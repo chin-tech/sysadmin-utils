@@ -91,6 +91,68 @@ begin
    }
 
 
+
+   function New-CustomXmlTask
+   {
+      [CmdletBinding()]
+      param(
+         [Parameter(Mandatory=$true)][string]$TaskName,
+         [Parameter(Mandatory=$true)][string]$TaskPath,
+         [Parameter(Mandatory=$true)][string]$Command,
+         [Parameter()][string]$Arguments = "",
+         [Parameter()][string]$ExecutionTimeLimit = "PT72H", # 72 hours
+         [bool]$IsHidden = $true
+      )
+
+      # Step 1: Generate base task definition via PowerShell cmdlets
+      $action    = New-ScheduledTaskAction -Execute $Command -Argument $Arguments
+      $trigger   = New-ScheduledTaskTrigger -AtLogOn
+      $settings  = New-ScheduledTaskSettingsSet -Hidden:$IsHidden -AllowStartIfOnBatteries
+      $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+      $taskDef = New-ScheduledTaskDefinition -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+
+      # Step 2: Convert to XML DOM for fine-grained editing
+      [xml]$xmlDoc = $taskDef.Xml
+
+      # Manage XML Namespaces for XPath queries
+      $nsmgr = New-Object System.Xml.XmlNamespaceManager($xmlDoc.NameTable)
+      $nsmgr.AddNamespace("task", "http://schemas.microsoft.com/windows/2004/02/mit/task")
+
+      # Step 3: Inject custom XML elements or modify existing nodes
+       
+      # Example A: Modify/Ensure ExecutionTimeLimit under <Settings>
+      $settingsNode = $xmlDoc.SelectSingleNode("//task:Settings", $nsmgr)
+      $timeLimitNode = $settingsNode.SelectSingleNode("task:ExecutionTimeLimit", $nsmgr)
+      if ($null -eq $timeLimitNode)
+      {
+         $timeLimitNode = $xmlDoc.CreateElement("ExecutionTimeLimit", "http://schemas.microsoft.com/windows/2004/02/mit/task")
+         $settingsNode.AppendChild($timeLimitNode) | Out-Null
+      }
+      $timeLimitNode.InnerText = $ExecutionTimeLimit
+
+      # Example B: Add a custom Description in <RegistrationInfo>
+      $regInfoNode = $xmlDoc.SelectSingleNode("//task:RegistrationInfo", $nsmgr)
+      if ($null -eq $regInfoNode)
+      {
+         $regInfoNode = $xmlDoc.CreateElement("RegistrationInfo", "http://schemas.microsoft.com/windows/2004/02/mit/task")
+         $xmlDoc.Task.PrependChild($regInfoNode) | Out-Null
+      }
+      $descNode = $xmlDoc.CreateElement("Description", "http://schemas.microsoft.com/windows/2004/02/mit/task")
+      $descNode.InnerText = "Dynamically built XML task."
+      $regInfoNode.AppendChild($descNode) | Out-Null
+
+      # Step 4: Register the modified XML string
+      $finalXmlString = $xmlDoc.OuterXml
+
+      Register-ScheduledTask `
+         -TaskName $TaskName `
+         -TaskPath $TaskPath `
+         -Xml $finalXmlString `
+         -Force
+   }
+
+
    function New-Tasks 
    {
       [CmdletBinding()]
@@ -101,7 +163,7 @@ begin
 
       foreach ($key in $items.Keys)
       {
-         Register-ScheduledTask -TaskName $items[$key]['taskName'] -xml $items[$key]['xmlPath']
+         Register-ScheduledTask -TaskName $items[$key]['taskName'] -xml $items[$key]['xmlData']
       }
    }
 
@@ -109,17 +171,33 @@ begin
    function Get-MobileData
    {
       param([string]$mobileName)
-      $mobileData = @{}
-      if (!([string]::IsNullOrWhiteSpace($mobileName)))
-      {
-         $mobileData['defaultUsers'] = Get-ChildItem -force -path $PATHS['mobileDefault'] -Include '*.csv' | Import-Csv 
-         $mobileData['mobileUsers'] = Get-ChildItem -force -path $PATHS['mobileEntries'] -include "${mobileName}-users" | Import-Csv
-         $mobileData['windows'] = Get-ChildItem -force -path $PATHS['mobileEntries'] -Include "${mobileName}-windows" | Import-Csv -ErrorAction SilentlyContinue
-         $mobileData['linux'] = Get-ChildItem -force -path $PATHS['mobileEntries'] -Include "${mobileName}-linux" | Import-Csv -ErroAction SilentlyContinue
-      }
+      $mobileData = [ordered]@{}
       $mobileData['AllMobiles'] = Get-ChildItem -force -path $PATHS['mobileEntries'] -include "*.csv" | Select-Object Name | Sort-Object -Unique -Property Name
+      if (([string]::IsNullOrWhiteSpace($mobileName)))
+      { return $mobileData
+      }
+      $curSection = $null
+      $mobileContent = Get-Content $PATHS['mobileEntries']
+      foreach ($line in $mobileContent)
+      {
+         $trimmed = $line.Trim()
+         if ([string]::IsNulllOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#') -or $trimmed.StartsWith(';')) 
+         {
+            continue
+         }
+         if ($trimmed -match '^\[?<Header>.+\]$') 
+         {
+            $curSection = $Matches['Header']
+            $mobileData[$curSection] = [System.Collections.Generic.List[string]]::new()
 
-
+         } elseif ($null -ne $curSection)
+         {
+            $mobileData[$curSection].Add($trimmed)
+         }
+      }
+      $mobileData['mobileUsers'] = $mobileData['Users'] | ConvertFrom-Csv
+      $mobileData['defaultUsers'] = Import-Csv $PATHS['defaultUsers'] 
+      $mobileData['AllUsers'] = $mobileData['Users'] + $mobileData['defaultUsers']
       return $mobileData
    }
 
@@ -342,6 +420,8 @@ process
    {
       'Info'
       {
+         Write-Host "Info Selected"
+         return
          if ([string]::IsNullOrWhiteSpace($mobileName))
          {
             Get-MobileOverview
@@ -351,11 +431,21 @@ process
          }
 
       }
-      'GPO'
-      { Set-MobileGPO -Add:$Add -Remove:$Remove -Force:$Force -mobileName $mobileName
+      'GPOAdd'
+      {
+         Write-Host "GPOAdd Selected with $add"
+         # Set-MobileGPO -Add:$Add -Remove:$Remove -Force:$Force -mobileName $mobileName
+      }
+
+      'GPORemove'
+      {
+         Write-Host "GPORemove Selected with $remove and $force "
+         # Set-MobileGPO -Add:$Add -Remove:$Remove -Force:$Force -mobileName $mobileName
       }
       'Deploy'
-      { Deploy-Mobile -mobileName $mobileName 
+      { 
+         Write-Host "Deploy Selected"
+         # Deploy-Mobile -mobileName $mobileName 
       }
    }
 }
