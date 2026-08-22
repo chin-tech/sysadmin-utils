@@ -11,10 +11,10 @@ public class Sha512Crypt
     {
         if (salt == null)
         {
-            byte[] saltBytes = new byte[12];
+            byte[] saltBytes = new byte[16];
             using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(saltBytes);
             StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < 12; i++) sb.Append(B64Alphabet[saltBytes[i] % 64]);
+            for (int i = 0; i < 16; i++) sb.Append(B64Alphabet[saltBytes[i] % 64]);
             salt = sb.ToString();
         }
         else if (salt.Length > 16)
@@ -126,6 +126,7 @@ public class Sha512Crypt
 "@
 
 # Load the class into memory once per session
-if (-not ([System.Management.Automation.PSTypeName]'Sha512Crypt').Type) {
+if (-not ([System.Management.Automation.PSTypeName]'Sha512Crypt').Type)
+{
     Add-Type -TypeDefinition $Sha512CryptSource
 }

@@ -36,13 +36,14 @@
         PSData = @{
             DefaultConfig = @{
                 GpoId          = '00000000-0000-0000-0000-000000000000'
-                UtilsPath      = '\\nas2\admin\utils'
-                EncryptionPfx  = '\\nas2\admin\utils\password_party_solution\encryption.pfx'
-                MobileFolder   = '\\netapp\home\.mobileFolder'
-                MobileDump     = '\\netapp\home\.mobileFolder\.dump'
-                MobileDefault  = '\\netapp\home\.mobileFolder\.default'
-                MobileEntries  = '\\netapp\home\.mobileFolder\.mobile'
-                TaskFolder     = '\\nas2\admin\utils\Tasks'
+                sshKeyName     = 'deployer'
+                certName       = 'deployer'
+                fallbackPass    = 'defaultPass'
+                curLuks         = 'defaultLuks'
+                encryptionPin     = 'defaultPin'
+                adminRoot = "\\nas2\admin"
+                nfsHomeRoot   = "\\netapp\home"
+
             }
         }
     }
