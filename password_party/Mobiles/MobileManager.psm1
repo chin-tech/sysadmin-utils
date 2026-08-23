@@ -468,6 +468,46 @@ function Initialize-Ssh-Environment
 
 }
 
+function Initialize-Functionality
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$Config
+    )
+
+    $cfg = Get-MobileConfig $Config
+
+    # 1. Prime SSH Keys and Authorized Keys
+    if (-not [string]::IsNullOrWhiteSpace($cfg.NfsHome) -and -not [string]::IsNullOrWhiteSpace($cfg.SshKeyName))
+    {
+        Initialize-Ssh-Environment -KeyName $cfg.SshKeyName -nfsHome $cfg.NfsHome
+    }
+
+    # 2. Ensure Document Encryption Certificate Exists in CurrentUser\My
+    $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My | 
+        Where-Object { $_.Subject -like '*CN=MobileDeployer*' -or $_.Subject -like "*$($cfg.CertName)*" }
+
+    if (-not $existingCert)
+    {
+        $pfxFileName = "$($cfg.CertName).pfx"
+        $pfxFullPath = Join-Path $cfg.AdminRoot $pfxFileName
+        # $securePass  = ConvertTo-SecureString -AsPlainText -Force $cfg.DefaultPass
+        $securePass = Read-Host -AsSecureString -Prompt "[!] The decryption certificate isn't in your cert store. Please enter the administrative password to import it "
+
+        if (Test-Path $pfxFullPath)
+        {
+            Import-PfxCertificate -FilePath $pfxFullPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePass | Out-Null
+            Write-Host "[+] Imported existing deployer certificate from: $pfxFullPath" -ForegroundColor Green
+        } else
+        {
+            # Generates PFX/CER in the target directory and automatically adds to Cert:\CurrentUser\My
+            New-DeployerCertificate -certPass $securePass -outPath $cfg.AdminRoot
+            Write-Host "[+] Generated and installed new deployment certificate in: $($cfg.AdminRoot)" -ForegroundColor Green
+        }
+    }
+}
+
 function Get-PostDeployScript
 {
     [CmdletBinding()]
@@ -1069,49 +1109,50 @@ function Get-MobileOverview
 {
     [CmdletBinding(DefaultParameterSetName = 'ExplicitPaths')]
     param(
-
-        [Parameter(Mandatory = $true, Position = 0)]
+        [Parameter(Position = 0)]
         [string]$MobileName,
 
-        [Parameter(ParameterSetName='Config')]
+        [Parameter(ParameterSetName = 'Config')]
         [PSCustomObject]$Config,
 
-
-        [Parameter(ParameterSetName='ExplicitPaths', Mandatory=$true)]
+        [Parameter(ParameterSetName = 'ExplicitPaths', Mandatory = $true)]
         [string]$defaultUsersPath,
 
-        [Parameter(ParameterSetName='ExplicitPaths', Mandatory=$true)]
+        [Parameter(ParameterSetName = 'ExplicitPaths', Mandatory = $true)]
         [string]$mobileEntriesPath,
 
-        [Parameter(ParameterSetName='ExplicitPaths', Mandatory=$true)]
-        [string]$fallBackPass
+        [Parameter(ParameterSetName = 'ExplicitPaths', Mandatory = $true)]
+        [string]$fallBackPass,
 
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$nfsHome,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$sshKeyName,
+
+        [Parameter()]
+        [switch]$Full
     )
 
     if ($PSCmdlet.ParameterSetName -eq 'Config')
     {
-        $defaultUsersPath = $config.MobileDefault
-        $mobileEntriesPath = $config.MobileEntries
-        $fallBackPass = $config.fallbackPass
+        $defaultUsersPath  = $Config.mobileDefaultUsers
+        $mobileEntriesPath = $Config.MobileEntries
+        $fallBackPass      = $Config.fallbackPass
+        $nfsHome           = $Config.NfsHome
+        $sshKeyName        = $Config.SshKeyName
+        $mobileDumpPath    = $Config.MobileDump
     }
-
-
 
     $data = Get-MobileData -MobileName $MobileName -defaultUserpath $defaultUsersPath -mobileEntriesPath $mobileEntriesPath -fallbackPass $fallBackPass
 
-    # Overall display width
-    $width = 72
+    $width = 76
 
     function Write-CenteredHeader
     {
-        param(
-            [string]$Text,
-            [ConsoleColor]$Color = 'Cyan'
-        )
-
-        $border = '=' * $width
+        param([string]$Text, [ConsoleColor]$Color = 'Cyan')
+        $border  = '=' * $width
         $padding = [Math]::Max(0, [Math]::Floor(($width - $Text.Length) / 2))
-
         Write-Host $border -ForegroundColor $Color
         Write-Host (' ' * $padding + $Text) -ForegroundColor $Color
         Write-Host $border -ForegroundColor $Color
@@ -1119,11 +1160,7 @@ function Get-MobileOverview
 
     function Write-Section
     {
-        param(
-            [string]$Text,
-            [ConsoleColor]$Color = 'DarkYellow'
-        )
-
+        param([string]$Text, [ConsoleColor]$Color = 'DarkYellow')
         Write-Host ""
         Write-Host ("[{0}]" -f $Text) -ForegroundColor $Color
         Write-Host ('-' * $width) -ForegroundColor DarkGray
@@ -1135,83 +1172,152 @@ function Get-MobileOverview
         return
     }
 
-    Write-Host ""
-
     if ([string]::IsNullOrWhiteSpace($MobileName))
     {
         Write-CenteredHeader -Text 'AVAILABLE MOBILES'
-
         foreach ($name in $data.AllMobiles)
         {
             Write-Host ("  {0,-30}" -f $name) -ForegroundColor Green
         }
-
         Write-Host ""
         return
     }
 
     Write-CenteredHeader -Text "MOBILE: $MobileName"
 
+    # --- SECTION: Configured Users ---
     Write-Section -Text 'USERS' -Color DarkYellow
-    Write-Host (
-        "  {0,-20} {1,-20} {2}" -f
-        'USERNAME',
-        'GROUPS',
-        'FULL NAME'
-    ) -ForegroundColor DarkYellow
+    Write-Host ("  {0,-18} {1,-18} {2,-24} {3}" -f 'USERNAME', 'GROUPS', 'FULL NAME', 'PASSWORD SET') -ForegroundColor DarkYellow
 
-    foreach ($u in ($data.MobileUsers| Sort-Object Username))
+    foreach ($u in ($data.MobileUsers | Sort-Object Username))
     {
-        $groups = $u.Groups -join ', '
+        $passPath    = Join-Path $mobileDumpPath $u.Username
+        $hasPassword = Test-Path $passPath
 
-        Write-Host (
-            "  {0,-20} {1,-20} {2}" -f
-            $u.Username,
-            $groups,
-            $u.Name
-        ) -ForegroundColor Yellow
+        $statusText  = if ($hasPassword)
+        { "[+] SET" 
+        } else
+        { "[-] PENDING" 
+        }
+        $statusColor = if ($hasPassword)
+        { 'Green' 
+        } else
+        { 'DarkRed' 
+        }
+        $groups      = $u.Groups -join ', '
+
+        Write-Host ("  {0,-18} {1,-18} {2,-24} " -f $u.Username, $groups, $u.Name) -ForegroundColor Yellow -NoNewline
+        Write-Host $statusText -ForegroundColor $statusColor
     }
 
+    # --- SECTION: Windows Nodes ---
     if ($data.Windows.Count -gt 0)
     {
-        Write-Section -Text 'WINDOWS' -Color DarkBlue
-
-        foreach ($c in ($data.Windows| Sort-Object))
+        Write-Section -Text 'WINDOWS ENDPOINTS' -Color DarkCyan
+        foreach ($c in ($data.Windows | Sort-Object))
         {
-            Write-Host ("  {0}" -f $c) -ForegroundColor Blue
+            Write-Host ("  [+] {0}" -f $c) -ForegroundColor Cyan
         }
     }
 
+    # --- SECTION: Linux Nodes ---
     if ($data.Linux.Count -gt 0)
     {
-        Write-Section -Text 'LINUX' -Color DarkRed
-
+        Write-Section -Text 'LINUX ENDPOINTS' -Color DarkRed
         foreach ($c in ($data.Linux | Sort-Object))
         {
-            Write-Host ("  {0}" -f $c) -ForegroundColor Red
+            Write-Host ("  [+] {0}" -f $c) -ForegroundColor Red
         }
     }
 
-    Write-Section -Text 'SIMULATED DEPLOY' -Color Gray
-
-    Write-Host (
-        "  {0,-22} {1,-25} {2}" -f
-        'USERNAME',
-        'FULL NAME',
-        'DESCRIPTION'
-    ) -ForegroundColor DarkGreen
-
+    # --- SECTION: Role Expansion ---
+    Write-Section -Text 'SIMULATED DEPLOYMENT ACCOUNTS' -Color DarkGreen
+    Write-Host ("  {0,-24} {1,-22} {2}" -f 'ACCOUNT NAME', 'FULL NAME', 'ROLE DESCRIPTION') -ForegroundColor DarkGreen
     foreach ($u in $data.AllUsers)
     {
-        Write-Host (
-            "  {0,-22} {1,-25} {2}" -f
-            $u.Name,
-            $u.FullName,
-            $u.Description
-        ) -ForegroundColor Green
+        Write-Host ("  {0,-24} {1,-22} {2}" -f $u.Name, $u.FullName, $u.Description) -ForegroundColor Green
     }
 
-    Write-Host ""
+    # --- SECTION: Deep Telemetry (-Full) ---
+    if ($Full)
+    {
+        Write-Section -Text 'HOST TELEMETRY AUDIT' -Color Magenta
+
+        if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyName))
+        {
+            Initialize-Ssh-Environment -KeyName $sshKeyName -nfsHome $nfsHome
+        }
+
+        $computerData = Invoke-InformationCollector `
+            -winComputers $data.Windows `
+            -linComputers $data.Linux `
+            -nfsHome $nfsHome `
+            -sshKeyName $sshKeyName
+
+        # Render Linux Audit Results
+        if ($computerData.Linux.Count -gt 0)
+        {
+            Write-Host "`n  -- Linux Status --" -ForegroundColor DarkRed
+            Write-Host ("  {0,-18} {1,-6} {2,-16} {3,-12} {4,-8} {5}" -f 'HOST', 'CORES', 'KERNEL', 'CLAMAV', 'LAPS', 'STATUS') -ForegroundColor DarkGray
+
+            foreach ($l in $computerData.Linux)
+            {
+                $statusColor = if ($l.Success)
+                { 'Green' 
+                } else
+                { 'Red' 
+                }
+                $statusText  = if ($l.Success)
+                { 'Online' 
+                } else
+                { 'Unreachable' 
+                }
+                $clamDef     = if ($l.ClamAvDefs)
+                { $l.ClamAvDefs 
+                } else
+                { 'N/A' 
+                }
+                $kernelVer   = if ($l.Kernel)
+                { $l.Kernel 
+                } else
+                { 'N/A' 
+                }
+
+                Write-Host ("  {0,-18} {1,-6} {2,-16} {3,-12} {4,-8} " -f $l.HostName, $l.Cores, $kernelVer, $clamDef, $l.HasLas) -NoNewline
+                Write-Host $statusText -ForegroundColor $statusColor
+            }
+        }
+
+        # Render Windows Audit Results
+        if ($computerData.Windows.Count -gt 0)
+        {
+            Write-Host "`n  -- Windows Status --" -ForegroundColor DarkCyan
+            Write-Host ("  {0,-18} {1,-14} {2,-16} {3,-14} {4}" -f 'HOST', 'LICENSE', 'AV DEFS', 'IVANTI VER', 'UPDATES') -ForegroundColor DarkGray
+
+            foreach ($w in $computerData.Windows)
+            {
+                $nodeName   = if ($w.PSComputerName)
+                { $w.PSComputerName 
+                } else
+                { 'Local/WinRM' 
+                }
+                $updateStat = if ($w.WinUpdates)
+                { "$($w.WinUpdates.Count) History Items" 
+                } else
+                { 'No Data' 
+                }
+                $licStatus  = if ($w.WindowsLicense)
+                { $w.WindowsLicense 
+                } else
+                { 'Unknown' 
+                }
+
+                Write-Host ("  {0,-18} {1,-14} {2,-16} {3,-14} {4}" -f $nodeName, $licStatus, $w.AVDefs, $w.IvantiVersion, $updateStat) -ForegroundColor Cyan
+            }
+        }
+    }
+
+    Write-Host "`n"
 }
 
 
@@ -1452,6 +1558,7 @@ function Start-MobileDeployment
     )
 
     $cfg = Get-MobileConfig $Config
+    Initialize-Functionality -Config $Config
     $mobileData = Get-MobileData -MobileName $MobileName -Config $cfg
     $sshKeyPath = Join-Path $cfg.nfsHome ".ssh\$($cfg.sshKeyName)"
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $cfg.MobileDump 
@@ -1462,7 +1569,7 @@ function Start-MobileDeployment
         'DTRW' = @("dtrw")
         'DTRO' = @("dtro")
     }
-    $disJoin = $true
+    $disJoin = $false
 
     $scriptBlock = {
         param($allusers, $taskData, $groupDict,$mobileName, $disJoin)
@@ -1483,39 +1590,79 @@ function Start-MobileDeployment
 
         foreach ($grp in $groupDict.Keys)
         {
-            Get-Localuser | Where-Object {$_.Name -match "($($groupDict[$grp] -join '|'))$"} | Add-LocalGroupMember -Group $grp
+            Get-Localuser | Where-Object {$_.Name -match "($($groupDict[$grp] -join '|'))$"} | Add-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue | Out-Null
         }
 
         foreach ($t in $taskData)
         {
-            Register-ScheduledTask -TaskName $t.TaskName -xml $t.TaskXML -User System -Force
+            Register-ScheduledTask -TaskName $t.TaskName -xml $t.TaskXML -User System -Force | Out-Null
         }
 
         if ($disJoin)
         {
-            Remove-Computer -Force -Restart -WorkGroupName "$mobileName"
+            Remove-Computer -Force -Restart -WorkGroupName "$mobileName" -ErrorAction SilentlyContinue
+        }
+
+        return [PSCustomObject]@{
+            Success = $true
         }
 
     }
-    Invoke-Command -ComputerName $mobileData.Windows -ScriptBlock $scriptBlock -ArgumentList $mobileData.AllUsers,$taskData,$groupDict,$mobileName,$disJoin
+    $winErrors = [System.Collections.Generic.List[object]]::new()
+    $winResults = Invoke-Command -ComputerName $mobileData.Windows -ScriptBlock $scriptBlock -ArgumentList $mobileData.AllUsers,$taskData,$groupDict,$mobileName,$disJoin -ErrorVariable winErrors -ErrorAction SilentlyContinue
 
-    # Need the linux computers and the linux computers there for easy processing
-    # $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
-    
-    if ($mobileData.Linux.Count -gt 0)
+    foreach ($computer in $mobileData.Windows)
     {
-        $linuxDeploy = Get-LinuxDeployScript -oldEncryption $cfg.curLuks -encryptionPin $cfg.encryptionPin -nfsHome $cfg.nfsHome -allUsers $mobileData.AllUsers
-        $jobs = foreach ($h in $mobileData.Linux)
-        {
-            Start-Job -ScriptBlock {
-                param($target, $payload, $key)
-                $payload | ssh -i $key -o BatchMode=yes -o StrictHostKeyChecking=no $target "bash -s --"
+            
+        $hostError = $winErrors | Where-Object { $_.TargetObject -eq $computer }
+        $hostResult = $winResults | Where-Object { $_.PSComputerName -eq $computer }
 
-            } -ArgumentList $h,$linuxDeploy,$sshKeyPath
+        if ($hostResult -and -not $hostError)
+        {
+            Write-Host " [Windows] - $($computer) - [ OK ]" -ForegroundColor Green
+        } else
+        {
+            Write-Host " [Windows] - $($computer) - [ FAIL ]" -ForegroundColor Red
+            if ($hostError)
+            {
+                Write-Warning "`t$($hostError.Exception.Message)" 
+            }
         }
-        $linRes = $jobs | Receive-Job -Wait -AutoRemoveJob
+    }
+}
+
+
+# Need the linux computers and the linux computers there for easy processing
+# $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
+    
+if ($mobileData.Linux.Count -gt 0)
+{
+    $linuxDeploy = Get-LinuxDeployScript -oldEncryption $cfg.curLuks -encryptionPin $cfg.encryptionPin -nfsHome $cfg.nfsHome -allUsers $mobileData.AllUsers
+    $jobs = foreach ($h in $mobileData.Linux)
+    {
+        Start-Job -ScriptBlock {
+            param($target, $payload, $key)
+            $null = $payload | ssh -i $key -o BatchMode=yes -o StrictHostKeyChecking=no $target "bash -s --"
+            return @{ Target = $target; ExitCode = $LASTEXITCODE}
+
+        } -ArgumentList $h,$linuxDeploy,$sshKeyPath
+    }
+
+}
+$linRes = $jobs | Receive-Job -Wait -AutoRemoveJob
+foreach ($r in $linRes)
+{
+    if ($r.ExitCode -eq 0)
+    {
+        Write-Host "[Linux] - $($r.Target) - [ OK ]" -ForegroundColor green
+
+    } else
+    {
+            
+        Write-Host "[Linux] - $($r.Target) - [ FAIL ]" -ForegroundColor red
 
     }
+}
 
 
 }

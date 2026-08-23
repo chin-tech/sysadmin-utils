@@ -25,6 +25,10 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'GPORemove', Position = 0)]
     [string]$Name,
 
+    # --- Inspection Depth (Info Only) ---
+    [Parameter(ParameterSetName = 'Info')]
+    [switch]$Full,
+
     # --- Force Switch (GPO Remove Only) ---
     [Parameter(ParameterSetName = 'GPORemove')]
     [switch]$Force,
@@ -38,26 +42,31 @@ param(
 $modulePath = Join-Path $PSScriptRoot 'MobileManager.psd1'
 Import-Module $modulePath -Force
 
-switch ($PSCmdlet.ParameterSetName) {
-    'Info' {
-        if ([string]::IsNullOrWhiteSpace($Name)) {
+switch ($PSCmdlet.ParameterSetName)
+{
+    'Info'
+    {
+        if ([string]::IsNullOrWhiteSpace($Name))
+        {
             Get-MobileOverview -Config $ConfigOverride
-        }
-        else {
-            Get-MobileData -MobileName $Name -Config $ConfigOverride | Format-List
+        } else
+        {
+            Get-GPOMobileOverview -MobileName $Name -Config $ConfigOverride -Full:$Full
         }
     }
 
-    'GPOAdd' {
+    'GPOAdd'
+    {
         Set-MobileGpoPermission -MobileName $Name -Add -Config $ConfigOverride
     }
 
-    'GPORemove' {
+    'GPORemove'
+    {
         Set-MobileGpoPermission -MobileName $Name -Remove -Force:$Force -Config $ConfigOverride
     }
 
-    'Deploy' {
-        Test-SshEnvironment
+    'Deploy'
+    {
         Start-MobileDeployment -MobileName $Name -Config $ConfigOverride
     }
 }

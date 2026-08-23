@@ -23,7 +23,7 @@
         'Get-MobileOverview',
         'Set-MobileGpoPermission',
         'Start-MobileDeployment',
-        'Test-SshEnvironment'
+        'Initialize-Ssh-Environment'
     )
 
     # Cmdlets, Variables, and Aliases to export
