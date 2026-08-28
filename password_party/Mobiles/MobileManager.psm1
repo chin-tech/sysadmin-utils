@@ -201,6 +201,57 @@ if (-not ([System.Management.Automation.PSTypeName]'Sha512Crypt').Type)
 }
 
 
+function Invoke-Linux
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [array]$Computers,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Script,
+
+        [Parameter(Mandatory=$true)]
+        [string]$KeyPath
+    )
+
+    # Clean the script once, up front — no point repeating this per-job
+    $cleanScript = ($Script -replace "`r","").TrimEnd() + "`n"
+
+    $jobs = foreach ($target in $Computers)
+    {
+        Start-Job -ScriptBlock {
+            param($target, $payload, $key)
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "ssh"
+            $psi.Arguments = "-i `"$key`" -o BatchMode=yes -o StrictHostKeyChecking=no $target `"bash -s --`""
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $proc.StandardInput.Write($payload)
+            $proc.StandardInput.Close()
+
+            $stdout = $proc.StandardOutput.ReadToEnd()
+            $stderr = $proc.StandardError.ReadToEnd()
+            $proc.WaitForExit()
+
+            return @{
+                Target   = $target
+                ExitCode = $proc.ExitCode
+                StdOut   = $stdout
+                StdErr   = $stderr
+            }
+        } -ArgumentList $target, $cleanScript, $KeyPath
+    }
+
+    $jobs | Wait-Job | Receive-Job
+    $jobs | Remove-Job
+}
+
 
 function Set-Groups
 {
@@ -257,6 +308,7 @@ function New-TaskXML
     param(
         [Parameter()][string]$Description = "Automated Task",
         [Parameter()][string]$Author = "SYSTEM",
+        [Parameter()][string]$Version = "1.0",
         
         [Parameter(Mandatory=$true)]
         [string]$Execute,
@@ -285,6 +337,7 @@ function New-TaskXML
     # 1. Registration Info
     $taskDef.RegistrationInfo.Description = $Description
     $taskDef.RegistrationInfo.Author = $Author
+    $taskDef.RegistrationInfo.Version = $Version
 
     # 2. Task Settings
     $taskDef.Settings.Enabled = $true
@@ -295,6 +348,7 @@ function New-TaskXML
     $taskDef.Settings.DisallowStartIfOnBatteries = $false
     $taskDef.Settings.StopIfGoingOnBatteries = $false
     $taskDef.Settings.ExecutionTimeLimit = $ExecutionTimeLimit
+    $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
 
     # 3. Principal Configuration
     $taskDef.Principal.UserId = $UserId
@@ -381,6 +435,13 @@ function New-TaskXML
                 {
                     $trigger.Delay = $cfg.Delay
                 }
+                if ($cfg.ContainsKey('EndBoundary'))
+                { $trigger.EndBoundary = $cfg.EndBoundary
+                } else
+                { 
+                    (Get-Date).AddSeconds(15).ToString('s')
+
+                }
             }
         }
     }
@@ -399,21 +460,21 @@ function ConvertTo-BashArgument
     "'" + $v.Replace("'","'\''") + "'"
 }
 
-function Invoke-Linux
-{
-    param(
-        [string]$mobileName,
-        [string]$bastionHost,
-        [string]$sshKeyPath,
-        [string]$scriptName,
-        [string[]]$extraArgs
-    )
-    $a = @($mobileName) + $extraArgs
-    $remoteArgs = ($a | ForEach-Object { ConvertTo-BashArgument $_}) -join ' '
-
-
-    (Get-Content $scriptName -Raw) -replace "`r`n","`n" | ssh -i $sshKeyPath -q $bastionHost "bash -s -- $remoteArgs"
-}
+# function Invoke-Linux
+# {
+#     param(
+#         [string]$mobileName,
+#         [string]$bastionHost,
+#         [string]$sshKeyPath,
+#         [string]$scriptName,
+#         [string[]]$extraArgs
+#     )
+#     $a = @($mobileName) + $extraArgs
+#     $remoteArgs = ($a | ForEach-Object { ConvertTo-BashArgument $_}) -join ' '
+#
+#
+#     (Get-Content $scriptName -Raw) -replace "`r`n","`n" | ssh -i $sshKeyPath -q $bastionHost "bash -s -- $remoteArgs"
+# }
 
 
 
@@ -515,7 +576,7 @@ function Get-PostDeployScript
         [Parameter()]
         [switch]$userRights,
         [switch]$Sharing,
-        [switch]$acls,
+        [switch]$hasLinux,
 
         [Parameter()]
         [array]$driveLetters
@@ -531,7 +592,7 @@ function Get-PostDeployScript
 '@)
     if ($userRights)
     {
-        if ($sharing)
+        if ($sharing -and $hasLinux)
         {
             $smbPass = "SupeSecretSMBP@ssw0rd99"
             $s.Add(@"
@@ -611,14 +672,11 @@ foreach ($d in $driveList) {
 '@)
     }
 
-    if ($acls)
-    {
-        $s.Add(@'
+    $s.Add(@'
 icacls.exe C:\Support /inheritance:r /T /Q
 icacls.exe C:\Support /grant Administrators:F ISSO:F /T /Q
 
 '@)
-    }
 
     $s.Add('"[ Post Deployment Ran - $(Get-Date)]" | Out-File C:\Post-Deploy.info ')
     return ($s -join "`n`n")
@@ -1065,11 +1123,12 @@ function Get-MobileData
 function Get-TaskData
 {
     param(
-        [string]$tasksPath
+        [string]$tasksPath,
+        [bool]$hasLinux
     )
 
     $taskData = @()
-    $disjoinData = Get-PostDeployScript -userRights -Sharing -acls
+    $disjoinData = Get-PostDeployScript -userRights -Sharing -hasLinux:$hasLinux
     $disjoinB64 = [Convert]::ToBase64String(($disJoinData))
     $domainDisjoinTask = New-TaskXML -Description 'Runs once after domain disjoin' `
         -Author '[Mobile Administration]' -Execute 'powershell.exe' `
@@ -1562,7 +1621,7 @@ function Start-MobileDeployment
     $mobileData = Get-MobileData -MobileName $MobileName -Config $cfg
     $sshKeyPath = Join-Path $cfg.nfsHome ".ssh\$($cfg.sshKeyName)"
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $cfg.MobileDump 
-    $taskData = Get-TaskData
+    $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
     $groupDict = @{
         'Administrators' = @("isso","adm","priv")
         'ISSO' = @("isso")
@@ -1635,34 +1694,25 @@ function Start-MobileDeployment
 # Need the linux computers and the linux computers there for easy processing
 # $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
     
+$linRes = @()
 if ($mobileData.Linux.Count -gt 0)
 {
     $linuxDeploy = Get-LinuxDeployScript -oldEncryption $cfg.curLuks -encryptionPin $cfg.encryptionPin -nfsHome $cfg.nfsHome -allUsers $mobileData.AllUsers
-    $jobs = foreach ($h in $mobileData.Linux)
+    $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $key
+    
+    foreach ($r in $linRes)
     {
-        Start-Job -ScriptBlock {
-            param($target, $payload, $key)
-            $null = $payload | ssh -i $key -o BatchMode=yes -o StrictHostKeyChecking=no $target "bash -s --"
-            return @{ Target = $target; ExitCode = $LASTEXITCODE}
+        if ($r.ExitCode -eq 0)
+        {
+            Write-Host "[Linux] - $($r.Target) - [ OK ]" -ForegroundColor green
 
-        } -ArgumentList $h,$linuxDeploy,$sshKeyPath
-    }
-
-}
-$linRes = $jobs | Receive-Job -Wait -AutoRemoveJob
-foreach ($r in $linRes)
-{
-    if ($r.ExitCode -eq 0)
-    {
-        Write-Host "[Linux] - $($r.Target) - [ OK ]" -ForegroundColor green
-
-    } else
-    {
+        } else
+        {
             
-        Write-Host "[Linux] - $($r.Target) - [ FAIL ]" -ForegroundColor red
+            Write-Host "[Linux] - $($r.Target) - [ FAIL ]" -ForegroundColor red
 
+        }
     }
-}
 
 
 }
@@ -1772,44 +1822,560 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
     }
     $winResult = @()
     $linResult = @()
+
     if ($winComputers -gt 0)
     {
         $winResult = Invoke-Command -ComputerName $winComputers -ScriptBlock $windowsInformationBlock
     }
+
     if ($linComputers -gt 0)
     {
-        $jobs = foreach ($linHost in $linComputers)
+        $res = Invoke-Linux -Computers $linComputers -Script $bashScript -KeyPath $sshKey
+
+        $linResult = foreach ($r in $res)
         {
-            Start-Job -ScriptBlock {
-                param($hostName, $script, $key)
-                $o = $script | ssh -o BatchMode=yes -o StrictHostKeyChecking=no -qi $key $hostName "bash -s --" 
-                $p = if ($LASTEXITCODE -eq 0 -and $o)
-                {
-                    $o | ConvertFrom-Json
-                } else
-                { $null 
-                }
-                [PSCustomObject]@{
-                    HostName = $hostName
-                    Cores = $p.Cores
-                    Kernel = $p.Kernel
-                    ClamAvDefs = $p.ClamAv
-                    LastUpdate = $p.LastUpdate
-                    HasLas = [bool]$p.HasLaps
-                    Success = ($LASTEXITCODE -eq 0)
-                }
+            $p = if ($r.ExitCode -eq 0 -and $r.StdOut)
+            {
+                $r.StdOut | ConvertFrom-Json
+            } else
+            {
+                $null
+            }
 
-            } -ArgumentList $linHost,$bashScript,$sshKey
+            [PSCustomObject]@{
+                HostName    = $r.Target
+                Cores       = $p.Cores
+                Kernel      = $p.Kernel
+                ClamAvDefs  = $p.ClamAv
+                LastUpdate  = $p.LastUpdate
+                HasLaps     = [bool]$p.HasLaps
+                Success     = ($r.ExitCode -eq 0)
+            }
         }
-        $linResult = $jobs | Receive-Job -Wait -AutoRemoveJob
-    }
-    return [PSCustomObject]@{ 
-        Windows = $winResult
-        Linux = $linResult
     }
 
+    return [PSCustomObject]@{
+        Windows = $winResult
+        Linux   = $linResult
+    }
 }
 
+
+function Show-TerminalMultiPicker
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string[]]$Options
+    )
+
+    $esc = [char]27
+    $selectedIndices = [System.Collections.Generic.HashSet[int]]::new()
+    $currentIndex = 0
+    $total = $Options.Count
+
+    Write-Host "`n=== $Title ===" -ForegroundColor Cyan
+    Write-Host "[Up/Down] Navigate | [Space] Toggle | [A] All | [C] Clear | [Enter] Confirm" -ForegroundColor DarkGray
+
+    # Pre-allocate buffer lines
+    1..$total | ForEach-Object { [Console]::WriteLine("") }
+
+    [Console]::CursorVisible = $false
+
+    try
+    {
+        while ($true)
+        {
+            [Console]::Write("$esc[${total}A")
+
+            for ($i = 0; $i -lt $total; $i++)
+            {
+                $isChecked = if ($selectedIndices.Contains($i))
+                { "[*]" 
+                } else
+                { "[ ]" 
+                }
+                $pointer   = if ($i -eq $currentIndex)
+                { " > " 
+                } else
+                { "   " 
+                }
+
+                [Console]::Write("$esc[2K`r")
+
+                if ($i -eq $currentIndex)
+                {
+                    Write-Host "$pointer$isChecked $($Options[$i])" -ForegroundColor Black -BackgroundColor White
+                } elseif ($selectedIndices.Contains($i))
+                {
+                    Write-Host "$pointer$isChecked $($Options[$i])" -ForegroundColor Green
+                } else
+                {
+                    Write-Host "$pointer$isChecked $($Options[$i])" -ForegroundColor Gray
+                }
+            }
+
+            $key = [Console]::ReadKey($true)
+
+            switch ($key.Key)
+            {
+                'UpArrow'
+                {
+                    $currentIndex = ($currentIndex - 1 + $total) % $total
+                }
+                'DownArrow'
+                {
+                    $currentIndex = ($currentIndex + 1) % $total
+                }
+                'Spacebar'
+                {
+                    if ($selectedIndices.Contains($currentIndex))
+                    {
+                        [void]$selectedIndices.Remove($currentIndex)
+                    } else
+                    {
+                        [void]$selectedIndices.Add($currentIndex)
+                    }
+                }
+                'A'
+                {
+                    0..($total - 1) | ForEach-Object { [void]$selectedIndices.Add($_) }
+                }
+                'C'
+                {
+                    $selectedIndices.Clear()
+                }
+                'Enter'
+                {
+                    # Wipe interactive menu
+                    [Console]::Write("$esc[${total}A")
+                    for ($i = 0; $i -lt $total; $i++)
+                    {
+                        [Console]::Write("$esc[2K`r`n")
+                    }
+                    [Console]::Write("$esc[${total}A$esc[2K`r")
+
+                    $picked = @($selectedIndices | Sort-Object | ForEach-Object { $Options[$_] })
+                    $summary = if ($picked.Count -gt 0)
+                    { $picked -join ';' 
+                    } else
+                    { "(none)" 
+                    }
+                    Write-Host "Selected Groups: $summary" -ForegroundColor Green
+                    return $picked
+                }
+            }
+        }
+    } finally
+    {
+        [Console]::CursorVisible = $true
+    }
+}
+
+function Show-TerminalSinglePicker
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][array]$Options,
+        [Parameter(Mandatory = $true)][string]$DisplayProperty
+    )
+
+    $esc = [char]27
+    $currentIndex = 0
+    $total = $Options.Count
+
+    Write-Host "`n=== $Title ===" -ForegroundColor Cyan
+    Write-Host "[Up/Down] Navigate | [Enter] Select Match" -ForegroundColor DarkGray
+
+    # Pre-allocate buffer lines
+    1..$total | ForEach-Object { [Console]::WriteLine("") }
+
+    [Console]::CursorVisible = $false
+
+    try
+    {
+        while ($true)
+        {
+            [Console]::Write("$esc[${total}A")
+
+            for ($i = 0; $i -lt $total; $i++)
+            {
+                $pointer = if ($i -eq $currentIndex)
+                { " > " 
+                } else
+                { "   " 
+                }
+                $label   = $Options[$i].$DisplayProperty
+
+                [Console]::Write("$esc[2K`r")
+
+                if ($i -eq $currentIndex)
+                {
+                    Write-Host "$pointer$label" -ForegroundColor Black -BackgroundColor White
+                } else
+                {
+                    Write-Host "$pointer$label" -ForegroundColor Gray
+                }
+            }
+
+            $key = [Console]::ReadKey($true)
+
+            switch ($key.Key)
+            {
+                'UpArrow'
+                {
+                    $currentIndex = ($currentIndex - 1 + $total) % $total
+                }
+                'DownArrow'
+                {
+                    $currentIndex = ($currentIndex + 1) % $total
+                }
+                'Enter'
+                {
+                    # Wipe interactive menu
+                    [Console]::Write("$esc[${total}A")
+                    for ($i = 0; $i -lt $total; $i++)
+                    {
+                        [Console]::Write("$esc[2K`r`n")
+                    }
+                    [Console]::Write("$esc[${total}A$esc[2K`r")
+
+                    $choice = $Options[$currentIndex]
+                    Write-Host "Resolved Match: $($choice.$DisplayProperty)" -ForegroundColor Green
+                    return $choice
+                }
+            }
+        }
+    } finally
+    {
+        [Console]::CursorVisible = $true
+    }
+}
+
+function Find-ADComputerMatch
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SearchTerm
+    )
+
+    $searcher = [System.DirectoryServices.DirectorySearcher]::new()
+    $cleanTerm = [System.Security.SecurityElement]::Escape($SearchTerm.Trim())
+    $searcher.Filter = "(&(objectCategory=computer)(|(name=$cleanTerm)(sAMAccountName=$cleanTerm*)(name=*$cleanTerm*)))"
+    $searcher.PropertiesToLoad.AddRange(@('name', 'dNSHostName', 'operatingSystem'))
+
+    $results = @($searcher.FindAll())
+    $matches = foreach ($res in $results)
+    {
+        $props = $res.Properties
+        [PSCustomObject]@{
+            Name            = if ($props.Contains('name'))
+            { $props['name'][0] 
+            } else
+            { '' 
+            }
+            DnsHostName     = if ($props.Contains('dnshostname'))
+            { $props['dnshostname'][0] 
+            } else
+            { '' 
+            }
+            OperatingSystem = if ($props.Contains('operatingsystem'))
+            { $props['operatingsystem'][0] 
+            } else
+            { '' 
+            }
+            DisplayText     = "$($props['name'][0]) ($($props['operatingsystem'][0]))"
+        }
+    }
+
+    return $matches
+}
+
+function Find-ADUserMatch
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SearchTerm
+    )
+
+    $searcher = [System.DirectoryServices.DirectorySearcher]::new()
+    $cleanTerm = [System.Security.SecurityElement]::Escape($SearchTerm.Trim())
+    $searcher.Filter = "(&(objectCategory=person)(objectClass=user)(|(sAMAccountName=$cleanTerm)(sAMAccountName=*$cleanTerm*)(displayName=*$cleanTerm*)(mail=*$cleanTerm*)))"
+    $searcher.PropertiesToLoad.AddRange(@('sAMAccountName', 'displayName', 'givenName', 'sn', 'mail'))
+
+    $results = @($searcher.FindAll())
+    $matches = foreach ($res in $results)
+    {
+        $props = $res.Properties
+        $first = if ($props.Contains('givenName'))
+        { $props['givenName'][0] 
+        } else
+        { '' 
+        }
+        $last  = if ($props.Contains('sn'))
+        { $props['sn'][0] 
+        } else
+        { '' 
+        }
+        $combined = "$first $last".Trim()
+
+        $resolvedName = if ($props.Contains('displayName') -and -not [string]::IsNullOrWhiteSpace($props['displayName'][0]))
+        {
+            $props['displayName'][0]
+        } elseif (-not [string]::IsNullOrWhiteSpace($combined))
+        {
+            $combined
+        } else
+        {
+            ''
+        }
+
+        $sam = if ($props.Contains('samaccountname'))
+        { $props['samaccountname'][0] 
+        } else
+        { '' 
+        }
+
+        [PSCustomObject]@{
+            UserName    = $sam
+            FullName    = $resolvedName
+            Email       = if ($props.Contains('mail'))
+            { $props['mail'][0] 
+            } else
+            { '' 
+            }
+            DisplayText = "$sam - $resolvedName"
+        }
+    }
+
+    return $matches
+}
+
+function New-MobileDeployment
+{
+    [CmdletBinding()]
+    param(
+    )
+
+    $mobileName = Read-Host -Prompt "Enter a Mobile Name"
+    if ([string]::IsNullOrWhiteSpace($mobileName))
+    {
+        Write-Warning "Mobile Name cannot be empty."
+        return
+    }
+
+    # Available group tags for terminal multi-select
+    $availableGroups = @('PRIV', 'DTRO', 'DTRW')
+
+    # Computer Entry & Disambiguation
+    $ResolveComputerInput = {
+        param([string]$PlatformLabel)
+        
+        $collected = [System.Collections.Generic.List[string]]::new()
+        Write-Host "`n=== Enter $PlatformLabel Computers ===" -ForegroundColor Cyan
+        
+        do
+        {
+            $raw = (Read-Host -Prompt "Enter $PlatformLabel host name (Enter to finish)").Trim()
+            if ([string]::IsNullOrWhiteSpace($raw))
+            { break 
+            }
+
+            $matches = @(Find-ADComputerMatch -SearchTerm $raw)
+
+            # 1. Exact match
+            $exact = $matches | Where-Object { $_.Name -ieq $raw }
+            if ($exact)
+            {
+                Write-Host "Found AD Computer: $($exact.Name)" -ForegroundColor Green
+                $collected.Add($exact.Name)
+                continue
+            }
+
+            # 2. Ambiguous match -> Terminal single-select picker
+            if ($matches.Count -gt 1)
+            {
+                $picked = Show-TerminalSinglePicker `
+                    -Title "Multiple $PlatformLabel AD Matches for '$raw'" `
+                    -Options $matches `
+                    -DisplayProperty "DisplayText"
+                
+                if ($picked)
+                {
+                    $collected.Add($picked.Name)
+                    continue
+                }
+            } elseif ($matches.Count -eq 1)
+            {
+                $confirmMatch = Read-Host -Prompt "Did you mean '$($matches[0].Name)'? (y/n)"
+                if ($confirmMatch -match '^(y|yes)$')
+                {
+                    $collected.Add($matches[0].Name)
+                    continue
+                }
+            }
+
+            # 3. Not found in AD -> Manual confirmation
+            Write-Warning "Host '$raw' was not found in Active Directory."
+            $confirm = Read-Host -Prompt "Add '$raw' as unjoined $PlatformLabel host? (y/n)"
+            if ($confirm -match '^(y|yes)$')
+            {
+                $collected.Add($raw.ToUpper())
+            } else
+            {
+                Write-Host "Skipping '$raw'." -ForegroundColor Yellow
+            }
+
+        } while ($true)
+
+        return $collected.ToArray()
+    }
+
+    # Collect Computers
+    $windowsComputers = & $ResolveComputerInput -PlatformLabel "Windows"
+    $linuxComputers   = & $ResolveComputerInput -PlatformLabel "Linux"
+
+    # Collect Users
+    $users = [System.Collections.Generic.List[PSCustomObject]]::new()
+    Write-Host "`n=== Enter Users ===" -ForegroundColor Cyan
+
+    do
+    {
+        $rawUser = (Read-Host -Prompt "Enter username/search term (Enter to finish)").Trim()
+        if ([string]::IsNullOrWhiteSpace($rawUser))
+        { break 
+        }
+
+        $resolvedUsername = $rawUser
+        $resolvedFullName = ''
+        $isDomainUser = $false
+
+        $userMatches = @(Find-ADUserMatch -SearchTerm $rawUser)
+
+        # 1. Exact match
+        $exactUser = $userMatches | Where-Object { $_.UserName -ieq $rawUser }
+        if ($exactUser)
+        {
+            $resolvedUsername = $exactUser.UserName
+            $resolvedFullName = $exactUser.FullName
+            $isDomainUser = $true
+            Write-Host "Found AD User: $resolvedFullName ($resolvedUsername)" -ForegroundColor Green
+        }
+        # 2. Ambiguous matches -> Terminal single-select picker
+        elseif ($userMatches.Count -gt 1)
+        {
+            $pickedUser = Show-TerminalSinglePicker `
+                -Title "Multiple User Matches for '$rawUser'" `
+                -Options $userMatches `
+                -DisplayProperty "DisplayText"
+
+            if ($pickedUser)
+            {
+                $resolvedUsername = $pickedUser.UserName
+                $resolvedFullName = $pickedUser.FullName
+                $isDomainUser = $true
+            }
+        }
+        # 3. Single partial match
+        elseif ($userMatches.Count -eq 1)
+        {
+            $confirmCandidate = Read-Host -Prompt "Did you mean '$($userMatches[0].FullName)' ($($userMatches[0].UserName))? (y/n)"
+            if ($confirmCandidate -match '^(y|yes)$')
+            {
+                $resolvedUsername = $userMatches[0].UserName
+                $resolvedFullName = $userMatches[0].FullName
+                $isDomainUser = $true
+            }
+        }
+
+        # 4. Non-domain fallback
+        if (-not $isDomainUser)
+        {
+            Write-Warning "User '$rawUser' was not found in Active Directory."
+            $confirmNonDomain = Read-Host -Prompt "Add '$rawUser' as a non-domain user? (y/n)"
+            if ($confirmNonDomain -notmatch '^(y|yes)$')
+            {
+                Write-Host "Skipping '$rawUser'." -ForegroundColor Yellow
+                continue
+            }
+            $manualFull = Read-Host -Prompt "Enter Full Name for '$rawUser' (leave blank if none)"
+            $resolvedFullName = if (-not [string]::IsNullOrWhiteSpace($manualFull))
+            { $manualFull.Trim() 
+            } else
+            { '' 
+            }
+        }
+
+        # Terminal Multi-Select Checklist for Groups
+        $pickedGroups = Show-TerminalMultiPicker `
+            -Title "Select Group Tags for '$resolvedUsername' ($resolvedFullName) (local is always made)" `
+            -Options $availableGroups
+
+        $pickedGroups += ("local")
+
+        $groupString = $pickedGroups -join ';'
+
+        $users.Add([PSCustomObject]@{
+                username = $resolvedUsername
+                groups   = $groupString
+                fullname = $resolvedFullName
+            })
+
+    } while ($true)
+
+    # Output Structured Deployment Object
+    [PSCustomObject]@{
+        MobileName       = $mobileName
+        WindowsComputers = $windowsComputers
+        LinuxComputers   = $linuxComputers
+        Users            = $users.ToArray()
+    }
+}
+
+
+function Write-MobileFile
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][PSCustomObject]$newMobile,
+        [Parameter(Mandatory = $true)][string]$mobilesPath
+    )
+
+    $outPath = Join-Path $mobilesPath $newMobile.MobileName
+    $lines = [System.Collections.Generic.List[string]]::new()
+
+    # [windows]
+    $lines.Add('[windows]')
+    foreach ($c in $newMobile.WindowsComputers)
+    {
+        if (-not [string]::IsNullOrWhiteSpace($c))
+        {
+            $lines.Add($c)
+        }
+    }
+
+    # [linux]
+    $lines.Add('[linux]')
+    foreach ($c in $newMobile.LinuxComputers)
+    {
+        if (-not [string]::IsNullOrWhiteSpace($c))
+        {
+            $lines.Add($c)
+        }
+    }
+
+    # [users]
+    $lines.Add('[users]')
+    $lines.Add('username,groups,fullname')
+    foreach ($u in $newMobile.Users)
+    {
+        $lines.Add("$($u.username),$($u.groups),$($u.fullname)")
+    }
+
+    # Write out without BOM issues or extra blank lines
+    [System.IO.File]::WriteAllLines($outPath, $lines)
+}
 
 
 

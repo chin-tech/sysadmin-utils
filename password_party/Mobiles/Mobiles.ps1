@@ -33,6 +33,9 @@ param(
     [Parameter(ParameterSetName = 'GPORemove')]
     [switch]$Force,
 
+    [Parameter(ParameterSetName='NewMobile')]
+    [switch]$New,
+
     # --- Optional Config Override ---
     [Parameter()]
     [hashtable]$ConfigOverride
@@ -68,5 +71,10 @@ switch ($PSCmdlet.ParameterSetName)
     'Deploy'
     {
         Start-MobileDeployment -MobileName $Name -Config $ConfigOverride
+    }
+    'NewMobile'
+    {
+        New-MobileDeployment -Config $ConfigOverRide
+
     }
 }
