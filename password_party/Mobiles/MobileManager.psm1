@@ -1,25 +1,47 @@
 # --- Configuration Loader ---
-$manifestCfg = $Script:DefaultConfig = $MyInvocation.MyCommand.Module.PrivateData.PSData.DefaultConfig
+$module = $MyInvocation.MyCommand.ScriptBlock.Module
+if (-not $module)
+{ $module = $MyInvocation.MyCommand.Module 
+}
+
+# Support both PrivateData.PSData.DefaultConfig and direct PrivateData.DefaultConfig
+$rawCfg = $module.PrivateData
+if ($rawCfg.PSData.DefaultConfig)
+{
+    $manifestCfg = $rawCfg.PSData.DefaultConfig
+} elseif ($rawCfg.DefaultConfig)
+{
+    $manifestCfg = $rawCfg.DefaultConfig
+} else
+{
+    $manifestCfg = @{}
+}
+
+$Script:DefaultConfig = $manifestCfg
 
 $adminRoot = $PSScriptRoot
-$mobileRoot = Join-Path $manifestCfg.nfsHomeRoot ".mobiles"
+$nfsRoot   = if ($manifestCfg.nfsHomeRoot)
+{ $manifestCfg.nfsHomeRoot 
+} else
+{ "C:\MobilesData" 
+} # Or appropriate fallback path
+$mobileRoot = Join-Path $nfsRoot ".mobiles"
 
 $script:Config = [PSCustomObject]@{
-    GpoID             = $manifestCfg.GpoID
-    nfsHomeRoot       = $manifestCfg.nfsHomeRoot
-    # LinuxBastion      = $manifestCfg.linuxBastion
-    SshKeyName        = $manifestCfg.sshKey
-    CertName          = $manifestCfg.CertName
-    fallbackPass      = $manifestCfg.fallbackPass
-    curLuks           = $manifestCfg.curLuks
-    encryptionPin     = $manifestCfg.encryptionPin
-    AdminRoot         = $adminRoot
-    NfsHome           = (Join-Path $manifestCfg.nfsHomeRoot $env:USERNAME)
-    MobileRoot        = $mobileRoot
-    MobileEntries     = (Join-Path $mobileRoot 'entries')     # Or wherever mobile INI/text files live
-    mobileDefaultUsers      = (Join-Path $mobileRoot '.default')
-    MobileDump        = (Join-Path $mobileRoot '.dump')
-    MobileDeployments = (Join-Path $mobileRoot '.deployments')
+    GpoID              = $manifestCfg.GpoID
+    nfsHomeRoot        = $nfsRoot
+    SshKeyName         = $manifestCfg.sshKey
+    CertName           = $manifestCfg.CertName
+    fallbackPass       = $manifestCfg.fallbackPass
+    curLuks            = $manifestCfg.curLuks
+    encryptionPin      = $manifestCfg.encryptionPin
+    AdminRoot          = $adminRoot
+    NfsHome            = (Join-Path $nfsRoot $env:USERNAME)
+    MobileRoot         = $mobileRoot
+    MobileEntries      = (Join-Path $mobileRoot 'entries')
+    mobileDefaultUsers = (Join-Path $mobileRoot '.default')
+    MobileDump         = (Join-Path $mobileRoot '.dump')
+    MobileDeployments  = (Join-Path $mobileRoot '.deployments')
 }
 
 function Get-MobileConfig
@@ -2049,6 +2071,8 @@ function New-MobileDeployment
 {
     [CmdletBinding()]
     param(
+        [Parameter()]
+        [object]$Config
     )
 
     $mobileName = Read-Host -Prompt "Enter a Mobile Name"
