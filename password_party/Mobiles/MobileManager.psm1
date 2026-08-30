@@ -21,9 +21,11 @@ $Script:DefaultConfig = $manifestCfg
 
 $adminRoot = $PSScriptRoot
 $nfsRoot   = if ($manifestCfg.nfsHomeRoot)
-{ $manifestCfg.nfsHomeRoot 
+{ 
+    $manifestCfg.nfsHomeRoot 
 } else
-{ "C:\MobilesData" 
+{ 
+    "C:\Temp\Mobiles" 
 } # Or appropriate fallback path
 $mobileRoot = Join-Path $nfsRoot ".mobiles"
 

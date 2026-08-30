@@ -44,6 +44,16 @@ param(
 # Import module from local directory
 $modulePath = Join-Path $PSScriptRoot 'MobileManager.psd1'
 Import-Module $modulePath -Force
+$overrideFile = "cfg.psd1"
+$ConfigOverRide = if (Test-Path $overrideFile)
+{
+    Import-PowerShellDataFile -Path $overrideFile
+} else
+{
+    $null
+}
+
+New-MobileDeployment -Config $ConfigOverRide
 
 switch ($PSCmdlet.ParameterSetName)
 {
