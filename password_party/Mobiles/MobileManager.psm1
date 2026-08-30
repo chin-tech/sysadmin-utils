@@ -460,21 +460,6 @@ function ConvertTo-BashArgument
     "'" + $v.Replace("'","'\''") + "'"
 }
 
-# function Invoke-Linux
-# {
-#     param(
-#         [string]$mobileName,
-#         [string]$bastionHost,
-#         [string]$sshKeyPath,
-#         [string]$scriptName,
-#         [string[]]$extraArgs
-#     )
-#     $a = @($mobileName) + $extraArgs
-#     $remoteArgs = ($a | ForEach-Object { ConvertTo-BashArgument $_}) -join ' '
-#
-#
-#     (Get-Content $scriptName -Raw) -replace "`r`n","`n" | ssh -i $sshKeyPath -q $bastionHost "bash -s -- $remoteArgs"
-# }
 
 
 
@@ -684,30 +669,6 @@ icacls.exe C:\Support /grant Administrators:F ISSO:F /T /Q
 
 
 
-# function Get-UserFullName
-# {
-#     [CmdLetBinding()]
-#     param(
-#         [Parameter()][string]$UserName,
-#         [Parameter()][string]$FullName
-#     )
-#
-#     if ([String]::IsNullOrWhiteSpace($FullName))
-#     {
-#         $uData = Get-ADUser -Filter "SamAccountName -eq '$UserName'" -Properties Name,DisplayName,GivenName,Surname 
-#         if (! ([string]::IsNullOrWhiteSpace($uData.DisplayName)))
-#         { 
-#             return $uData.DisplayName 
-#         }
-#         if (! ([string]::IsNullOrWhiteSpace($uData.GivenName) -and [string]::IsNullOrWhiteSpace($uData.SurName)))
-#         { 
-#             return $uData.GivenName + $uData.Surname 
-#         }
-#     }
-#
-#     return $FullName
-#
-# }
 
 function Get-UserFullName
 {
@@ -1380,74 +1341,6 @@ function Get-MobileOverview
 }
 
 
-# function Set-MobileGpoPermission
-# {
-#     [CmdletBinding(DefaultParameterSetName = 'Add')]
-#     param(
-#         [Parameter(Mandatory = $true, Position = 0)]
-#         [string]$MobileName,
-#
-#         [Parameter(Mandatory = $true)]
-#         [string]$GpoID,
-#
-#         [Parameter(Mandatory = $true, ParameterSetName = 'Add')]
-#         [switch]$Add,
-#
-#         [Parameter(Mandatory = $true, ParameterSetName = 'Remove')]
-#         [switch]$Remove,
-#
-#         [Parameter(ParameterSetName = 'Remove')]
-#         [switch]$Force,
-#
-#         [Parameter()]
-#         [PSCustomObject]$Config
-#
-#     )
-#
-#     $cfg = Get-MobileConfig $Config
-#
-#
-#     if ($Force -and $Remove)
-#     {
-#         Get-GPPermission -Guid $gpoId -All |
-#             Where-Object { $_.Trustee.SidType -eq 'User' -and $_.Permission -eq 'GpoRead' } |
-#             ForEach-Object {
-#                 Set-GPPermission -Guid $gpoId -TargetName $_.Trustee.Name -TargetType User -PermissionLevel None -Confirm:$false
-#             }
-#         Write-Host "[+] Force removed all user permissions from GPO ($gpoId)" -ForegroundColor Yellow
-#         return
-#     }
-#
-#     $mobileData = Get-MobileData -MobileName $MobileName -Config $cfg
-#     $targetUsers = if ($Add)
-#     { 
-#         $mobileData.AllUsers 
-#     } else
-#     { 
-#         $mobileData.MobileUsers 
-#     }
-#
-#     foreach ($u in $targetUsers)
-#     {
-#         $permLevel = if ($Add)
-#         { 
-#             'GpoRead' 
-#         } else
-#         { 
-#             'None' 
-#         }
-#         Set-GPPermission -Guid $gpoId -TargetName $u.Name -TargetType User -PermissionLevel $permLevel -Confirm:$false -ErrorAction SilentlyContinue
-#     }
-#
-#     $actionText = if ($Add)
-#     { 
-#         "Added" 
-#     } else
-#     {
-#         "Removed" 
-#     }
-#     Write-Host "[+] $actionText users from '$MobileName' for GPO ($gpoId)" -ForegroundColor Green
-# }
 
 function Set-MobileGpoPermission
 {
