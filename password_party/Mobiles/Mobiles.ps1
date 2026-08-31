@@ -53,7 +53,7 @@ $ConfigOverRide = if (Test-Path $overrideFile)
     $null
 }
 
-New-MobileDeployment -Config $ConfigOverRide
+
 
 switch ($PSCmdlet.ParameterSetName)
 {
