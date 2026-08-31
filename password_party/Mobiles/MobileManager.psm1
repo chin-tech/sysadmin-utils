@@ -2257,12 +2257,14 @@ function Write-MobileFile
 {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][PSCustomObject]$newMobile,
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$newMobile,
         [Parameter(Mandatory = $false)]
         [ValidateNotNullOrEmpty()]
-        [string]$mobilesPath   = $script:config.MobileEntries
+        [string]$mobilesPath   = $script:manifestCfg.MobileEntries
     )
 
+    Write-Host $Script:manifestCfg
     $outPath = Join-Path $mobilesPath $newMobile.MobileName
     Write-Host "[+] Mobile getting written to $outpath"
     $lines = [System.Collections.Generic.List[string]]::new()
