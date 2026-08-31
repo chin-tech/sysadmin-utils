@@ -2264,6 +2264,7 @@ function Write-MobileFile
     )
 
     $outPath = Join-Path $mobilesPath $newMobile.MobileName
+    Write-Host "[+] Mobile getting written to $outpath"
     $lines = [System.Collections.Generic.List[string]]::new()
 
     # [windows]
