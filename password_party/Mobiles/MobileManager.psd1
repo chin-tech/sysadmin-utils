@@ -25,6 +25,7 @@
         'Start-MobileDeployment',
         'Initialize-Ssh-Environment'
         'New-MobileDeployment'
+        'Write-MobileFile'
     )
 
     # Cmdlets, Variables, and Aliases to export

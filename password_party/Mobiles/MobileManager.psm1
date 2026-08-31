@@ -2258,7 +2258,9 @@ function Write-MobileFile
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][PSCustomObject]$newMobile,
-        [Parameter(Mandatory = $true)][string]$mobilesPath
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$mobilesPath   = $script:config.MobileEntries
     )
 
     $outPath = Join-Path $mobilesPath $newMobile.MobileName
