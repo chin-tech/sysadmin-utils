@@ -2244,7 +2244,7 @@ function New-MobileDeployment
     } while ($true)
 
     # Output Structured Deployment Object
-    [PSCustomObject]@{
+    Write-MobileFile  -NewMobile  [PSCustomObject]@{
         MobileName       = $mobileName
         WindowsComputers = $windowsComputers
         LinuxComputers   = $linuxComputers
