@@ -2264,7 +2264,9 @@ function Write-MobileFile
         [string]$mobilesPath   = $script:manifestCfg.MobileEntries
     )
 
-    Write-Host $Script:manifestCfg
+    Write-Host $Script:manifestCfg.Keys
+    Write-Host $newMobile
+    Write-Host $mobilesPath
     $outPath = Join-Path $mobilesPath $newMobile.MobileName
     Write-Host "[+] Mobile getting written to $outpath"
     $lines = [System.Collections.Generic.List[string]]::new()
