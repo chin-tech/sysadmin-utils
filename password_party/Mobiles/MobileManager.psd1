@@ -43,8 +43,8 @@
                 fallbackPass    = 'defaultPass'
                 curLuks         = 'defaultLuks'
                 encryptionPin     = 'defaultPin'
-                adminRoot = "\\nas2\admin"
-                nfsHomeRoot   = "\\netapp\home"
+                adminRoot = "C:\TEMP"
+                nfsHomeRoot   = "C:\TEMP\"
 
             }
         }
