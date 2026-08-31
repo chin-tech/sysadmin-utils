@@ -2252,132 +2252,133 @@ function New-MobileDeployment
     }
     # Output Structured Deployment Object
     Write-MobileFile  -NewMobile  $mobile
+}
 
 
-    function Write-MobileFile
+function Write-MobileFile
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$newMobile,
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$mobilesPath   = $script:Config.MobileEntries
+    )
+
+    Write-Host $Script:Config.Keys
+    Write-Host $newMobile.MobileName
+    Write-Host $mobilesPath
+    $outPath = Join-Path $Script:Config.MobileEntries $newMobile.MobileName
+    Write-Host "[+] Mobile getting written to $outpath"
+    $lines = [System.Collections.Generic.List[string]]::new()
+
+    # [windows]
+    $lines.Add('[windows]')
+    foreach ($c in $newMobile.WindowsComputers)
     {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)]
-            [PSCustomObject]$newMobile,
-            [Parameter(Mandatory = $false)]
-            [ValidateNotNullOrEmpty()]
-            [string]$mobilesPath   = $script:Config.MobileEntries
-        )
-
-        Write-Host $Script:Config.Keys
-        Write-Host $newMobile.MobileName
-        Write-Host $mobilesPath
-        $outPath = Join-Path $Script:Config.MobileEntries $newMobile.MobileName
-        Write-Host "[+] Mobile getting written to $outpath"
-        $lines = [System.Collections.Generic.List[string]]::new()
-
-        # [windows]
-        $lines.Add('[windows]')
-        foreach ($c in $newMobile.WindowsComputers)
+        if (-not [string]::IsNullOrWhiteSpace($c))
         {
-            if (-not [string]::IsNullOrWhiteSpace($c))
-            {
-                $lines.Add($c)
-            }
+            $lines.Add($c)
         }
-
-        # [linux]
-        $lines.Add('[linux]')
-        foreach ($c in $newMobile.LinuxComputers)
-        {
-            if (-not [string]::IsNullOrWhiteSpace($c))
-            {
-                $lines.Add($c)
-            }
-        }
-
-        # [users]
-        $lines.Add('[users]')
-        $lines.Add('username,groups,fullname')
-        foreach ($u in $newMobile.Users)
-        {
-            $lines.Add("$($u.username),$($u.groups),$($u.fullname)")
-        }
-
-        # Write out without BOM issues or extra blank lines
-        [System.IO.File]::WriteAllLines($outPath, $lines)
     }
 
+    # [linux]
+    $lines.Add('[linux]')
+    foreach ($c in $newMobile.LinuxComputers)
+    {
+        if (-not [string]::IsNullOrWhiteSpace($c))
+        {
+            $lines.Add($c)
+        }
+    }
+
+    # [users]
+    $lines.Add('[users]')
+    $lines.Add('username,groups,fullname')
+    foreach ($u in $newMobile.Users)
+    {
+        $lines.Add("$($u.username),$($u.groups),$($u.fullname)")
+    }
+
+    # Write out without BOM issues or extra blank lines
+    [System.IO.File]::WriteAllLines($outPath, $lines)
+}
 
 
 
 
-    # function Unregister-Deployment
-    # {
-    #     [CmdletBinding()]
-    #     param(
-    #         [Parameter(Mandatory = $true)]
-    #         [string]$MobileName,
-    #
-    #         [Parameter(Mandatory = $true)]
-    #         [hashtable]$Config,
-    #
-    #         [Parameter()]
-    #         [string]$archiveDir = "C:\Mobiles\"
-    #
-    #     )
-    #
-    #     $cfg = Get-MobileConfig $config
-    #     $mobileData = Get-MobileData  -MobileName $MobileName -defaultUserpath $cfg.DefaultUsers -mobileEntriesPath $cfg.MobileEntries -fallbackPass $cfg.DefaultPass
-    #     $taskData = Get-TaskData
-    #
-    #     $scriptBlock = {
-    #         param([array]$AllUsers, [hashtable]$Tasks, [string]$archiveDir)
-    #
-    #         $curDate = Get-Date
-    #         $archivePath = Join-Path $archiveDir "$($curDate.Year)"
-    #         if (-not (Test-Path $archivePath))
-    #         {
-    #             New-Item -ItemType Directory -Force $archivePath
-    #         }
-    #
-    #
-    #
-    #         foreach ($u in $AllUsers)
-    #         {
-    #             $name = $u.Name
-    #             $sid = (Get-LocalUser -Name $name -ErrorAction SilentlyContinue).Sid.Value
-    #
-    #             $profilePath = "C:\Users\$name"
-    #             if (Test-Path $profilePath)
-    #             {
-    #                 $ts = (Get-Date).ToString('yyyyMMdd')
-    #                 $archiveFile = Join-Path $archivePath "$($name)_${ts}.zip"
-    #                 Compress-Archive -Path $profilePath -DestinationPath $archiveFile -CompressionLevel Optimal
-    #
-    #             }
-    #             $profileObject = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.SID -eq $sid -or $_.LocalPath -ieq $profilePath }
-    #
-    #             if ($profileObject)
-    #             {$profileObject | Remove-CimInstance
-    #             } elseif (Test-Path $profilePath)
-    #             { Remove-Item -Force -Recurse -Path $profilePath -ErrorAction SilentlyContinue
-    #             }
-    #             Remove-LocalUser $name -ErrorAction SilentlyContinue
-    #         }
-    #
-    #     }
-    #
-    #
-    #     Invoke-Command -ComputerName $mobileData.Windows -ScriptBlock $scriptBlock -ArgumentList $mobileData.AllUsers,$taskData,$archiveDir
-    #     $linuxDeploy = Get-LinuxDeployScript -oldEncryption $config.curLuks -encryptionPin $Config.encryptionPin  
-    #     $jobs = foreach ($h in $mobileData.Linux)
-    #     {
-    #         Start-Job -ScriptBlock {
-    #             param($target, $payload, $key)
-    #             $payload | ssh -i $key -o BatchMode=yes -o StrictHostKeyChecking=no $target "bash -s --"
-    #
-    #         } -ArgumentList $h,$bashScript,$sshKey
-    #     }
-    #     $linRes = $jobs | Receive-Job -Wait -AutoRemoveJob
-    #
-    # }
-    #
-    #
-    #
+
+# function Unregister-Deployment
+# {
+#     [CmdletBinding()]
+#     param(
+#         [Parameter(Mandatory = $true)]
+#         [string]$MobileName,
+#
+#         [Parameter(Mandatory = $true)]
+#         [hashtable]$Config,
+#
+#         [Parameter()]
+#         [string]$archiveDir = "C:\Mobiles\"
+#
+#     )
+#
+#     $cfg = Get-MobileConfig $config
+#     $mobileData = Get-MobileData  -MobileName $MobileName -defaultUserpath $cfg.DefaultUsers -mobileEntriesPath $cfg.MobileEntries -fallbackPass $cfg.DefaultPass
+#     $taskData = Get-TaskData
+#
+#     $scriptBlock = {
+#         param([array]$AllUsers, [hashtable]$Tasks, [string]$archiveDir)
+#
+#         $curDate = Get-Date
+#         $archivePath = Join-Path $archiveDir "$($curDate.Year)"
+#         if (-not (Test-Path $archivePath))
+#         {
+#             New-Item -ItemType Directory -Force $archivePath
+#         }
+#
+#
+#
+#         foreach ($u in $AllUsers)
+#         {
+#             $name = $u.Name
+#             $sid = (Get-LocalUser -Name $name -ErrorAction SilentlyContinue).Sid.Value
+#
+#             $profilePath = "C:\Users\$name"
+#             if (Test-Path $profilePath)
+#             {
+#                 $ts = (Get-Date).ToString('yyyyMMdd')
+#                 $archiveFile = Join-Path $archivePath "$($name)_${ts}.zip"
+#                 Compress-Archive -Path $profilePath -DestinationPath $archiveFile -CompressionLevel Optimal
+#
+#             }
+#             $profileObject = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.SID -eq $sid -or $_.LocalPath -ieq $profilePath }
+#
+#             if ($profileObject)
+#             {$profileObject | Remove-CimInstance
+#             } elseif (Test-Path $profilePath)
+#             { Remove-Item -Force -Recurse -Path $profilePath -ErrorAction SilentlyContinue
+#             }
+#             Remove-LocalUser $name -ErrorAction SilentlyContinue
+#         }
+#
+#     }
+#
+#
+#     Invoke-Command -ComputerName $mobileData.Windows -ScriptBlock $scriptBlock -ArgumentList $mobileData.AllUsers,$taskData,$archiveDir
+#     $linuxDeploy = Get-LinuxDeployScript -oldEncryption $config.curLuks -encryptionPin $Config.encryptionPin  
+#     $jobs = foreach ($h in $mobileData.Linux)
+#     {
+#         Start-Job -ScriptBlock {
+#             param($target, $payload, $key)
+#             $payload | ssh -i $key -o BatchMode=yes -o StrictHostKeyChecking=no $target "bash -s --"
+#
+#         } -ArgumentList $h,$bashScript,$sshKey
+#     }
+#     $linRes = $jobs | Receive-Job -Wait -AutoRemoveJob
+#
+# }
+#
+#
+#
