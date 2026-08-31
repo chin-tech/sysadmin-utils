@@ -85,7 +85,7 @@ switch ($PSCmdlet.ParameterSetName)
     'NewMobile'
     {
         $data = New-MobileDeployment -Config $ConfigOverRide
-        Write-MobileFile -MobileName $data
+        Write-MobileFile -NewMobile $data
 
     }
 }
