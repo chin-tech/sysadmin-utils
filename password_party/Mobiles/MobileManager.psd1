@@ -26,6 +26,7 @@
         'Initialize-Ssh-Environment'
         'New-MobileDeployment'
         'Write-MobileFile'
+        'Set-MobileGpoPermission'
     )
 
     # Cmdlets, Variables, and Aliases to export

@@ -30,20 +30,21 @@ $nfsRoot   = if ($manifestCfg.nfsHomeRoot)
 $mobileRoot = Join-Path $nfsRoot ".mobiles"
 
 $script:Config = [PSCustomObject]@{
-    GpoID              = $manifestCfg.GpoID
     nfsHomeRoot        = $nfsRoot
+    AdminRoot          = $adminRoot
+    MobileRoot         = $mobileRoot
+    GpoID              = $manifestCfg.GpoID
     SshKeyName         = $manifestCfg.sshKey
     CertName           = $manifestCfg.CertName
     fallbackPass       = $manifestCfg.fallbackPass
     curLuks            = $manifestCfg.curLuks
     encryptionPin      = $manifestCfg.encryptionPin
-    AdminRoot          = $adminRoot
     NfsHome            = (Join-Path $nfsRoot $env:USERNAME)
-    MobileRoot         = $mobileRoot
     MobileEntries      = (Join-Path $mobileRoot 'entries')
     mobileDefaultUsers = (Join-Path $mobileRoot '.default')
     MobileDump         = (Join-Path $mobileRoot '.dump')
     MobileDeployments  = (Join-Path $mobileRoot '.deployments')
+    SSHKeyPath         = Join-Path (Join-Path $nfsRoot $env:USERNAME) ".ssh\$($manifestCfg.sshKey)"
 }
 
 function Get-MobileConfig
@@ -277,6 +278,7 @@ function Invoke-Linux
 }
 
 
+
 function Set-Groups
 {
     [CmdletBinding()]
@@ -296,19 +298,24 @@ function Set-Groups
         switch -WildCard ($g)
         {
             'i*'
-            { return @('isso')
+            {
+                return @('isso')
             }
             't*'
-            { return @('adm')
+            { 
+                return @('adm')
             }
             'p*'
-            {$grps += @("priv")
+            {
+                $grps += @("priv")
             }
             'd*rw'
-            { $grps += @("dtrw")
+            { 
+                $grps += @("dtrw")
             }
             'd*ro'
-            { $grps += @("dtro")
+            { 
+                $grps += @("dtro")
             }
         }
     }
@@ -419,9 +426,11 @@ function New-TaskXML
             ([TaskTriggerType]::Daily)
             {
                 $trigger.DaysInterval = if ($cfg.ContainsKey('DaysInterval'))
-                { $cfg.DaysInterval 
+                { 
+                    $cfg.DaysInterval 
                 } else
-                { 1 
+                { 
+                    1 
                 }
                 if (-not $trigger.StartBoundary)
                 {
@@ -506,35 +515,29 @@ function Initialize-Ssh-Environment
 {
     [CmdletBinding()]
     param(
-        [Parameter()][string]$KeyName = 'deployer',
-        [Parameter()][string]$nfsHome 
+        [string]$keyPath = $Script:Config.SSHKeyPath,
+        [string]$keyName = $Script:Config.SshKeyName,
+        [string]$nfsHome = $Script:Config.NfsHome
     )
     # r = remote ; l = local
     $nfsSSH = Join-Path  $nfsHome '.ssh'
     $localSSh = Join-Path "${env:HOME}" ".ssh"
-    $rConfig = Join-Path  $nfsSSH 'config'
     $rAuthorized = Join-Path $nfsSSH 'authorized_keys'
-    $rKey = Join-Path $nfsSSH $keyName
-
 
     @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_) } | ForEach-Object {
         New-Item -ItemType Directory -Path $_ -Force | Out-Null
     }
 
-    if (-not (Select-String -Pattern $KeyName -Path $rConfig -Quiet))
+    if (-not (Test-Path $keyPath))
     {
-        if (-not (Test-Path $rKey))
-        {
-            ssh-keygen -f "$rKey" -C "''" -N "''" -t ecdsa -q
-        }
-        $pubKey = ssh-keygen -yf $rKey
-
-        if (-not (Select-String -Pattern $pubKey -Path $rAuthorized))
-        {
-            $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
-        }
-        
+        ssh-keygen -f "$keyPath" -C "''" -N "''" -t ecdsa -q
     }
+    $pubKey = ssh-keygen -yf $keyPath
+    if (-not (Select-String -Pattern $pubKey -Path $rAuthorized))
+    {
+        $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
+    }
+
 
 }
 
@@ -542,25 +545,24 @@ function Initialize-Functionality
 {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
-        [PSCustomObject]$Config
+        [Parameter()]
+        [string]$sshKeyName = $script:Config.SshKeyName,
+        [string]$sshKeyPath = $script:Config.SSHKeyPath,
+        [string]$nfsHome = $script:Config.nfsHome,
+        [string]$adminRoot = $script:Config.AdminRoot,
+        [string]$certName = $script:Config.certName
+
     )
 
-    $cfg = Get-MobileConfig $Config
-
-    # 1. Prime SSH Keys and Authorized Keys
-    if (-not [string]::IsNullOrWhiteSpace($cfg.NfsHome) -and -not [string]::IsNullOrWhiteSpace($cfg.SshKeyName))
-    {
-        Initialize-Ssh-Environment -KeyName $cfg.SshKeyName -nfsHome $cfg.NfsHome
-    }
+    Initialize-Ssh-Environment -KeyName $sshKeyName -nfsHome $nfsHome
 
     # 2. Ensure Document Encryption Certificate Exists in CurrentUser\My
     $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My | 
-        Where-Object { $_.Subject -like '*CN=MobileDeployer*' -or $_.Subject -like "*$($cfg.CertName)*" }
+        Where-Object { $_.Subject -like '*CN=MobileDeployer*' -or $_.Subject -like "*$($certName)*" }
 
     if (-not $existingCert)
     {
-        $pfxFileName = "$($cfg.CertName).pfx"
+        $pfxFileName = "$($certName).pfx"
         $pfxFullPath = Join-Path $cfg.AdminRoot $pfxFileName
         # $securePass  = ConvertTo-SecureString -AsPlainText -Force $cfg.DefaultPass
         $securePass = Read-Host -AsSecureString -Prompt "[!] The decryption certificate isn't in your cert store. Please enter the administrative password to import it "
@@ -572,8 +574,8 @@ function Initialize-Functionality
         } else
         {
             # Generates PFX/CER in the target directory and automatically adds to Cert:\CurrentUser\My
-            New-DeployerCertificate -certPass $securePass -outPath $cfg.AdminRoot
-            Write-Host "[+] Generated and installed new deployment certificate in: $($cfg.AdminRoot)" -ForegroundColor Green
+            New-DeployerCertificate -certPass $securePass -outPath $pfxFullPath
+            Write-Host "[+] Generated and installed new deployment certificate in: $($pfxFullPath)" -ForegroundColor Green
         }
     }
 }
@@ -718,14 +720,18 @@ function Get-UserFullName
             }
 
             $first = if ($props.Contains('givenName'))
-            { $props['givenName'][0] 
+            {
+                $props['givenName'][0] 
             } else
-            { '' 
+            { 
+                '' 
             }
             $last  = if ($props.Contains('sn'))
-            { $props['sn'][0] 
+            { 
+                $props['sn'][0] 
             } else
-            { '' 
+            {
+                '' 
             }
             $combined = "$first $last".Trim()
 
@@ -1065,19 +1071,24 @@ function Get-MobileData
             switch -Regex ($grp)
             {
                 '^a.*'
-                {$desc += 'System Administrator'
+                {
+                    $desc += 'System Administrator'
                 }
                 '^i.*'
-                {$desc += 'Cybersecurity'
+                {
+                    $desc += 'Cybersecurity'
                 }
                 '^l.*'
-                {$desc += 'General User'
+                {
+                    $desc += 'General User'
                 }
                 '^d.*'
-                {$desc += 'Data Transfer'
+                {
+                    $desc += 'Data Transfer'
                 }
                 '^p.*'
-                {$desc += 'Privileged User'
+                {
+                    $desc += 'Privileged User'
                 }
             }
 
@@ -1289,7 +1300,7 @@ function Get-MobileOverview
 
         if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyName))
         {
-            Initialize-Ssh-Environment -KeyName $sshKeyName -nfsHome $nfsHome
+            Initialize-Ssh-Environment
         }
 
         $computerData = Invoke-InformationCollector `
@@ -1526,18 +1537,20 @@ function Start-MobileDeployment
         [Parameter(Mandatory = $true, Position = 0)]
         [string]$MobileName,
         [Parameter()]
-        [PSCustomObject]$Config
-        # [Parameter()]
-        # [string]$EncryptPass = 'defaultPin',
-        # [Parameter()]
-        # [string]$userFallBackPass    = 'defaultPassword',
+        [string]$sshKeyName = $Script:Config.sshKeyName,
+        [string]$sshKeyPath = $Script:Config.SSHKeyPath,
+        [string]$certName = $Script:Config.certName,
+        [string]$adminRoot = $Script:Config.adminRoot,
+        [string]$defaultPass = $Script:Config.defaultPass, 
+        [string]$defaultPin = $Script:Config.defaultPin,
+        [string]$oldEncryption = $Script:Config.curLuks,
+        [string]$mobileDump = $Script:Config.mobileDump
     )
 
     $cfg = Get-MobileConfig $Config
-    Initialize-Functionality -Config $Config
-    $mobileData = Get-MobileData -MobileName $MobileName -Config $cfg
-    $sshKeyPath = Join-Path $cfg.nfsHome ".ssh\$($cfg.sshKeyName)"
-    $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $cfg.MobileDump 
+    Initialize-Functionality -sshKeyName $sshKeyName -nfsHome $nfsHome -adminRoot $adminRoot -sshKeyPath -certName $certName
+    $mobileData = Get-MobileData -MobileName $MobileName 
+    $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
     $groupDict = @{
         'Administrators' = @("isso","adm","priv")
@@ -1605,33 +1618,32 @@ function Start-MobileDeployment
             }
         }
     }
-}
 
-
-# Need the linux computers and the linux computers there for easy processing
-# $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
+    # Need the linux computers and the linux computers there for easy processing
+    # $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
     
-$linRes = @()
-if ($mobileData.Linux.Count -gt 0)
-{
-    $linuxDeploy = Get-LinuxDeployScript -oldEncryption $cfg.curLuks -encryptionPin $cfg.encryptionPin -nfsHome $cfg.nfsHome -allUsers $mobileData.AllUsers
-    $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $key
-    
-    foreach ($r in $linRes)
+    $linRes = @()
+    if ($mobileData.Linux.Count -gt 0)
     {
-        if ($r.ExitCode -eq 0)
+        $linuxDeploy = Get-LinuxDeployScript -oldEncryption $oldEncryption -encryptionPin $defaultPin -nfsHome $nfsHome -allUsers $mobileData.AllUsers
+        $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $key
+    
+        foreach ($r in $linRes)
         {
-            Write-Host "[Linux] - $($r.Target) - [ OK ]" -ForegroundColor green
+            if ($r.ExitCode -eq 0)
+            {
+                Write-Host "[Linux] - $($r.Target) - [ OK ]" -ForegroundColor green
 
-        } else
-        {
+            } else
+            {
             
-            Write-Host "[Linux] - $($r.Target) - [ FAIL ]" -ForegroundColor red
+                Write-Host "[Linux] - $($r.Target) - [ FAIL ]" -ForegroundColor red
 
+            }
         }
+
+
     }
-
-
 }
 
 
@@ -1708,16 +1720,20 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
                 switch ($_.ResultCode)
                 {
                     2
-                    {"Succeeded"
+                    {
+                        "Succeeded"
                     }
                     3
-                    {"Succeeded With Errors"
+                    {
+                        "Succeeded With Errors"
                     }
                     4
-                    {"Failed"
+                    {
+                        "Failed"
                     }
                     5
-                    {"Aborted"
+                    {
+                        "Aborted"
                     }
                     default
                     { "Other: ($($_.ResultCode))"
@@ -2073,8 +2089,8 @@ function New-MobileDeployment
 {
     [CmdletBinding()]
     param(
-        [Parameter()]
-        [object]$Config
+        [string]$mobilePath = $Script:Config.MobileEntries
+
     )
 
     $mobileName = Read-Host -Prompt "Enter a Mobile Name"
@@ -2251,7 +2267,7 @@ function New-MobileDeployment
 
     }
     # Output Structured Deployment Object
-    Write-MobileFile  -NewMobile  $mobile
+    Write-MobileFile  -NewMobile  $mobile -mobilesPath $mobilePath
 }
 
 
