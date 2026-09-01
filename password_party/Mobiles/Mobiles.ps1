@@ -64,7 +64,7 @@ switch ($PSCmdlet.ParameterSetName)
             Get-MobileOverview -Config $ConfigOverride
         } else
         {
-            Get-GPOMobileOverview -MobileName $Name -Config $ConfigOverride -Full:$Full
+            Get-MobileOverview -MobileName $Name -Config $ConfigOverride -Full:$Full
         }
     }
 
