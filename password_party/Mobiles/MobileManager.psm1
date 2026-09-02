@@ -1435,7 +1435,7 @@ function Get-MobileOverview
                 { 'N/A' 
                 }
 
-                Write-Host ("$($fmt -f $l.HostName, $l.Cores, $kernelVer, $clamDef, $l.HasLas)") -NoNewline
+                Write-Host ("$($fmt -f $l.HostName, $l.Cores, $kernelVer, $clamDef, $l.HasLaps, '')") -NoNewline
                 Write-Host $statusText -ForegroundColor $statusColor
             }
         }
@@ -1834,9 +1834,7 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
 
     if (@($winComputers).Count -gt 0)
     {
-        Write-Host "[DEBUG] -- $($winComputers)"
         $winResult = Invoke-Command -ComputerName $winComputers -ScriptBlock $windowsInformationBlock -ErrorAction SilentlyContinue -ErrorVariable winFails
-        Write-Host "[DEBUG] - $winResult -- $winFails"
     }
 
     if (@($linComputers).Count -gt 0)
