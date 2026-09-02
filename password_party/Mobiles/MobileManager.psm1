@@ -530,11 +530,19 @@ function Initialize-Ssh-Environment
         New-Item -ItemType Directory -Path $_ -Force | Out-Null
     }
 
+    
+    icacls.exe $nfsSSH /inheritance:r /T |Out-Null
+    icacls.exe $nfsSSH /grant:r "$(env:USERNAME):(R)" /T |out-null
+
+
+    icacls.exe $localSSH /inheritance:r |Out-Null
+    icacls.exe $localSSH /grant:r "$(env:USERNAME):(R)" /T | Out-Null
+
     if (-not (Test-Path $keyPath))
     {
         ssh-keygen -f "$keyPath" -C "''" -N "''" -t ecdsa -q
         icacls.exe $keyPath /inheritance:r |Out-Null
-        icacls.exe $keyPath /grant:r "$(env:USERNAME):(R)"
+        icacls.exe $keyPath /grant:r "$(env:USERNAME):(R)"| Out-Null
 
     }
     $pubKey = ssh-keygen -yf $keyPath
@@ -542,7 +550,7 @@ function Initialize-Ssh-Environment
     {
         $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
         icacls.exe $rAuthorized /inheritance:r |Out-Null
-        icacls.exe $rAuthorized /grant:r "$(env:USERNAME):(R)"
+        icacls.exe $rAuthorized /grant:r "$(env:USERNAME):(R)"| Out-Null
     }
 
 
