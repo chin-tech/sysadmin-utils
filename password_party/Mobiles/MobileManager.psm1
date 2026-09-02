@@ -1735,9 +1735,15 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
             Where-Object { $_.DisplayName -and -not $_.SystemComponent -and $_.WindowsInstaller -ne 1 -or $_.DisplayName } |
             Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
             Sort-Object DisplayName -Unique
-        $adminRotateScriptVersion = ((schtasks /query /tn admin-task /xml) | Select-String -Pattern '<Version>(.*?)</Version>').Matches.Groups[1].Value
+        $adminRotateScriptVersion = ""
+        $adminScriptExists = Get-ScheduledTask -TaskName ADMIN-LAPS -ErrorAction SilentlyContinue
+        if (-not ($null -eq $adminScriptExists))
+        {
+            $adminRotateScriptVersion = ((schtasks /query /tn admin-task /xml) | Select-String -Pattern '<Version>(.*?)</Version>').Matches.Groups[1].Value
 
-        $activation = Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" |    Where-Object { $_.PartialProductKey } | Select-Object -First 1 -ExpandProperty LicenseStatus
+        }
+
+        $activation = Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" -ErrorAction SilentlyContinue |    Where-Object { $_.PartialProductKey } | Select-Object -First 1 -ExpandProperty LicenseStatus
 
         $licenseStatusMap = @{
             0 = 'Unlicensed'
@@ -1796,7 +1802,7 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
 
     if ($winComputers -gt 0)
     {
-        $winResult = Invoke-Command -ComputerName $winComputers -ScriptBlock $windowsInformationBlock
+        $winResult = Invoke-Command -ComputerName $winComputers -ScriptBlock $windowsInformationBlock -ErrorAction SilentlyContinue -ErrorVariable winFails
     }
 
     if ($linComputers -gt 0)
@@ -1828,6 +1834,7 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
     return [PSCustomObject]@{
         Windows = $winResult
         Linux   = $linResult
+        WinFails = $winFails
     }
 }
 
