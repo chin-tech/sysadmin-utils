@@ -27,7 +27,7 @@
         'New-MobileDeployment'
         'Write-MobileFile'
         'Set-MobileGpoPermission'
-        'Set-MobileDebug'
+        'Set-Debug'
     )
 
     # Cmdlets, Variables, and Aliases to export
