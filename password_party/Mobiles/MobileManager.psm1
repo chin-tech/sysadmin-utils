@@ -1230,12 +1230,13 @@ function Get-MobileOverview
 
     if ($PSCmdlet.ParameterSetName -eq 'Config')
     {
-        $defaultUsersPath  = $Config.mobileDefaultUsers
-        $mobileEntriesPath = $Config.MobileEntries
-        $fallBackPass      = $Config.fallbackPass
-        $nfsHome           = $Config.NfsHome
-        $sshKeyPath        = $Config.sshKeyPath
-        $mobileDumpPath    = $Config.MobileDump
+        $cfg = Get-MobileConfig $config
+        $defaultUsersPath  = $cfg.mobileDefaultUsers
+        $mobileEntriesPath = $cfg.MobileEntries
+        $fallBackPass      = $cfg.fallbackPass
+        $nfsHome           = $cfg.NfsHome
+        $sshKeyPath        = $cfg.sshKeyPath
+        $mobileDumpPath    = $cfg.MobileDump
     }
 
     $data = Get-MobileData -MobileName $MobileName -defaultUserpath $defaultUsersPath -mobileEntriesPath $mobileEntriesPath -fallbackPass $fallBackPass
