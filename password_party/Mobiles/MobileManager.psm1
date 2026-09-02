@@ -944,12 +944,12 @@ function Get-MobileData
         [Parameter(Position = 0)]
         [string]$MobileName,
         
-        [Parameter(Mandatory = $true, ParameterSetName = 'ExplicitPaths')]
-        [string]$defaultUserpath,
-        [Parameter(Mandatory = $true, ParameterSetName = 'ExplicitPaths')]
-        [string]$mobileEntriesPath,
-        [Parameter(Mandatory = $true, ParameterSetName = 'ExplicitPaths')]
-        [string]$fallbackPass,
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$defaultUserpath = $Script:Config.defaultUsers,
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$mobileEntriesPath = $Script:Config.MobileEntries,
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$fallbackPass = $Script:Config.fallbackPass,
         
         [Parameter(Mandatory = $true, ParameterSetName = 'Config')]
         [PSCustomObject]$Config
