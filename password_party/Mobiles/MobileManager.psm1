@@ -238,7 +238,7 @@ function Write-DebugOutput
     param(
         [string]$msg
     )
-    if ($using:DEBUG)
+    if ($script:DebugEnabled)
     {
 
         Write-Host "[DEBUG] $msg" -ForegroundColor Gray
