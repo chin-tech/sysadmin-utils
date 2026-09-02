@@ -1346,7 +1346,6 @@ function Get-MobileOverview
         $computerData = Invoke-InformationCollector `
             -winComputers $data.Windows `
             -linComputers $data.Linux `
-            -nfsHome $nfsHome `
             -sshKeyName $sshKeyPath
 
         # Render Linux Audit Results
