@@ -57,7 +57,7 @@ $ConfigOverRide = if (Test-Path $overrideFile)
 }
 
 
-Set-MobileDebug -Enable:$enableDebug
+Set-Debug -Enable:$enableDebug
 
 switch ($PSCmdlet.ParameterSetName)
 {
