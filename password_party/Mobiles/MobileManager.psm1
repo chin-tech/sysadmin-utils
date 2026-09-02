@@ -523,10 +523,10 @@ function Initialize-Ssh-Environment
     )
     # r = remote ; l = local
     $nfsSSH = Join-Path  $nfsHome '.ssh'
-    $localSSh = Join-Path "${env:HOME}" ".ssh"
+    $localSSh = Join-Path $env:HOME ".ssh"
     $rAuthorized = Join-Path $nfsSSH 'authorized_keys'
 
-    @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_) } | ForEach-Object {
+    @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_ ) } | ForEach-Object {
         New-Item -ItemType Directory -Path $_ -Force | Out-Null
     }
 
@@ -541,10 +541,11 @@ function Initialize-Ssh-Environment
     if (-not (Test-Path $keyPath))
     {
         ssh-keygen -f "$keyPath" -C "''" -N "''" -t ecdsa -q
-        icacls.exe $keyPath /inheritance:r |Out-Null
-        icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
 
     }
+
+    icacls.exe $keyPath /inheritance:r |Out-Null
+    icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
     $pubKey = ssh-keygen -yf $keyPath
     if (-not (Select-String -Pattern $pubKey -Path $rAuthorized))
     {
