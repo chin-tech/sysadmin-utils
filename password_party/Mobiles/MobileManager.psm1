@@ -1346,7 +1346,7 @@ function Get-MobileOverview
         $computerData = Invoke-InformationCollector `
             -winComputers $data.Windows `
             -linComputers $data.Linux `
-            -sshKeyName $sshKeyPath
+            -sshKeyPath $sshKeyPath
 
         # Render Linux Audit Results
         if ($computerData.Linux.Count -gt 0)
