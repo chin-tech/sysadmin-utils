@@ -29,6 +29,7 @@ $nfsRoot   = if ($manifestCfg.nfsHomeRoot)
 } # Or appropriate fallback path
 $mobileRoot = Join-Path $nfsRoot ".mobiles"
 
+$Script:DebugEnabled = $false
 $script:Config = [PSCustomObject]@{
     nfsHomeRoot        = $nfsRoot
     AdminRoot          = $adminRoot
@@ -45,6 +46,12 @@ $script:Config = [PSCustomObject]@{
     MobileDump         = (Join-Path $mobileRoot '.dump')
     MobileDeployments  = (Join-Path $mobileRoot '.deployments')
     SSHKeyPath         = Join-Path (Join-Path $nfsRoot $env:USERNAME) ".ssh\$($manifestCfg.sshKey)"
+}
+
+function Set-Debug 
+{
+    param([bool]$enable)
+    $script:DebugEnabled = $enable
 }
 
 function Get-MobileConfig
@@ -225,6 +232,18 @@ if (-not ([System.Management.Automation.PSTypeName]'Sha512Crypt').Type)
     Add-Type -TypeDefinition $Sha512CryptSource
 }
 
+
+function Write-DebugOutput
+{
+    param(
+        [string]$msg
+    )
+    if ($using:DEBUG)
+    {
+
+        Write-Host "[DEBUG] $msg" -ForegroundColor Gray
+    }
+}
 
 function Invoke-Linux
 {
@@ -955,6 +974,16 @@ function Get-MobileData
         [PSCustomObject]$Config
 
     )
+
+    Write-DebugOutput "@
+    =====
+    Function = Get-MobileData
+    [MobileName] = $mobileName
+    [defaultUserPath] = $defaultUserpath  ; Path Exists = $(Test-Path $defaultUserpath)
+    [MobileEntriesPath] = $mobileEntriesPath ; Path Exists = $(Test-Path $mobileEntriesPath)
+    [fallbackPass] = $fallbackPass  
+    =====
+ @"
 
 
 
