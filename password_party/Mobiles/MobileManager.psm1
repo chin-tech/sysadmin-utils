@@ -1865,9 +1865,9 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
     }
 
     return [PSCustomObject]@{
-        Windows = $winResult
-        Linux   = $linResult
-        WinFails = $winFails
+        Windows = @($winResult)
+        Linux   = @($linResult)
+        WinFails = @($winFails)
     }
 }
 
