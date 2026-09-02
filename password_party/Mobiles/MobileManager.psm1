@@ -544,7 +544,7 @@ function Initialize-Ssh-Environment
 
     if (-not (Test-Path $keyPath))
     {
-        ssh-keygen -f "$keyPath" -C "''" -N "''" -t ecdsa -q
+        ssh-keygen -f "$keyPath" -C '""' -N '""' -t ecdsa -q
 
     }
 
