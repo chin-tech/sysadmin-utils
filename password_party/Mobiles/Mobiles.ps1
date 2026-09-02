@@ -57,7 +57,9 @@ $ConfigOverRide = if (Test-Path $overrideFile)
 }
 
 
-Set-Debug -Enable:$enableDebug
+if ($PSCmdlet.MyInvocation.BoundParameters.ContainsKey('Debug'))
+{ $DebugPreference = 'Continue'
+}
 
 switch ($PSCmdlet.ParameterSetName)
 {

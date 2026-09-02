@@ -29,7 +29,6 @@ $nfsRoot   = if ($manifestCfg.nfsHomeRoot)
 } # Or appropriate fallback path
 $mobileRoot = Join-Path $nfsRoot ".mobiles"
 
-$Script:DebugEnabled = $false
 $script:Config = [PSCustomObject]@{
     nfsHomeRoot        = $nfsRoot
     AdminRoot          = $adminRoot
@@ -48,11 +47,6 @@ $script:Config = [PSCustomObject]@{
     SSHKeyPath         = Join-Path (Join-Path $nfsRoot $env:USERNAME) ".ssh\$($manifestCfg.sshKey)"
 }
 
-function Set-Debug 
-{
-    param([bool]$enable)
-    $script:DebugEnabled = $enable
-}
 
 function Get-MobileConfig
 {
@@ -233,17 +227,6 @@ if (-not ([System.Management.Automation.PSTypeName]'Sha512Crypt').Type)
 }
 
 
-function Write-DebugOutput
-{
-    param(
-        [string]$msg
-    )
-    if ($script:DebugEnabled)
-    {
-
-        Write-Host "[DEBUG] $msg" -ForegroundColor Gray
-    }
-}
 
 function Invoke-Linux
 {
@@ -946,6 +929,7 @@ function Get-UserCreds
     return $AllUsers
 }
 
+
 # --- Public Exported Functions ---
 
 
@@ -964,10 +948,13 @@ function Get-MobileData
         [string]$MobileName,
         
         [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [ValidateNotNullOrEmpty()]
         [string]$defaultUserpath = $Script:Config.defaultUsers,
         [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [ValidateNotNullOrEmpty()]
         [string]$mobileEntriesPath = $Script:Config.MobileEntries,
         [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [ValidateNotNullOrEmpty()]
         [string]$fallbackPass = $Script:Config.fallbackPass,
         
         [Parameter(Mandatory = $true, ParameterSetName = 'Config')]
@@ -975,25 +962,44 @@ function Get-MobileData
 
     )
 
-    Write-DebugOutput "@
-    =====
-    Function = Get-MobileData
-    [MobileName] = $mobileName
-    [defaultUserPath] = $defaultUserpath  ; Path Exists = $(Test-Path $defaultUserpath)
-    [MobileEntriesPath] = $mobileEntriesPath ; Path Exists = $(Test-Path $mobileEntriesPath)
-    [fallbackPass] = $fallbackPass  
-    =====
- @"
 
 
 
     if ($PSCmdlet.ParameterSetName -eq 'Config')
+
     {
-        $defaultUserpath = $Config.mobileDefaultUsers
-        $mobileEntriesPath = $config.MobileEntries
-        $fallbackPass = $config.fallbackPass
+        $cfg = Get-MobileConfig $Config
+        $defaultUserpath = $cfg.mobileDefaultUsers
+        $mobileEntriesPath = $cfg.MobileEntries
+        $fallbackPass = $cfg.fallbackPass
     }
 
+    $userPathExists = if (-not [string]::IsNullOrWhiteSpace($defaultUserpath))
+    { Test-Path $defaultUserpath
+    } else
+    {$false
+    }
+    $mobileEntriesExist = if (-not [string]::IsNullOrWhiteSpace($mobileEntriesPath))
+    { Test-Path $mobileEntriesPath
+    } else
+    {$false
+    }
+
+    Write-Debug "@
+    =====
+    Function = Get-MobileData
+    [MobileName] = $mobileName
+    [defaultUserPath] = $defaultUserpath  ; Path Exists = $(Test-Path $userPathExists)
+    [MobileEntriesPath] = $mobileEntriesPath ; Path Exists = $(Test-Path $mobileEntriesExist)
+    [fallbackPass] = $fallbackPass  
+    =====
+ @" 
+
+    if (-not $userPathExists -or -not $mobileEntriesExist)
+    {
+        Write-Error "[!] Ensure proper directory setup"
+        exit 1
+    }
 
     $result = [PsCustomObject]@{
         AllMobiles   = @()
