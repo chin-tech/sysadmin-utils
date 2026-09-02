@@ -2324,7 +2324,7 @@ function New-MobileDeployment
             -Title "Select Group Tags for '$resolvedUsername' ($resolvedFullName) (local is always made)" `
             -Options $availableGroups
 
-        $pickedGroups += ("local")
+        $pickedGroups += @("local")
 
         $groupString = $pickedGroups -join ';'
 
