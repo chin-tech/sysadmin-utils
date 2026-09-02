@@ -570,7 +570,7 @@ function Initialize-Functionality
 
     )
 
-    Initialize-Ssh-Environment -KeyName $sshKeyName -nfsHome $nfsHome
+    Initialize-Ssh-Environment -KeyName $sshKeyName -nfsHome $nfsHome -keyPath $sshKeyPath
 
     # 2. Ensure Document Encryption Certificate Exists in CurrentUser\My
     $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My | 
@@ -1354,7 +1354,7 @@ function Get-MobileOverview
 
         if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyPath))
         {
-            Initialize-Ssh-Environment -keyPath $sshKeyPath -nfsHome $nfsHome
+            Initialize-Ssh-Environment -keyPath $sshKeyPath -nfsHome $nfsHome -keyName $script:Config.sshKeyName
         }
 
         $computerData = Invoke-InformationCollector `
