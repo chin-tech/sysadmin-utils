@@ -518,7 +518,6 @@ function Initialize-Ssh-Environment
     [CmdletBinding()]
     param(
         [string]$keyPath = $Script:Config.SSHKeyPath,
-        [string]$keyName = $Script:Config.SshKeyName,
         [string]$nfsHome = $Script:Config.NfsHome
     )
     # r = remote ; l = local
@@ -528,6 +527,11 @@ function Initialize-Ssh-Environment
 
     @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_ ) } | ForEach-Object {
         New-Item -ItemType Directory -Path $_ -Force | Out-Null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($keyPath) -or $keyPath.EndsWith('\'))
+    {
+        throw "SSH KEY PATH IS INVALID! -- '$sshKeyPath'  -- CHECK SSH KEY"
     }
 
     
@@ -547,7 +551,7 @@ function Initialize-Ssh-Environment
     icacls.exe $keyPath /inheritance:r |Out-Null
     icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
     $pubKey = ssh-keygen -yf $keyPath
-    if (-not (Select-String -Pattern $pubKey -Path $rAuthorized))
+    if (-not (Select-String -Pattern $pubKey -Path $rAuthorized -ErrorAction SIlentlyContinue))
     {
         $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
         icacls.exe $rAuthorized /inheritance:r |Out-Null
@@ -570,7 +574,7 @@ function Initialize-Functionality
 
     )
 
-    Initialize-Ssh-Environment -KeyName $sshKeyName -nfsHome $nfsHome -keyPath $sshKeyPath
+    Initialize-Ssh-Environment  -nfsHome $nfsHome -keyPath $sshKeyPath
 
     # 2. Ensure Document Encryption Certificate Exists in CurrentUser\My
     $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My | 
@@ -1354,7 +1358,7 @@ function Get-MobileOverview
 
         if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyPath))
         {
-            Initialize-Ssh-Environment -keyPath $sshKeyPath -nfsHome $nfsHome -keyName $script:Config.sshKeyName
+            Initialize-Ssh-Environment -keyPath $sshKeyPath -nfsHome $nfsHome 
         }
 
         $computerData = Invoke-InformationCollector `
