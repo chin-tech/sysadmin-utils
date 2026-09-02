@@ -532,17 +532,17 @@ function Initialize-Ssh-Environment
 
     
     icacls.exe $nfsSSH /inheritance:r /T |Out-Null
-    icacls.exe $nfsSSH /grant:r "$(env:USERNAME):(R)" /T |out-null
+    icacls.exe $nfsSSH /grant:r "$($env:USERNAME):(R)" /T |out-null
 
 
     icacls.exe $localSSH /inheritance:r |Out-Null
-    icacls.exe $localSSH /grant:r "$(env:USERNAME):(R)" /T | Out-Null
+    icacls.exe $localSSH /grant:r "$($env:USERNAME):(R)" /T | Out-Null
 
     if (-not (Test-Path $keyPath))
     {
         ssh-keygen -f "$keyPath" -C "''" -N "''" -t ecdsa -q
         icacls.exe $keyPath /inheritance:r |Out-Null
-        icacls.exe $keyPath /grant:r "$(env:USERNAME):(R)"| Out-Null
+        icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
 
     }
     $pubKey = ssh-keygen -yf $keyPath
