@@ -39,6 +39,9 @@ param(
     # --- Optional Config Override ---
     [Parameter()]
     [hashtable]$ConfigOverride
+
+    [Parameter()]
+    [switch]$Debug
 )
 
 # Import module from local directory
@@ -54,6 +57,7 @@ $ConfigOverRide = if (Test-Path $overrideFile)
 }
 
 
+Set-MobileDebug -Enable:$Debug
 
 switch ($PSCmdlet.ParameterSetName)
 {
