@@ -247,6 +247,7 @@ function Invoke-Linux
 
     $jobs = foreach ($target in $Computers)
     {
+        Write-Host "[[ Trying $target ]]"
         Start-Job -ScriptBlock {
             param($target, $payload, $key)
 
@@ -266,7 +267,7 @@ function Invoke-Linux
             $stderr = $proc.StandardError.ReadToEnd()
             $proc.WaitForExit()
 
-            return @{
+            return [PSCustomObject]@{
                 Target   = $target
                 ExitCode = $proc.ExitCode
                 StdOut   = $stdout
@@ -275,8 +276,9 @@ function Invoke-Linux
         } -ArgumentList $target, $cleanScript, $KeyPath
     }
 
-    $jobs | Wait-Job | Receive-Job
+    $res = $jobs | Wait-Job | Receive-Job
     $jobs | Remove-Job
+    return $res
 }
 
 
@@ -1738,18 +1740,18 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
 '@
 
     $windowsInformationBlock = {
-        $ivantiVersion = (Get-ItemProperty -Path @(
-                'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
-                'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
-                'HKLM:\SOFTWARE\Wow6432Node\LANDesk\Inventory'
-                'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
-            ) -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Version -ErrorAction SilentlyContinue)
+        # $ivantiVersion = (Get-ItemProperty -Path @(
+        #         'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
+        #         'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
+        #         'HKLM:\SOFTWARE\Wow6432Node\LANDesk\Inventory'
+        #         'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
+        #     ) -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Version -ErrorAction SilentlyContinue)
 
 
-        $SymantecAvDefs = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' -ErrorAction SilentlyContinue).DefSetVersion
+        # $SymantecAvDefs = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' -ErrorAction SilentlyContinue).DefSetVersion
 
-        $symantecBackupPath = Get-ChildItem 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions' -Recurse -ErrorAction SilentlyContinue |
-            Get-ItemProperty | Select-Object PSPath, DefSetVersion, DefSetId, LatestVirusDefsDate
+        # $symantecBackupPath = Get-ChildItem 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions' -Recurse -ErrorAction SilentlyContinue |
+        # Get-ItemProperty | Select-Object PSPath, DefSetVersion, DefSetId, LatestVirusDefsDate
 
         $Packages = Get-ItemProperty @(
             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
