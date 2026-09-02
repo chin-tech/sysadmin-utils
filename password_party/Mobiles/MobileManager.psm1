@@ -253,7 +253,7 @@ function Invoke-Linux
 
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = "ssh"
-            $psi.Arguments = "-i `"$key`" -o BatchMode=yes -o StrictHostKeyChecking=no $target `"bash -s --`""
+            $psi.Arguments = "-i `"$key`" -o -UpdateHostKeys=no -o BatchMode=yes -o StrictHostKeyChecking=no $target `"bash -s --`""
             $psi.RedirectStandardInput = $true
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
@@ -1726,7 +1726,7 @@ function Invoke-InformationCollector
 collect_hostname()   { printf "hostname\t%s\n" "$(hostname)"; }
 collect_cores()      { printf "cores\t%s\n"    "$(nproc)"; }
 collect_kernel()     { printf "kernel\t%s\n"   "$(uname -r)"; }
-collect_clamAVDefs() { printf "ClamAV\t%s\n" "$(clamscan --version | awk -F'/' '{print $NF}')"}
+collect_clamAVDefs() { printf "ClamAV\t%s\n" "$(clamscan --version | awk -F'/' '{print $NF}')"; }
 collect_lastUpdate() { printf "UpdateHistory\t%s\n" "$( (yum history list 2>/dev/null || dnf history list 2>/dev/null) | awk -F'|' 'tolower($0) ~ /(update|upgrade)/ {gsub(/^[ \t]+|[ \t]+$/, "", $0); print; exit}')"; }
 collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname '*laps*' 2>/dev/null | head -n 1)"; }
 {
@@ -1769,7 +1769,7 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
         $adminScriptExists = Get-ScheduledTask -TaskName ADMIN-LAPS -ErrorAction SilentlyContinue
         if (-not ($null -eq $adminScriptExists))
         {
-            $adminRotateScriptVersion = ((schtasks /query /tn admin-task /xml) | Select-String -Pattern '<Version>(.*?)</Version>').Matches.Groups[1].Value
+            $adminRotateScriptVersion = ((schtasks /query /tn ADMIN-LAPS /xml) | Select-String -Pattern '<Version>(.*?)</Version>').Matches.Groups[1].Value
 
         }
 
@@ -1829,13 +1829,14 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
     }
     $winResult = @()
     $linResult = @()
+    $winFails  = @()
 
-    if ($winComputers -gt 0)
+    if ($winComputers.Count -gt 0)
     {
         $winResult = Invoke-Command -ComputerName $winComputers -ScriptBlock $windowsInformationBlock -ErrorAction SilentlyContinue -ErrorVariable winFails
     }
 
-    if ($linComputers -gt 0)
+    if ($linComputers.Count -gt 0)
     {
         $res = Invoke-Linux -Computers $linComputers -Script $bashScript -KeyPath $sshKeyPath
 
@@ -1854,8 +1855,8 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
                 Cores       = $p.Cores
                 Kernel      = $p.Kernel
                 ClamAvDefs  = $p.ClamAv
-                LastUpdate  = $p.LastUpdate
-                HasLaps     = [bool]$p.HasLaps
+                LastUpdate  = $p.UpdateHistory
+                HasLaps     = [bool]$p.HasAdminRotate
                 Success     = ($r.ExitCode -eq 0)
             }
         }
