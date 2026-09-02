@@ -277,7 +277,6 @@ function Invoke-Linux
 
     $res = $jobs | Wait-Job | Receive-Job
     $jobs | Remove-Job
-    Write-Host "[DEBUG] - ExitCode: $($res.ExitCode)  | StdERR: $($res.StdErr)"
     return $res
 }
 
@@ -554,7 +553,7 @@ function Initialize-Ssh-Environment
     icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
     $pubKey = ssh-keygen -yf $keyPath
     if (-not (Test-Path $rAuthorized))
-    { New-Item -Type File -Path $rAuthorized -Force
+    { New-Item -Type File -Path $rAuthorized -Force | Out-Null
     }
     if (-not (Select-String -Pattern $pubKey -Path $rAuthorized -ErrorAction SIlentlyContinue))
     {
@@ -1836,6 +1835,7 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
     {
         Write-Host "[DEBUG] -- $($winComputers)"
         $winResult = Invoke-Command -ComputerName $winComputers -ScriptBlock $windowsInformationBlock -ErrorAction SilentlyContinue -ErrorVariable winFails
+        Write-Host "[DEBUG] - $winResult -- $winFails"
     }
 
     if (@($linComputers).Count -gt 0)
