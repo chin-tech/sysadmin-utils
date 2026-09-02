@@ -278,6 +278,8 @@ function Invoke-Linux
 
     $res = $jobs | Wait-Job | Receive-Job
     $jobs | Remove-Job
+    Write-Host "$($res.ExitCode)"
+    Write-Host "$($res.StdErr)"
     return $res
 }
 
@@ -1368,39 +1370,6 @@ function Get-MobileOverview
             -linComputers $data.Linux `
             -sshKeyPath $sshKeyPath
 
-        # Render Linux Audit Results
-        if ($computerData.Linux.Count -gt 0)
-        {
-            Write-Host "`n  -- Linux Status --" -ForegroundColor DarkRed
-            Write-Host ("  {0,-18} {1,-6} {2,-16} {3,-12} {4,-8} {5}" -f 'HOST', 'CORES', 'KERNEL', 'CLAMAV', 'LAPS', 'STATUS') -ForegroundColor DarkGray
-
-            foreach ($l in $computerData.Linux)
-            {
-                $statusColor = if ($l.Success)
-                { 'Green' 
-                } else
-                { 'Red' 
-                }
-                $statusText  = if ($l.Success)
-                { 'Online' 
-                } else
-                { 'Unreachable' 
-                }
-                $clamDef     = if ($l.ClamAvDefs)
-                { $l.ClamAvDefs 
-                } else
-                { 'N/A' 
-                }
-                $kernelVer   = if ($l.Kernel)
-                { $l.Kernel 
-                } else
-                { 'N/A' 
-                }
-
-                Write-Host ("  {0,-18} {1,-6} {2,-16} {3,-12} {4,-8} " -f $l.HostName, $l.Cores, $kernelVer, $clamDef, $l.HasLas) -NoNewline
-                Write-Host $statusText -ForegroundColor $statusColor
-            }
-        }
 
         # Render Windows Audit Results
         if ($computerData.Windows.Count -gt 0 -or $computerData.WinFails.Count -gt 0)
@@ -1435,6 +1404,41 @@ function Get-MobileOverview
                 
             }
         }
+
+        # Render Linux Audit Results
+        if ($computerData.Linux.Count -gt 0)
+        {
+            Write-Host "`n  -- Linux Status --" -ForegroundColor DarkRed
+            Write-Host ("  {0,-18} {1,-6} {2,-16} {3,-12} {4,-8} {5}" -f 'HOST', 'CORES', 'KERNEL', 'CLAMAV', 'LAPS', 'STATUS') -ForegroundColor DarkGray
+
+            foreach ($l in $computerData.Linux)
+            {
+                $statusColor = if ($l.Success)
+                { 'Green' 
+                } else
+                { 'Red' 
+                }
+                $statusText  = if ($l.Success)
+                { 'Online' 
+                } else
+                { 'Unreachable' 
+                }
+                $clamDef     = if ($l.ClamAvDefs)
+                { $l.ClamAvDefs 
+                } else
+                { 'N/A' 
+                }
+                $kernelVer   = if ($l.Kernel)
+                { $l.Kernel 
+                } else
+                { 'N/A' 
+                }
+
+                Write-Host ("  {0,-18} {1,-6} {2,-16} {3,-12} {4,-8} " -f $l.HostName, $l.Cores, $kernelVer, $clamDef, $l.HasLas) -NoNewline
+                Write-Host $statusText -ForegroundColor $statusColor
+            }
+        }
+
     }
 
     Write-Host "`n"
