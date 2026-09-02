@@ -533,11 +533,16 @@ function Initialize-Ssh-Environment
     if (-not (Test-Path $keyPath))
     {
         ssh-keygen -f "$keyPath" -C "''" -N "''" -t ecdsa -q
+        icacls.exe $keyPath /inheritance:r |Out-Null
+        icacls.exe $keyPath /grant:r "$(env:USERNAME):(R)"
+
     }
     $pubKey = ssh-keygen -yf $keyPath
     if (-not (Select-String -Pattern $pubKey -Path $rAuthorized))
     {
         $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
+        icacls.exe $rAuthorized /inheritance:r |Out-Null
+        icacls.exe $rAuthorized /grant:r "$(env:USERNAME):(R)"
     }
 
 
