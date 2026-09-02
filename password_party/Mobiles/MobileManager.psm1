@@ -523,7 +523,7 @@ function Initialize-Ssh-Environment
     )
     # r = remote ; l = local
     $nfsSSH = Join-Path  $nfsHome '.ssh'
-    $localSSh = Join-Path $env:HOME ".ssh"
+    $localSSh = Join-Path $env:UserProfile ".ssh"
     $rAuthorized = Join-Path $nfsSSH 'authorized_keys'
 
     @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_ ) } | ForEach-Object {
@@ -551,7 +551,7 @@ function Initialize-Ssh-Environment
     {
         $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
         icacls.exe $rAuthorized /inheritance:r |Out-Null
-        icacls.exe $rAuthorized /grant:r "$(env:USERNAME):(R)"| Out-Null
+        icacls.exe $rAuthorized /grant:r "$($env:USERNAME):(R)"| Out-Null
     }
 
 
