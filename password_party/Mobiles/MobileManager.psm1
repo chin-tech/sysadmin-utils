@@ -44,7 +44,7 @@ $script:Config = [PSCustomObject]@{
     mobileDefaultUsers = (Join-Path $mobileRoot '.default')
     MobileDump         = (Join-Path $mobileRoot '.dump')
     MobileDeployments  = (Join-Path $mobileRoot '.deployments')
-    SSHKeyPath         = Join-Path (Join-Path $nfsRoot $env:USERNAME) ".ssh\$($manifestCfg.sshKey)"
+    SSHKeyPath         = Join-Path (Join-Path $nfsRoot $env:USERNAME) ".ssh\Deployer"
 }
 
 
