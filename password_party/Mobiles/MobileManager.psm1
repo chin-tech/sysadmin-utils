@@ -247,13 +247,12 @@ function Invoke-Linux
 
     $jobs = foreach ($target in $Computers)
     {
-        Write-Host "[[ Trying $target ]]"
         Start-Job -ScriptBlock {
             param($target, $payload, $key)
 
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = "ssh"
-            $psi.Arguments = "-i `"$key`" -o -UpdateHostKeys=no -o BatchMode=yes -o StrictHostKeyChecking=no $target `"bash -s --`""
+            $psi.Arguments = "-i `"$key`" -o UpdateHostKeys=no -o BatchMode=yes -o StrictHostKeyChecking=no $target `"bash -s --`""
             $psi.RedirectStandardInput = $true
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
@@ -278,8 +277,7 @@ function Invoke-Linux
 
     $res = $jobs | Wait-Job | Receive-Job
     $jobs | Remove-Job
-    Write-Host "$($res.ExitCode)"
-    Write-Host "$($res.StdErr)"
+    Write-Host "[DEBUG] - ExitCode: $($res.ExitCode)  | StdERR: $($res.StdErr)"
     return $res
 }
 
@@ -1831,12 +1829,12 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
     $linResult = @()
     $winFails  = @()
 
-    if ($winComputers.Count -gt 0)
+    if (@($winComputers).Count -gt 0)
     {
         $winResult = Invoke-Command -ComputerName $winComputers -ScriptBlock $windowsInformationBlock -ErrorAction SilentlyContinue -ErrorVariable winFails
     }
 
-    if ($linComputers.Count -gt 0)
+    if (@($linComputers).Count -gt 0)
     {
         $res = Invoke-Linux -Computers $linComputers -Script $bashScript -KeyPath $sshKeyPath
 
