@@ -553,6 +553,9 @@ function Initialize-Ssh-Environment
     icacls.exe $keyPath /inheritance:r |Out-Null
     icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
     $pubKey = ssh-keygen -yf $keyPath
+    if (-not (Test-Path $rAuthorized))
+    { New-Item -Type File -Path $rAuthorized -Force
+    }
     if (-not (Select-String -Pattern $pubKey -Path $rAuthorized -ErrorAction SIlentlyContinue))
     {
         $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
@@ -1831,6 +1834,7 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
 
     if (@($winComputers).Count -gt 0)
     {
+        Write-Host "[DEBUG] -- $($winComputers)"
         $winResult = Invoke-Command -ComputerName $winComputers -ScriptBlock $windowsInformationBlock -ErrorAction SilentlyContinue -ErrorVariable winFails
     }
 
