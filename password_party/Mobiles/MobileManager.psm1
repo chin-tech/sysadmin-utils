@@ -1170,20 +1170,24 @@ function Get-MobileOverview
         [Parameter(ParameterSetName = 'Config')]
         [PSCustomObject]$Config,
 
-        [Parameter(ParameterSetName = 'ExplicitPaths', Mandatory = $true)]
-        [string]$defaultUsersPath,
-
-        [Parameter(ParameterSetName = 'ExplicitPaths', Mandatory = $true)]
-        [string]$mobileEntriesPath,
-
-        [Parameter(ParameterSetName = 'ExplicitPaths', Mandatory = $true)]
-        [string]$fallBackPass,
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$defaultUsersPath = $Script:Config.mobileDefaultUsers,
 
         [Parameter(ParameterSetName = 'ExplicitPaths')]
-        [string]$nfsHome,
+        [string]$mobileEntriesPath = $Script:Config.mobileEntries ,
 
         [Parameter(ParameterSetName = 'ExplicitPaths')]
-        [string]$sshKeyName,
+        [string]$fallBackPass = $Script:Config.fallbackPass,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$nfsHome = $Script:Config.nfsHome,
+
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$mobileDumpPath = $Script:Config.mobileDump,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$sshKeyPath = $Script:Config.sshKeyPath,
 
         [Parameter()]
         [switch]$Full
@@ -1195,7 +1199,7 @@ function Get-MobileOverview
         $mobileEntriesPath = $Config.MobileEntries
         $fallBackPass      = $Config.fallbackPass
         $nfsHome           = $Config.NfsHome
-        $sshKeyName        = $Config.SshKeyName
+        $sshKeyPath        = $Config.sshKeyPath
         $mobileDumpPath    = $Config.MobileDump
     }
 
@@ -1307,7 +1311,7 @@ function Get-MobileOverview
             -winComputers $data.Windows `
             -linComputers $data.Linux `
             -nfsHome $nfsHome `
-            -sshKeyName $sshKeyName
+            -sshKeyName $sshKeyPath
 
         # Render Linux Audit Results
         if ($computerData.Linux.Count -gt 0)
@@ -1650,8 +1654,7 @@ function Start-MobileDeployment
 function Invoke-InformationCollector 
 {
     [CmdletBinding()]
-    param([Parameter()][array]$winComputers, [array]$linComputers, [string]$nfsHome, [string]$sshKeyName)
-    $sshKey = Join-Path $nfsHome ".ssh\$sshKeyName"
+    param([Parameter()][array]$winComputers, [array]$linComputers, [string]$sshKeyPath)
 
     $bashScript = @'
 #!/usr/bin/env bash
@@ -1763,7 +1766,7 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
 
     if ($linComputers -gt 0)
     {
-        $res = Invoke-Linux -Computers $linComputers -Script $bashScript -KeyPath $sshKey
+        $res = Invoke-Linux -Computers $linComputers -Script $bashScript -KeyPath $sshKeyPath
 
         $linResult = foreach ($r in $res)
         {
