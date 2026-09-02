@@ -1338,9 +1338,9 @@ function Get-MobileOverview
     {
         Write-Section -Text 'HOST TELEMETRY AUDIT' -Color Magenta
 
-        if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyName))
+        if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyPath))
         {
-            Initialize-Ssh-Environment
+            Initialize-Ssh-Environment -keyPath $sshKeyPath -nfsHome $nfsHome
         }
 
         $computerData = Invoke-InformationCollector `
@@ -1383,7 +1383,7 @@ function Get-MobileOverview
         }
 
         # Render Windows Audit Results
-        if ($computerData.Windows.Count -gt 0)
+        if ($computerData.Windows.Count -gt 0 -or $computerData.WinFails.Count -gt 0)
         {
             Write-Host "`n  -- Windows Status --" -ForegroundColor DarkCyan
             Write-Host ("  {0,-18} {1,-14} {2,-16} {3,-14} {4}" -f 'HOST', 'LICENSE', 'AV DEFS', 'IVANTI VER', 'UPDATES') -ForegroundColor DarkGray
@@ -1407,6 +1407,12 @@ function Get-MobileOverview
                 }
 
                 Write-Host ("  {0,-18} {1,-14} {2,-16} {3,-14} {4}" -f $nodeName, $licStatus, $w.AVDefs, $w.IvantiVersion, $updateStat) -ForegroundColor Cyan
+            }
+            foreach ($f in $computerData.WinFails) 
+            {
+                Write-Host "$($f.OriginInfo.PsComputerName) - Unreachable or Error"
+
+                
             }
         }
     }
