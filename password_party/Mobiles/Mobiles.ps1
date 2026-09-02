@@ -38,7 +38,7 @@ param(
 
     # --- Optional Config Override ---
     [Parameter()]
-    [hashtable]$ConfigOverride
+    [hashtable]$ConfigOverride,
 
     [Parameter()]
     [switch]$Debug
