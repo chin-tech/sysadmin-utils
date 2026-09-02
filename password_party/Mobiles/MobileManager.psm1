@@ -1409,7 +1409,8 @@ function Get-MobileOverview
         if ($computerData.Linux.Count -gt 0)
         {
             Write-Host "`n  -- Linux Status --" -ForegroundColor DarkRed
-            Write-Host ("  {0,-18} {1,-6} {2,-30} {3,-12} {4,-8} {5}" -f 'HOST', 'CORES', 'KERNEL', 'CLAMAV', 'LAPS', 'STATUS') -ForegroundColor DarkGray
+            $fmt = "  {0,-18} {1,-6} {2,-30} {3,-12} {4,-8} {5}"
+            Write-Host ("$($fmt  -f 'HOST', 'CORES', 'KERNEL', 'CLAMAV', 'LAPS', 'STATUS')") -ForegroundColor DarkGray
 
             foreach ($l in $computerData.Linux)
             {
@@ -1434,7 +1435,7 @@ function Get-MobileOverview
                 { 'N/A' 
                 }
 
-                Write-Host ("  {0,-18} {1,-6} {2,-16} {3,-12} {4,-8} " -f $l.HostName, $l.Cores, $kernelVer, $clamDef, $l.HasLas) -NoNewline
+                Write-Host ("$($fmt -f $l.HostName, $l.Cores, $kernelVer, $clamDef, $l.HasLas)") -NoNewline
                 Write-Host $statusText -ForegroundColor $statusColor
             }
         }
