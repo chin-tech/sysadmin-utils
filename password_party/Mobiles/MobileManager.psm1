@@ -28,7 +28,6 @@ $nfsRoot   = if ($manifestCfg.nfsHomeRoot)
     "C:\Temp\Mobiles" 
 } # Or appropriate fallback path
 $mobileRoot = Join-Path $nfsRoot ".mobiles"
-
 $script:Config = [PSCustomObject]@{
     nfsHomeRoot        = $nfsRoot
     AdminRoot          = $adminRoot
@@ -46,6 +45,87 @@ $script:Config = [PSCustomObject]@{
     MobileDeployments  = (Join-Path $mobileRoot '.deployments')
     SSHKeyPath         = Join-Path (Join-Path $nfsRoot $env:USERNAME) ".ssh\Deployer"
 }
+
+
+enum GroupType
+{
+    Local
+    ISSO
+    Admin
+    Priv
+    DTRW
+    DTRO
+}
+
+enum LinuxAccountType 
+{
+    Wheel
+    General
+}
+
+$script:GroupMetadata = @{
+    [GroupType]::ISSO = @{
+        Patterns         = @('i*', 'isso')
+        Description      = 'Mobile - ISSO'
+        Suffix           = 'isso'
+        LinuxAccountType = [LinuxAccountType]::Wheel
+        Exclusive        = $true
+        Selectable       = $false
+        Priority         = 100
+        
+    }
+
+    [GroupType]::Admin = @{
+        Patterns         = @('t*', 'adm*', 'admin')
+        Description      = 'Mobile - System Admin'
+        Suffix           = 'admin'
+        LinuxAccountType = [LinuxAccountType]::Wheel
+        Exclusive        = $true
+        Selectable       = $false
+        Priority         = 90
+    }
+
+    [GroupType]::Priv = @{
+        Patterns         = @('p*', 'priv')
+        Description      = 'Mobile - Privileged User'
+        Suffix           = 'priv'
+        LinuxAccountType = [LinuxAccountType]::Wheel
+        Exclusive        = $false
+        Selectable       = $true
+        Priority         = 50
+    }
+
+    [GroupType]::DTRW = @{
+        Patterns         = @('d*rw', 'dtrw')
+        Description      = 'Mobile - Data Transfer Read Write'
+        Suffix           = 'dtrw'
+        LinuxAccountType = $null
+        Exclusive        = $false
+        Selectable       = $true
+        Priority         = 40
+    }
+
+    [GroupType]::DTRO = @{
+        Patterns         = @('d*ro', 'dtro')
+        Description      = 'Mobile - Data Transfer Read Only'
+        Suffix           = 'dtro'
+        LinuxAccountType = $null
+        Exclusive        = $false
+        Selectable       = $true
+        Priority         = 40
+    }
+
+    [GroupType]::Local = @{
+        Patterns         = @()
+        Description      = 'Mobile - General User'
+        Suffix           = $null
+        LinuxAccountType = [LinuxAccountType]::General
+        Exclusive        = $false
+        Selectable       = $false
+        Priority         = 0
+    }
+}
+
 
 
 function Get-MobileConfig
@@ -281,6 +361,27 @@ function Invoke-Linux
 }
 
 
+function Resolve-GroupType
+{
+    param(
+        [Parameter(Mandatory)]
+        [string]$Group
+    )
+
+    foreach ($groupType in $script:GroupMetadata.Keys)
+    {
+        foreach ($pattern in $script:GroupMetadata[$groupType].Patterns)
+        {
+            if ($Group -like $pattern)
+            {
+                return $groupType
+            }
+        }
+    }
+
+    return $null
+}
+
 
 function Set-Groups
 {
@@ -290,39 +391,37 @@ function Set-Groups
         [array]$Groups
     )
 
-    $grps = @("local")
-    if ($Groups.Length -eq 0)
-    {
-        return $grps
+    if (-not $groups)
+    { return @([GroupType]::Local)
     }
 
-    foreach ($g in $Groups)
+    $resolved = foreach ($g in $groups)
     {
-        switch -WildCard ($g)
+        $type = Resolve-GroupType $g
+        if ($null -ne $type)
         {
-            'i*'
-            {
-                return @('isso')
-            }
-            't*'
-            { 
-                return @('adm')
-            }
-            'p*'
-            {
-                $grps += @("priv")
-            }
-            'd*rw'
-            { 
-                $grps += @("dtrw")
-            }
-            'd*ro'
-            { 
-                $grps += @("dtro")
-            }
+            $type
         }
+    } 
+    $resolved = ($resolved | Sort-Object -Unique)
+
+    $exclusive = $resolved |
+        Where-Object {
+            $script:GroupMetadata[$_].Exclusive
+        } |
+        Sort-Object {
+            $script:GroupMetadata[$_].Priority
+        } -Descending |
+        Select-Object -First 1
+
+    if ($null -ne $exclusive)
+    {
+        return @($exclusive)
     }
-    return $grps
+    return @(
+        [GroupType]::Local
+        $rseolved
+    ) | Select-Object -unique
 }
 
 
@@ -779,61 +878,18 @@ function Get-LinuxDeployScript
         [array]$allUsers,
         [Parameter(Mandatory = $true)]
         [string]$oldEncryption,
-
         [Parameter(Mandatory = $true)]
-        [string]$encryptionPin,
-        [Parameter(Mandatory = $true)]
-        [string]$nfsHome
+        [string]$encryptionPin
 
     )
 
-    $linuxUsernames = @{}
-    foreach ($u in $allUsers)
-    {
-        $baseName = ($u.Name -split '\.')[0]
-        switch -Regex ($u.Name)
-        {
-            'dt[ro]$'
-            { continue 
-            }
-            '(priv|admin)$'
-            {
-                $linuxUsernames[$baseName] = "admin:$($u.MustChangePassword):$($baseName):$($u.LinuxPassword)"
-                continue
-            }
-            default
-            {
-                if (-not ($linuxUsernames.ContainsKey($baseName)))
-                {
-                    $linuxUsernames[$baseName] = "local:$($u.MustChangePassword):$($baseName):$($u.LinuxPassword)"
-                }
+    $scriptArray = [System.Collections.Generic[string]]::new()
 
-            }
-        }
-    }
-
-    $userFile = Join-Path $nfsHome "mobile.users"
-    $linuxUsernames.Values | Set-Content -Path $userFile -Encoding UTF8
-
-    ## Generate script that has content in NFS share, so each host will have this content
-    $scriptContent = @'
+    $scriptArray.Add(@'
 #!/usr/bin/env bash
 mHome='/mobiles/home'
 
 dzdo mkdir -p $mHome
-while IFS=: read -r admin expire username pwhash; do
-    addToWheel=""
-    [[ $admin == "admin" ]] && addToWheel="-G wheel"
-    [[ -z $username ]] && continue
-    if id "$username" &>/dev/null; then
-        dzdo usermod -p "$pwhash" $addToWheel "$username"
-    else
-        dzdo useradd $addToWheel -m -b $mHome -c 'Mobile' -p "$pwhash" "$username"
-    fi
-    if [[ $expire == "true" ]]; then
-        dzdo chage -d 0 "$username"
-    fi
-done < mobile.users
 
 cat << 'EOF' | dzdo tee /etc/systemd/system/mobile-logrotate.timer > /dev/null
 [Unit]
@@ -861,12 +917,50 @@ dzdo systemctl enable --now mobile-logrotate.timer
 
 mapfile -t luks_devices < <(lsblk -rno PATH,FSTYPE | awk '$2 == "crypto_LUKS" {print $1}')
 for dev in "${luks_devices[@]}"; do
-'@
-    $scriptContent += @"
+'@)
+    $scriptArray.Add(@"
     printf "%s\n%s\n" "$oldEncryption" "$encryptionPin" | dzdo cryptsetup luksAddKey --force --batch-mode `$dev
 done
-"@
-    return $scriptContent
+"@)
+
+    $linuxUsers = foreach ($group in ($allUsers | Group-Object BaseName))
+    {
+        $group.Group |
+            Where-Object { $null -ne $_.LinuxAccountType } |
+            Sort-Object {
+                $script:GroupMetadata[$_.GroupType].LinuxPriority
+            } -Descending |
+            Select-Object -First 1
+    }
+
+    foreach ($u in $linuxUsers)
+    {
+        $wheel = if ($u.LinuxAccountType -eq [GroupType]::Wheel)
+        {
+            '-G wheel'
+        } else
+        {
+            ''
+        }
+
+        $scriptArray.Add(@"
+if id '$($u.LinuxName)' &>/dev/null; then
+    dzdo usermod -p '$($u.LinuxPassword)' $wheel '$($u.LinuxName)'
+else
+    dzdo useradd -m -b "`$mHome" -c '$($u.Description)' -p '$($u.LinuxPassword)' $wheel '$($u.LinuxName)'
+fi
+"@)
+
+        if ($u.MustChangePassword)
+        {
+            $scriptArray.Add(@"
+dzdo chage -d 0 '$($u.LinuxName)'
+"@)
+        }
+    }
+
+    return $scriptArray -join "`n" 
+
 }
 
 ### END UTILS
@@ -922,29 +1016,30 @@ function Get-UserCreds
         [Parameter(Mandatory = $true)][array]$AllUsers,
         [Parameter(Mandatory = $true)][string]$mobileDumpPath
     )
-
-    $ADUsers = $AllUsers.Name | ForEach-Object { ($_ -split '\.')[0] } | Sort-Object -unique
-    foreach ($u in $ADUsers)
+    foreach ($bName in ($allUsers.BaseName | Sort-Object -Unique))
     {
-        $PwFile = Join-Path  $mobileDumpPath $u
+        $PwFile = Join-Path  $mobileDumpPath $bName
         if ( ! (Test-Path $PwFile ))
         {
             continue
         }
         $content = Unprotect-CmsMessage -Content (Get-Content $PwFile)
-        foreach ($line in $content.Split('\r?\n'))
+        foreach ($line in ( $content -split '\r?\n'))
         {
-            $timestamp, $username, $pw = $line -split (':')
-            foreach ($userObject in $AllUsers)
-            {
-                if ($userObject.Name -eq $username)
-                {
-                    $userObject.Password = ConvertTo-SecureString -AsPlainText -Force $pw
-                    $userObject.LinuxPassword = [Sha512Crypt]::Crypt($pw)
-                }
+            if ([string]::IsNullOrWhiteSpace($line))
+            { continue 
             }
+            $timestamp, $username, $pw = $line -split ':',3
+            $uObject = $allUsers | Where-Object Name -eq $username | Select-Object -First 1
+            if ($null -eq $uObject)
+            {
+                continue
+            }
+            $uObject.Password = ConvertTo-SecureString -AsPlainText -Force $pw
+            $uObject.LinuxPassword = [Sha512Crypt]::Crypt($pw)
         }
     }
+    
 
     $pw = $null
     [System.GC]::Collect()
@@ -1120,45 +1215,30 @@ function Get-MobileData
 
     foreach ($u in $tmp)
     {
-        $fullName = Get-UserFullName $u.Username $u.Name
         $grps = Set-Groups $u.Groups
         foreach ($grp in $grps)
         {
-            $desc = "[Mobile] $($u.Name) - "
-            switch -Regex ($grp)
+            $meta = $Script:GroupMetadata[$grp]
+            $accountName = if ($meta.Suffix)
             {
-                '^a.*'
-                {
-                    $desc += 'System Administrator'
-                }
-                '^i.*'
-                {
-                    $desc += 'Cybersecurity'
-                }
-                '^l.*'
-                {
-                    $desc += 'General User'
-                }
-                '^d.*'
-                {
-                    $desc += 'Data Transfer'
-                }
-                '^p.*'
-                {
-                    $desc += 'Privileged User'
-                }
+                "$($u.Username).$($meta.Suffix)"
+            } else
+            {
+                $u.Username
             }
 
             $uData = [PSCustomObject]@{
-                Name     = $u.Username
-                FullName = $fullName
+                BaseName = $u.UserName
+                Name     = $accountName
+                GroupType = $grp
+                FullName = Get-UserFullName $u.Username $u.Name
                 Password = (ConvertTo-SecureString -AsPlainText -Force $fallbackPass)
+                Description = "$($meta.Description)"
+                LinuxName = "$($u.UserName).local"
                 LinuxPassword = [sha512Crypt]::Crypt($fallbackPass)
-                Description = "$desc"
+                LinuxAccountType = $meta.LinuxAccountType
                 MustChangePassword = $false
             }
-            $uData.Name += ".$grp"
-
 
             $allUsers.Add($uData)
         }
@@ -2169,7 +2249,6 @@ function New-MobileDeployment
         [string]$mobilePath = $Script:Config.MobileEntries
 
     )
-
     $mobileName = Read-Host -Prompt "Enter a Mobile Name"
     if ([string]::IsNullOrWhiteSpace($mobileName))
     {
@@ -2178,7 +2257,8 @@ function New-MobileDeployment
     }
 
     # Available group tags for terminal multi-select
-    $availableGroups = @('PRIV', 'DTRO', 'DTRW')
+    
+    $availableGroups = $script:GroupMetadata.Keys | Where-Object {$Script:GroupMetadata[$_].Selectable} | ForEach-Object { $_.ToString() }
 
     # Computer Entry & Disambiguation
     $ResolveComputerInput = {
@@ -2324,7 +2404,6 @@ function New-MobileDeployment
             -Title "Select Group Tags for '$resolvedUsername' ($resolvedFullName) (local is always made)" `
             -Options $availableGroups
 
-        $pickedGroups += @("local")
 
         $groupString = $pickedGroups -join ';'
 
