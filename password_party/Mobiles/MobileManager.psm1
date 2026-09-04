@@ -1139,6 +1139,7 @@ function Get-MobileData
     }
     ## Default users
     $result.DefaultUsers = Get-ChildItem -Force -Path $defaultUserpath | Get-Content | ConvertFrom-CSV 
+    Write-Debug " default user parsing: $($result.DefaultUsers)"
 
 
     ## Actual Mobile Data
@@ -1216,6 +1217,7 @@ function Get-MobileData
     foreach ($u in $tmp)
     {
         $grps = Set-Groups $u.Groups
+        Write-Debug "$($u.Username) -- $($grps)"
         foreach ($grp in $grps)
         {
             $meta = $Script:GroupMetadata[$grp]
