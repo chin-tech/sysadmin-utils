@@ -57,8 +57,15 @@ $ConfigOverRide = if (Test-Path $overrideFile)
 }
 
 
-if ($PSCmdlet.MyInvocation.BoundParameters.ContainsKey('Debug'))
-{ $DebugPreference = 'Continue'
+$passThru = @{}
+if ($PSBoundParameters.ContainsKey('Debug'))
+{
+    $passThru['Debug'] = $true
+}
+
+if ($PSBoundParameters.ContainsKey('Verbose'))
+{
+    $passThru['Verbose'] = $true
 }
 
 switch ($PSCmdlet.ParameterSetName)
@@ -67,30 +74,30 @@ switch ($PSCmdlet.ParameterSetName)
     {
         if ([string]::IsNullOrWhiteSpace($Name))
         {
-            Get-MobileOverview -Config $ConfigOverride
+            Get-MobileOverview -Config $ConfigOverride @passThry
         } else
         {
-            Get-MobileOverview -MobileName $Name -Config $ConfigOverride -Full:$Full
+            Get-MobileOverview -MobileName $Name -Config $ConfigOverride -Full:$Full @passThry
         }
     }
 
     'GPOAdd'
     {
-        Set-MobileGpoPermission -MobileName $Name -Add -Config $ConfigOverride
+        Set-MobileGpoPermission -MobileName $Name -Add -Config $ConfigOverride @passThru
     }
 
     'GPORemove'
     {
-        Set-MobileGpoPermission -MobileName $Name -Remove -Force:$Force -Config $ConfigOverride
+        Set-MobileGpoPermission -MobileName $Name -Remove -Force:$Force -Config $ConfigOverride @passThru
     }
 
     'Deploy'
     {
-        Start-MobileDeployment -MobileName $Name -Config $ConfigOverride
+        Start-MobileDeployment -MobileName $Name -Config $ConfigOverride @passThru
     }
     'NewMobile'
     {
-        New-MobileDeployment -Config $ConfigOverRide
+        New-MobileDeployment -Config $ConfigOverRide @passThru
 
     }
 }
