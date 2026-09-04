@@ -1307,6 +1307,7 @@ function Get-MobileOverview
         [string]$MobileName,
 
         [Parameter(ParameterSetName = 'Config')]
+        [AllowNull()]
         [PSCustomObject]$Config,
 
         [Parameter(ParameterSetName = 'ExplicitPaths')]
