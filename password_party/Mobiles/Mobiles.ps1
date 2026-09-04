@@ -78,10 +78,10 @@ switch ($PSCmdlet.ParameterSetName)
     {
         if ([string]::IsNullOrWhiteSpace($Name))
         {
-            Get-MobileOverview @passThry
+            Get-MobileOverview @passThru
         } else
         {
-            Get-MobileOverview -MobileName $Name -Full:$Full @passThry
+            Get-MobileOverview -MobileName $Name -Full:$Full @passThru
         }
     }
 
