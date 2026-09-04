@@ -420,7 +420,7 @@ function Set-Groups
     }
     return @(
         [GroupType]::Local
-        $rseolved
+        $resolved
     ) | Select-Object -unique
 }
 
