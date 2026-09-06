@@ -1913,7 +1913,7 @@ function Get-TaskData
     return $taskData
 }
 
-function Format-InformationResults
+function Format-HostCollector
 {
     [CmdletBinding()]
     param(
@@ -2227,7 +2227,7 @@ function Get-MobileOverview
             -linComputers $data.Linux `
             -sshKeyPath $sshKeyPath
 
-        $computerData | Format-InformationResults
+        $computerData | Format-HostCollector
         #
         # # Render Windows Audit Results
         # if ($computerData.Windows.Count -gt 0 -or $computerData.WinFails.Count -gt 0)
@@ -2902,34 +2902,30 @@ jq -n \
     }
     $winResult = @()
     $linResult = @()
-    $winFails = [System.Collections.Generic.List[object]]::new()
-    $winResult = @()
 
     if (@($winComputers).Count -gt 0)
     {
+        $winFails = [System.Collections.Generic.List[object]]::new()
+
         $rawWindows = Invoke-Command `
             -ComputerName $winComputers `
             -ScriptBlock $windowsInformationBlock `
             -ErrorAction SilentlyContinue `
             -ErrorVariable winFails
 
-        $winResult = foreach ($r in $rawWindows)
-        {
-            [PSCustomObject]@{
-                HostName = $r.PSComputerName
-                Platform = 'Windows'
-                Success  = $true
-                Facts    = [PSCustomObject]@{
-                    WindowsLicense     = $r.WindowsLicense
-                    WinUpdates         = @($r.WinUpdates)
-                    IvantiVersion      = $r.IvantiVersion
-                    AVDefs             = $r.AVDefs
-                    Packages           = @($r.Packages)
-                    AdminRotateVersion = $r.AdminRotateVersion
+        $winResult = @(
+            foreach ($r in $rawWindows)
+            {
+                [PSCustomObject]@{
+                    HostName = $r.HostName
+                    Platform = $r.Platform
+                    Success  = $true
+                    Summary  = $r.Summary
+                    Details  = $r.Details
+                    Failures = @()
                 }
-                Failures = @()
             }
-        }
+        )
 
         foreach ($computer in $winComputers)
         {
@@ -2950,7 +2946,8 @@ jq -n \
                 HostName = $computer
                 Platform = 'Windows'
                 Success  = $false
-                Facts    = $null
+                Summary  = $null
+                Details  = $null
                 Failures = if ($hostErrors)
                 {
                     @($hostErrors.Exception.Message)
@@ -2962,8 +2959,6 @@ jq -n \
         }
     }
 
-    $linResult = @()
-
     if (@($linComputers).Count -gt 0)
     {
         $rawLinux = Invoke-Linux `
@@ -2971,67 +2966,61 @@ jq -n \
             -Script $bashScript `
             -KeyPath $sshKeyPath
 
-        $linResult = foreach ($r in $rawLinux)
-        {
-            if ($r.ExitCode -ne 0)
+        $linResult = @(
+            foreach ($r in $rawLinux)
             {
-                [PSCustomObject]@{
-                    HostName = $r.Target
-                    Platform = 'Linux'
-                    Success  = $false
-                    Facts    = $null
-                    Failures = @(
-                        if ($r.StdErr)
-                        {
-                            $r.StdErr
-                        } else
-                        {
-                            "SSH exited with code $($r.ExitCode)"
-                        }
-                    )
-                }
-
-                continue
-            }
-
-            try
-            {
-                $p = $r.StdOut | ConvertFrom-Json
-
-                [PSCustomObject]@{
-                    HostName = $r.Target
-                    Platform = 'Linux'
-                    Success  = $true
-                    Facts    = [PSCustomObject]@{
-                        Cores              = $p.Cores
-                        Kernel             = $p.Kernel
-                        ClamAvDefs         = $p.ClamAv
-                        LastUpdate         = $p.UpdateHistory
-                        HasAdminRotate     = [bool]$p.HasAdminRotate
-                        Packages           = @($p.Packages)
+                if ($r.ExitCode -ne 0)
+                {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Summary  = $null
+                        Details  = $null
+                        Failures = @(
+                            if ($r.StdErr)
+                            {
+                                $r.StdErr
+                            } else
+                            {
+                                "SSH exited with code $($r.ExitCode)"
+                            }
+                        )
                     }
-                    Failures = @()
+
+                    continue
                 }
-            } catch
-            {
-                [PSCustomObject]@{
-                    HostName = $r.Target
-                    Platform = 'Linux'
-                    Success  = $false
-                    Facts    = $null
-                    Failures = @(
-                        "Invalid JSON response: $($_.Exception.Message)"
-                    )
+
+                try
+                {
+                    $p = $r.StdOut | ConvertFrom-Json
+
+                    [PSCustomObject]@{
+                        HostName = $p.HostName
+                        Platform = $p.Platform
+                        Success  = $true
+                        Summary  = $p.Summary
+                        Details  = $p.Details
+                        Failures = @()
+                    }
+                } catch
+                {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Summary  = $null
+                        Details  = $null
+                        Failures = @(
+                            "Invalid JSON response: $($_.Exception.Message)"
+                        )
+                    }
                 }
             }
-        }
+        )
     }
 
-    return [PSCustomObject]@{
-        Windows = @($winResult)
-        Linux   = @($linResult)
-        WinFails = @($winFails)
-    }
+    return @($winResult) + @($linResult)
 }
 
 
