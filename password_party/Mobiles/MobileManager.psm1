@@ -1942,7 +1942,7 @@ function Format-HostCollector
             return
         }
 
-        $fmt = "  {0,-16} {1,-8} {2,-26} {3,-5} {4,-8} {5,-10} {6,-12} {7,-12} {8}"
+        $fmt = "  {0,-12} {1,-7} {2,-27} {3,3} {4,5} {5,-8} {6,-11} {7,-10} {8,-10}"
 
         Write-Host (
             $fmt -f
@@ -1954,7 +1954,7 @@ function Format-HostCollector
             'LAPS',
             'AV DEFS',
             'IVANTI',
-            'STATUS'
+            'LICENSE'
         ) -ForegroundColor DarkGray
 
         foreach ($r in ($results | Sort-Object Platform, HostName))
@@ -2010,6 +2010,14 @@ function Format-HostCollector
                 {
                     '-'
                 }
+                $license = if( $summary.License)
+                {
+                    $summary.License
+                } else
+                {
+                    '-'
+
+                }
 
                 Write-Host (
                     $fmt -f
@@ -2021,10 +2029,9 @@ function Format-HostCollector
                     $laps,
                     $av,
                     $ivanti,
-                    ''
-                ) -NoNewline
+                    $license
+                ) 
 
-                Write-Host 'Online' -ForegroundColor Green
             } else
             {
                 Write-Host (
@@ -2666,7 +2673,7 @@ function Invoke-InformationCollector
     $bashScript = @'
 #!/usr/bin/env bash
 
-hostname_value="$(hostname)"
+hostname_value="$(hostname -s)"
 cores_value="$(nproc)"
 kernel_value="$(uname -r)"
 
