@@ -2677,10 +2677,7 @@ hostname_value="$(hostname -s)"
 cores_value="$(nproc)"
 kernel_value="$(uname -r)"
 
-clamav_value="$(
-    clamscan --version 2>/dev/null |
-        awk -F'/' '{print $NF}'
-)"
+clamav_value="$(clamscan -V 2>/dev/null | awk -F'/' '{print $NF}' | xargs -I{} date -d "{}" +'%d/%m/%Y')"
 
 last_update_value="$(
     (yum history list 2>/dev/null || dnf history list 2>/dev/null) |
@@ -2716,9 +2713,13 @@ fi
 #
 packages_json="$(
     rpm -qa \
-        --qf '{"Name":"%{NAME}","Version":"%{VERSION}-%{RELEASE}","Arch":"%{ARCH}"}\n' \
+        --qf '%{NAME}|%{VERSION}-%{RELEASE}|%{ARCH}\n' \
         2>/dev/null |
-    jq -s '.'
+    jq -R -s '
+        split("\n") | map(select(length > 0)) | map(
+            split("|") | {Name: .[0], Version: .[1], Arch: .[2]}
+        )
+    '
 )"
 
 package_count="$(
