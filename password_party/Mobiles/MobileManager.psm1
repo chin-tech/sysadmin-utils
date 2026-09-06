@@ -2777,10 +2777,54 @@ jq -n \
 
     $windowsInformationBlock = {
 
-        $os = Get-CimInstance Win32_OperatingSystem
+        # $os = Get-CimInstance Win32_OperatingSystem
         $osInfo = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion'
-        $osString = "$($osInfo.ProductName) - $($osInfo.DisplayVersion)"
         $KernelString = "$($osInfo.LCUVer)"
+        function Get-WinVersion
+        {
+            param($buildNumber)
+
+            $map = @{
+                2600  = "WINXP"
+                3790  = "WINXP64"
+                6002  = "WINVISTA"
+                7601  = "WIN7"
+                9200  = "WIN8"
+                9600  = "WIN8.1"
+
+                10240 = "WIN10-1507"
+                10586 = "WIN10-1511"
+                14393 = "WIN10-1607"
+                15063 = "WIN10-1703"
+                16299 = "WIN10-1709"
+                17134 = "WIN10-1803"
+                17763 = "WIN10-1809"
+                18362 = "WIN10-1903"
+                18363 = "WIN10-1909"
+                19041 = "WIN10-2004"
+                19042 = "WIN10-20H2"
+                19043 = "WIN10-21H1"
+                19044 = "WIN10-21H2"
+                19045 = "WIN10-22H2"
+
+                22000 = "WIN11-21H2"
+                22621 = "WIN11-22H2"
+                22631 = "WIN11-23H2"
+                26100 = "WIN11-24H2"
+                26200 = "WIN11-25H2"
+                28000 = "WIN11-26H1"
+                26300 = "WIN11-26H2"
+            }
+
+            if ($map.ContainsKey($buildNumber))
+            {
+                "$($map[$buildNumber])-$buildNumber"
+            } else
+            {
+                "WINUNKNOWN-$buildNumber"
+            }
+        }
+        $osString = "$(Get-WinVersion $osInfo.buildNumber)"
 
         $cores = (
             Get-CimInstance Win32_Processor |
