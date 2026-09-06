@@ -2711,10 +2711,24 @@ fi
 #
 # RHEL-family package inventory.
 #
+# packages_json="$(
+#     rpm -qa \
+#         --qf '%{NAME}|%{VERSION}-%{RELEASE}|%{ARCH}\n' \
+#         2>/dev/null |
+#     jq -R -s '
+#         split("\n") | map(select(length > 0)) | map(
+#             split("|") | {Name: .[0], Version: .[1], Arch: .[2]}
+#         )
+#     '
+# )"
 packages_json="$(
-    rpm -qa \
-        --qf '%{NAME}|%{VERSION}-%{RELEASE}|%{ARCH}\n' \
-        2>/dev/null |
+    # 1. Grab initial OS baseline epoch from basesystem (or setup), add 30m buffer
+    base_epoch=$(rpm -q --qf '%{INSTALLTIME}' basesystem 2>/dev/null || rpm -q --qf '%{INSTALLTIME}' setup 2>/dev/null)
+    cutoff=$(( ${base_epoch:-0} + 1800 ))
+
+    # 2. Query RPMs, filter by timestamp, and shape to JSON
+    rpm -qa --qf '%{INSTALLTIME}|%{NAME}|%{VERSION}-%{RELEASE}|%{ARCH}\n' 2>/dev/null |
+    awk -F'|' -v cutoff="$cutoff" '$1 > cutoff { print $2 "|" $3 "|" $4 }' |
     jq -R -s '
         split("\n") | map(select(length > 0)) | map(
             split("|") | {Name: .[0], Version: .[1], Arch: .[2]}
