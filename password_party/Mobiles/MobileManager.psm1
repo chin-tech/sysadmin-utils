@@ -1913,7 +1913,164 @@ function Get-TaskData
     return $taskData
 }
 
+function Format-InformationResults
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object[]]$InputObject
+    )
 
+    begin
+    {
+        $results = [System.Collections.Generic.List[object]]::new()
+    }
+
+    process
+    {
+        foreach ($item in $InputObject)
+        {
+            $results.Add($item)
+        }
+    }
+
+    end
+    {
+        if ($results.Count -eq 0)
+        {
+            Write-Host "  No telemetry results returned." -ForegroundColor Yellow
+            return
+        }
+
+        $fmt = "  {0,-16} {1,-8} {2,-26} {3,-5} {4,-8} {5,-10} {6,-12} {7,-12} {8}"
+
+        Write-Host (
+            $fmt -f
+            'HOST',
+            'OS',
+            'KERNEL',
+            'CPU',
+            'PKGS',
+            'LAPS',
+            'AV DEFS',
+            'IVANTI',
+            'STATUS'
+        ) -ForegroundColor DarkGray
+
+        foreach ($r in ($results | Sort-Object Platform, HostName))
+        {
+            if ($r.Success)
+            {
+                $summary = $r.Summary
+
+                $kernel = if ($summary.Kernel)
+                {
+                    $summary.Kernel
+                } else
+                {
+                    'N/A'
+                }
+
+                $cores = if ($null -ne $summary.Cores)
+                {
+                    $summary.Cores
+                } else
+                {
+                    '-'
+                }
+
+                $packages = if ($null -ne $summary.PackageCount)
+                {
+                    $summary.PackageCount
+                } else
+                {
+                    '-'
+                }
+
+                $laps = if ($summary.AdminRotateVersion)
+                {
+                    $summary.AdminRotateVersion
+                } else
+                {
+                    '-'
+                }
+
+                $av = if ($summary.AVDefs)
+                {
+                    $summary.AVDefs
+                } else
+                {
+                    '-'
+                }
+
+                $ivanti = if ($summary.IvantiVersion)
+                {
+                    $summary.IvantiVersion
+                } else
+                {
+                    '-'
+                }
+
+                Write-Host (
+                    $fmt -f
+                    $r.HostName,
+                    $r.Platform,
+                    $kernel,
+                    $cores,
+                    $packages,
+                    $laps,
+                    $av,
+                    $ivanti,
+                    ''
+                ) -NoNewline
+
+                Write-Host 'Online' -ForegroundColor Green
+            } else
+            {
+                Write-Host (
+                    $fmt -f
+                    $r.HostName,
+                    $r.Platform,
+                    '-',
+                    '-',
+                    '-',
+                    '-',
+                    '-',
+                    '-',
+                    ''
+                ) -NoNewline
+
+                Write-Host 'FAILED' -ForegroundColor Red
+            }
+        }
+
+        #
+        # Failures beneath table
+        #
+        $failed = @(
+            $results |
+                Where-Object { -not $_.Success }
+        )
+
+        if ($failed.Count)
+        {
+            Write-Host ""
+            Write-Host "  Failures:" -ForegroundColor DarkRed
+
+            foreach ($r in $failed)
+            {
+                foreach ($failure in @($r.Failures))
+                {
+                    Write-Host (
+                        "    {0,-16} {1}" -f
+                        $r.HostName,
+                        $failure
+                    ) -ForegroundColor Red
+                }
+            }
+        }
+    }
+}
 
 
 function Get-MobileOverview
@@ -2070,75 +2227,76 @@ function Get-MobileOverview
             -linComputers $data.Linux `
             -sshKeyPath $sshKeyPath
 
-
-        # Render Windows Audit Results
-        if ($computerData.Windows.Count -gt 0 -or $computerData.WinFails.Count -gt 0)
-        {
-            Write-Host "`n  -- Windows Status --" -ForegroundColor DarkCyan
-            Write-Host ("  {0,-18} {1,-14} {2,-16} {3,-14} {4}" -f 'HOST', 'LICENSE', 'AV DEFS', 'IVANTI VER', 'UPDATES') -ForegroundColor DarkGray
-
-            foreach ($w in $computerData.Windows)
-            {
-                $nodeName   = if ($w.PSComputerName)
-                { $w.PSComputerName 
-                } else
-                { 'Local/WinRM' 
-                }
-                $updateStat = if ($w.WinUpdates)
-                { "$($w.WinUpdates.Count) History Items" 
-                } else
-                { 'No Data' 
-                }
-                $licStatus  = if ($w.WindowsLicense)
-                { $w.WindowsLicense 
-                } else
-                { 'Unknown' 
-                }
-
-                Write-Host ("  {0,-18} {1,-14} {2,-16} {3,-14} {4}" -f $nodeName, $licStatus, $w.AVDefs, $w.IvantiVersion, $updateStat) -ForegroundColor Cyan
-            }
-            foreach ($f in $computerData.WinFails) 
-            {
-                Write-Host "$($f.OriginInfo.PsComputerName) - Unreachable or Error"
-
-                
-            }
-        }
-
-        # Render Linux Audit Results
-        if ($computerData.Linux.Count -gt 0)
-        {
-            Write-Host "`n  -- Linux Status --" -ForegroundColor DarkRed
-            $fmt = "  {0,-18} {1,-6} {2,-30} {3,-12} {4,-8} {5}"
-            Write-Host ("$($fmt  -f 'HOST', 'CORES', 'KERNEL', 'CLAMAV', 'LAPS', 'STATUS')") -ForegroundColor DarkGray
-
-            foreach ($l in $computerData.Linux)
-            {
-                $statusColor = if ($l.Success)
-                { 'Green' 
-                } else
-                { 'Red' 
-                }
-                $statusText  = if ($l.Success)
-                { 'Online' 
-                } else
-                { 'Unreachable' 
-                }
-                $clamDef     = if ($l.ClamAvDefs)
-                { $l.ClamAvDefs 
-                } else
-                { 'N/A' 
-                }
-                $kernelVer   = if ($l.Kernel)
-                { $l.Kernel 
-                } else
-                { 'N/A' 
-                }
-
-                Write-Host ("$($fmt -f $l.HostName, $l.Cores, $kernelVer, $clamDef, $l.HasLaps, '')") -NoNewline
-                Write-Host $statusText -ForegroundColor $statusColor
-            }
-        }
+        Format-InformationResults -InputObject $computerData
+        #
+        # # Render Windows Audit Results
+        # if ($computerData.Windows.Count -gt 0 -or $computerData.WinFails.Count -gt 0)
+        # {
+        #     Write-Host "`n  -- Windows Status --" -ForegroundColor DarkCyan
+        #     Write-Host ("  {0,-18} {1,-14} {2,-16} {3,-14} {4}" -f 'HOST', 'LICENSE', 'AV DEFS', 'IVANTI VER', 'UPDATES') -ForegroundColor DarkGray
+        #
+        #     foreach ($w in $computerData.Windows)
+        #     {
+        #         $nodeName   = if ($w.PSComputerName)
+        #         { $w.PSComputerName 
+        #         } else
+        #         { 'Local/WinRM' 
+        #         }
+        #         $updateStat = if ($w.WinUpdates)
+        #         { "$($w.WinUpdates.Count) History Items" 
+        #         } else
+        #         { 'No Data' 
+        #         }
+        #         $licStatus  = if ($w.WindowsLicense)
+        #         { $w.WindowsLicense 
+        #         } else
+        #         { 'Unknown' 
+        #         }
+        #
+        #         Write-Host ("  {0,-18} {1,-14} {2,-16} {3,-14} {4}" -f $nodeName, $licStatus, $w.AVDefs, $w.IvantiVersion, $updateStat) -ForegroundColor Cyan
+        #     }
+        #     foreach ($f in $computerData.WinFails) 
+        #     {
+        #         Write-Host "$($f.OriginInfo.PsComputerName) - Unreachable or Error"
+        #
+        #
+        #     }
+        # }
+        #
+        # # Render Linux Audit Results
+        # if ($computerData.Linux.Count -gt 0)
+        # {
+        #     Write-Host "`n  -- Linux Status --" -ForegroundColor DarkRed
+        #     $fmt = "  {0,-18} {1,-6} {2,-30} {3,-12} {4,-8} {5}"
+        #     Write-Host ("$($fmt  -f 'HOST', 'CORES', 'KERNEL', 'CLAMAV', 'LAPS', 'STATUS')") -ForegroundColor DarkGray
+        #
+        #     foreach ($l in $computerData.Linux)
+        #     {
+        #         $statusColor = if ($l.Success)
+        #         { 'Green' 
+        #         } else
+        #         { 'Red' 
+        #         }
+        #         $statusText  = if ($l.Success)
+        #         { 'Online' 
+        #         } else
+        #         { 'Unreachable' 
+        #         }
+        #         $clamDef     = if ($l.ClamAvDefs)
+        #         { $l.ClamAvDefs 
+        #         } else
+        #         { 'N/A' 
+        #         }
+        #         $kernelVer   = if ($l.Kernel)
+        #         { $l.Kernel 
+        #         } else
+        #         { 'N/A' 
+        #         }
+        #
+        #         Write-Host ("$($fmt -f $l.HostName, $l.Cores, $kernelVer, $clamDef, $l.HasLaps, '')") -NoNewline
+        #         Write-Host $statusText -ForegroundColor $statusColor
+        #     }
+        # }
 
     }
 
@@ -2507,57 +2665,163 @@ function Invoke-InformationCollector
 
     $bashScript = @'
 #!/usr/bin/env bash
-collect_hostname()   { printf "hostname\t%s\n" "$(hostname)"; }
-collect_cores()      { printf "cores\t%s\n"    "$(nproc)"; }
-collect_kernel()     { printf "kernel\t%s\n"   "$(uname -r)"; }
-collect_clamAVDefs() { printf "ClamAV\t%s\n" "$(clamscan --version | awk -F'/' '{print $NF}')"; }
-collect_lastUpdate() { printf "UpdateHistory\t%s\n" "$( (yum history list 2>/dev/null || dnf history list 2>/dev/null) | awk -F'|' 'tolower($0) ~ /(update|upgrade)/ {gsub(/^[ \t]+|[ \t]+$/, "", $0); print; exit}')"; }
-collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname '*laps*' 2>/dev/null | head -n 1)"; }
-{
-  collect_hostname
-  collect_cores
-  collect_kernel
-  collect_clamAVDefs
-  collect_lastUpdate
-  collect_hasRotate
-} | jq -Rs '
-  reduce (split("\n")[] | select(length > 0) | split("\t")) as $item
-    ({}; . + { ($item[0]): ($item[1] | tonumber? // .) })
-'
 
+hostname_value="$(hostname)"
+cores_value="$(nproc)"
+kernel_value="$(uname -r)"
+
+clamav_value="$(
+    clamscan --version 2>/dev/null |
+        awk -F'/' '{print $NF}'
+)"
+
+last_update_value="$(
+    (yum history list 2>/dev/null || dnf history list 2>/dev/null) |
+        awk -F'|' '
+            tolower($0) ~ /(update|upgrade)/ {
+                gsub(/^[ \t]+|[ \t]+$/, "", $0)
+                print
+                exit
+            }
+        '
+)"
+
+laps_path="$(
+    find /etc/systemd \
+        -iname '*laps*' \
+        -type f \
+        2>/dev/null |
+        head -n 1
+)"
+
+#
+# Eventually replace this with actual version extraction
+# if your LAPS unit/script contains one.
+#
+if [[ -n "$laps_path" ]]; then
+    laps_version="Present"
+else
+    laps_version=""
+fi
+
+#
+# RHEL-family package inventory.
+#
+packages_json="$(
+    rpm -qa \
+        --qf '{"Name":"%{NAME}","Version":"%{VERSION}-%{RELEASE}","Arch":"%{ARCH}"}\n' \
+        2>/dev/null |
+    jq -s '.'
+)"
+
+package_count="$(
+    jq 'length' <<< "$packages_json"
+)"
+
+jq -n \
+    --arg hostname "$hostname_value" \
+    --arg kernel "$kernel_value" \
+    --argjson cores "$cores_value" \
+    --argjson packageCount "$package_count" \
+    --arg laps "$laps_version" \
+    --arg avDefs "$clamav_value" \
+    --arg lastUpdate "$last_update_value" \
+    --argjson packages "$packages_json" \
+'
+{
+    HostName: $hostname,
+    Platform: "Linux",
+
+    Summary: {
+        Kernel: $kernel,
+        Cores: $cores,
+        PackageCount: $packageCount,
+        AdminRotateVersion: $laps,
+        AVDefs: $avDefs,
+        IvantiVersion: null,
+        License: null,
+        LastUpdate: $lastUpdate
+    },
+
+    Details: {
+        Packages: $packages,
+        Updates: []
+    }
+}
+'
 '@
 
     $windowsInformationBlock = {
-        # $ivantiVersion = (Get-ItemProperty -Path @(
-        #         'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
-        #         'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
-        #         'HKLM:\SOFTWARE\Wow6432Node\LANDesk\Inventory'
-        #         'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
-        #     ) -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Version -ErrorAction SilentlyContinue)
 
+        $os = Get-CimInstance Win32_OperatingSystem
 
-        # $SymantecAvDefs = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' -ErrorAction SilentlyContinue).DefSetVersion
+        $cores = (
+            Get-CimInstance Win32_Processor |
+                Measure-Object -Property NumberOfCores -Sum
+        ).Sum
 
-        # $symantecBackupPath = Get-ChildItem 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions' -Recurse -ErrorAction SilentlyContinue |
-        # Get-ItemProperty | Select-Object PSPath, DefSetVersion, DefSetId, LatestVirusDefsDate
+        $packages = @(
+            Get-ItemProperty @(
+                'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            ) -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.DisplayName -and
+                    -not $_.SystemComponent
+                } |
+                Select-Object `
+                    DisplayName,
+                DisplayVersion,
+                Publisher,
+                InstallDate |
+                Sort-Object DisplayName -Unique
+        )
 
-        $Packages = Get-ItemProperty @(
-            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-        ) -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -and -not $_.SystemComponent -and $_.WindowsInstaller -ne 1 -or $_.DisplayName } |
-            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
-            Sort-Object DisplayName -Unique
-        $adminRotateScriptVersion = ""
-        $adminScriptExists = Get-ScheduledTask -TaskName ADMIN-LAPS -ErrorAction SilentlyContinue
-        if (-not ($null -eq $adminScriptExists))
+        $ivantiVersion = (
+            Get-ItemProperty -Path @(
+                'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
+                'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
+                'HKLM:\SOFTWARE\Wow6432Node\LANDesk\Inventory'
+                'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
+            ) -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty Version -ErrorAction SilentlyContinue
+        )
+
+        $symantecAvDefs = (
+            Get-ItemProperty `
+                -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' `
+                -ErrorAction SilentlyContinue
+        ).DefSetVersion
+
+        $adminRotateScriptVersion = $null
+
+        $adminScriptExists = Get-ScheduledTask `
+            -TaskName 'ADMIN-LAPS' `
+            -ErrorAction SilentlyContinue
+
+        if ($adminScriptExists)
         {
-            $adminRotateScriptVersion = ((schtasks /query /tn ADMIN-LAPS /xml) | Select-String -Pattern '<Version>(.*?)</Version>').Matches.Groups[1].Value
+            $xml = schtasks /query /tn ADMIN-LAPS /xml
 
+            $versionMatch = (
+                $xml |
+                    Select-String -Pattern '<Version>(.*?)</Version>'
+            ).Matches
+
+            if ($versionMatch.Count)
+            {
+                $adminRotateScriptVersion =
+                $versionMatch[0].Groups[1].Value
+            }
         }
 
-        $activation = Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" -ErrorAction SilentlyContinue |    Where-Object { $_.PartialProductKey } | Select-Object -First 1 -ExpandProperty LicenseStatus
+        $activation = Get-CimInstance `
+            -ClassName SoftwareLicensingProduct `
+            -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" `
+            -ErrorAction SilentlyContinue |
+            Where-Object PartialProductKey |
+            Select-Object -First 1 -ExpandProperty LicenseStatus
 
         $licenseStatusMap = @{
             0 = 'Unlicensed'
@@ -2569,79 +2833,196 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
             6 = 'Extended Grace'
         }
 
-        $activationStatus = $licenseStatusMap[[int]$activation]
+        $activationStatus = if ($null -ne $activation)
+        {
+            $licenseStatusMap[[int]$activation]
+        } else
+        {
+            'Unknown'
+        }
 
-        $Session = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $Session.CreateUpdateSearcher()
+        $session  = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
 
-        $latestUpdates = $searcher.QueryHistory(0,10) | Select-Object Title, Date, @{Name="Status"; Expression= {
-                switch ($_.ResultCode)
-                {
-                    2
-                    {
-                        "Succeeded"
-                    }
-                    3
-                    {
-                        "Succeeded With Errors"
-                    }
-                    4
-                    {
-                        "Failed"
-                    }
-                    5
-                    {
-                        "Aborted"
-                    }
-                    default
-                    { "Other: ($($_.ResultCode))"
+        $latestUpdates = @(
+            $searcher.QueryHistory(0, 10) |
+                Select-Object `
+                    Title,
+                Date,
+                @{
+                    Name = 'Status'
+                    Expression = {
+                        switch ($_.ResultCode)
+                        {
+                            2
+                            { 'Succeeded' 
+                            }
+                            3
+                            { 'Succeeded With Errors' 
+                            }
+                            4
+                            { 'Failed' 
+                            }
+                            5
+                            { 'Aborted' 
+                            }
+                            default
+                            { "Other: $($_.ResultCode)" 
+                            }
+                        }
                     }
                 }
+        )
+
+        $lastUpdate = $latestUpdates |
+            Where-Object Status -like 'Succeeded*' |
+            Sort-Object Date -Descending |
+            Select-Object -First 1 -ExpandProperty Date
+
+        [PSCustomObject]@{
+            HostName = $env:COMPUTERNAME
+            Platform = 'Windows'
+
+            Summary = [PSCustomObject]@{
+                Kernel             = "$($os.Version) ($($os.BuildNumber))"
+                Cores              = $cores
+                PackageCount       = $packages.Count
+                AdminRotateVersion = $adminRotateScriptVersion
+                AVDefs             = $symantecAvDefs
+                IvantiVersion      = $ivantiVersion
+                License            = $activationStatus
+                LastUpdate         = $lastUpdate
+            }
+
+            Details = [PSCustomObject]@{
+                Packages = $packages
+                Updates  = $latestUpdates
             }
         }
-
-        return [PSCustomObject]@{
-            WindowsLicense = $activationStatus
-            WinUpdates = $latestUpdates
-            IvantiVersion = $ivantiVersion
-            AVDefs = $SymantecAvDefs
-            Packages = $Packages
-            AdminRotateVersion = $adminRotateScriptVersion
-        }
-
-        
     }
     $winResult = @()
     $linResult = @()
-    $winFails  = @()
+    $winFails = [System.Collections.Generic.List[object]]::new()
+    $winResult = @()
 
     if (@($winComputers).Count -gt 0)
     {
-        $winResult = Invoke-Command -ComputerName $winComputers -ScriptBlock $windowsInformationBlock -ErrorAction SilentlyContinue -ErrorVariable winFails
+        $rawWindows = Invoke-Command `
+            -ComputerName $winComputers `
+            -ScriptBlock $windowsInformationBlock `
+            -ErrorAction SilentlyContinue `
+            -ErrorVariable winFails
+
+        $winResult = foreach ($r in $rawWindows)
+        {
+            [PSCustomObject]@{
+                HostName = $r.PSComputerName
+                Platform = 'Windows'
+                Success  = $true
+                Facts    = [PSCustomObject]@{
+                    WindowsLicense     = $r.WindowsLicense
+                    WinUpdates         = @($r.WinUpdates)
+                    IvantiVersion      = $r.IvantiVersion
+                    AVDefs             = $r.AVDefs
+                    Packages           = @($r.Packages)
+                    AdminRotateVersion = $r.AdminRotateVersion
+                }
+                Failures = @()
+            }
+        }
+
+        foreach ($computer in $winComputers)
+        {
+            if ($winResult.HostName -contains $computer)
+            {
+                continue
+            }
+
+            $hostErrors = @(
+                $winFails |
+                    Where-Object {
+                        $_.TargetObject -eq $computer -or
+                        $_.OriginInfo.PSComputerName -eq $computer
+                    }
+            )
+
+            $winResult += [PSCustomObject]@{
+                HostName = $computer
+                Platform = 'Windows'
+                Success  = $false
+                Facts    = $null
+                Failures = if ($hostErrors)
+                {
+                    @($hostErrors.Exception.Message)
+                } else
+                {
+                    @('No result returned from remote host.')
+                }
+            }
+        }
     }
+
+    $linResult = @()
 
     if (@($linComputers).Count -gt 0)
     {
-        $res = Invoke-Linux -Computers $linComputers -Script $bashScript -KeyPath $sshKeyPath
+        $rawLinux = Invoke-Linux `
+            -Computers $linComputers `
+            -Script $bashScript `
+            -KeyPath $sshKeyPath
 
-        $linResult = foreach ($r in $res)
+        $linResult = foreach ($r in $rawLinux)
         {
-            $p = if ($r.ExitCode -eq 0 -and $r.StdOut)
+            if ($r.ExitCode -ne 0)
             {
-                $r.StdOut | ConvertFrom-Json
-            } else
-            {
-                $null
+                [PSCustomObject]@{
+                    HostName = $r.Target
+                    Platform = 'Linux'
+                    Success  = $false
+                    Facts    = $null
+                    Failures = @(
+                        if ($r.StdErr)
+                        {
+                            $r.StdErr
+                        } else
+                        {
+                            "SSH exited with code $($r.ExitCode)"
+                        }
+                    )
+                }
+
+                continue
             }
 
-            [PSCustomObject]@{
-                HostName    = $r.Target
-                Cores       = $p.Cores
-                Kernel      = $p.Kernel
-                ClamAvDefs  = $p.ClamAv
-                LastUpdate  = $p.UpdateHistory
-                HasLaps     = [bool]$p.HasAdminRotate
-                Success     = ($r.ExitCode -eq 0)
+            try
+            {
+                $p = $r.StdOut | ConvertFrom-Json
+
+                [PSCustomObject]@{
+                    HostName = $r.Target
+                    Platform = 'Linux'
+                    Success  = $true
+                    Facts    = [PSCustomObject]@{
+                        Cores              = $p.Cores
+                        Kernel             = $p.Kernel
+                        ClamAvDefs         = $p.ClamAv
+                        LastUpdate         = $p.UpdateHistory
+                        HasAdminRotate     = [bool]$p.HasAdminRotate
+                        Packages           = @($p.Packages)
+                    }
+                    Failures = @()
+                }
+            } catch
+            {
+                [PSCustomObject]@{
+                    HostName = $r.Target
+                    Platform = 'Linux'
+                    Success  = $false
+                    Facts    = $null
+                    Failures = @(
+                        "Invalid JSON response: $($_.Exception.Message)"
+                    )
+                }
             }
         }
     }
@@ -3563,3 +3944,24 @@ function Unregister-Deployment
 
 
 
+$bashScript = @'
+#!/usr/bin/env bash
+collect_hostname()   { printf "hostname\t%s\n" "$(hostname)"; }
+collect_cores()      { printf "cores\t%s\n"    "$(nproc)"; }
+collect_kernel()     { printf "kernel\t%s\n"   "$(uname -r)"; }
+collect_clamAVDefs() { printf "ClamAV\t%s\n" "$(clamscan --version | awk -F'/' '{print $NF}')"; }
+collect_lastUpdate() { printf "UpdateHistory\t%s\n" "$( (yum history list 2>/dev/null || dnf history list 2>/dev/null) | awk -F'|' 'tolower($0) ~ /(update|upgrade)/ {gsub(/^[ \t]+|[ \t]+$/, "", $0); print; exit}')"; }
+collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname '*laps*' 2>/dev/null | head -n 1)"; }
+{
+  collect_hostname
+  collect_cores
+  collect_kernel
+  collect_clamAVDefs
+  collect_lastUpdate
+  collect_hasRotate
+} | jq -Rs '
+  reduce (split("\n")[] | select(length > 0) | split("\t")) as $item
+    ({}; . + { ($item[0]): ($item[1] | tonumber? // .) })
+'
+
+'@
