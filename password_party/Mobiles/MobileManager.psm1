@@ -72,58 +72,469 @@ $script:GroupMetadata = @{
         Exclusive        = $true
         Selectable       = $false
         Priority         = 100
+        WindowsGroups    = @("Administrators", "ISSO")
         
     }
 
     [GroupType]::Admin = @{
         Patterns         = @('t*', 'adm*', 'admin')
         Description      = 'Mobile - System Admin'
-        Suffix           = 'admin'
+        Suffix           = [GroupType]::Admin.ToString().ToLower()
         LinuxAccountType = [LinuxAccountType]::Wheel
         Exclusive        = $true
         Selectable       = $false
         Priority         = 90
+        WindowsGroups    = @("Administrators")
     }
 
     [GroupType]::Priv = @{
         Patterns         = @('p*', 'priv')
         Description      = 'Mobile - Privileged User'
-        Suffix           = 'priv'
+        Suffix           = [GroupType]::Priv.ToString().ToLower()
         LinuxAccountType = [LinuxAccountType]::Wheel
         Exclusive        = $false
         Selectable       = $true
         Priority         = 50
+        WindowsGroups    = @("Administrators")
     }
 
     [GroupType]::DTRW = @{
         Patterns         = @('d*rw', 'dtrw')
         Description      = 'Mobile - Data Transfer Read Write'
-        Suffix           = 'dtrw'
+        Suffix           = [GroupType]::DTRW.ToString().ToLower()
         LinuxAccountType = $null
         Exclusive        = $false
         Selectable       = $true
         Priority         = 40
+        WindowsGroups    = @("DTRW")
     }
 
     [GroupType]::DTRO = @{
         Patterns         = @('d*ro', 'dtro')
         Description      = 'Mobile - Data Transfer Read Only'
-        Suffix           = 'dtro'
+        Suffix           = [GroupType]::DTRO.ToString().ToLower()
         LinuxAccountType = $null
         Exclusive        = $false
         Selectable       = $true
         Priority         = 40
+        WindowsGroups    = @("DTRO")
     }
 
     [GroupType]::Local = @{
         Patterns         = @()
         Description      = 'Mobile - General User'
-        Suffix           = $null
+        Suffix           = [GroupType]::Local.ToString().ToLower()
         LinuxAccountType = [LinuxAccountType]::General
         Exclusive        = $false
         Selectable       = $false
         Priority         = 0
     }
+}
+
+
+
+$script:WindowsDeployBlock = {
+    param($allUsers, $taskData, $mobileName, $disJoin)
+
+    $actions = [System.Collections.Generic.List[object]]::new()
+    $failures = [System.Collections.Generic.List[object]]::new()
+    
+
+    $createdUsers = [System.Collections.Generic.List[string]]::new()
+    $existingUsers = [System.Collections.Generic.List[string]]::new()
+    $registeredTasks = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($u in $allUsers)
+    {
+        $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
+
+        if ($existing)
+        {
+            $existingUsers.Add($u.Name)
+        } else
+        {
+            $uParams = @{
+                Name        = $u.Name
+                FullName    = $u.FullName
+                Password    = $u.Password
+                Description = $u.Description
+            }
+
+            try
+            {
+                New-LocalUser @uParams -ErrorAction Stop
+                $createdUsers.Add($u.Name)
+
+            } catch
+            {
+                $failures.Add("User: '$($u.Name)': $($_.Exception.Message)")
+            }
+        }
+
+        if ($u.MustChangePassword)
+        {
+            try
+            {
+                $a = [ADSI]"WinNT://./$($u.Name),user"
+                $a.PasswordExpired = 1
+                $a.SetInfo()
+            } catch
+            {
+                $failures.Add(
+                    "Password expiry '$($u.Name)': $($_.Exception.Message)"
+                )
+            }
+        }
+
+        foreach ($g in $u.WindowsGroups)
+        {
+            try
+            {
+                Add-LocalGroupMember `
+                    -Group $g `
+                    -Member $u.Name `
+                    -ErrorAction Stop
+            } catch [Microsoft.PowerShell.Commands.MemberExistsException]
+            {
+                ## Not really an error in our case.
+            } catch
+            {
+                $failures.Add("Group '$g' for $($u.Name) : $($_.Exception.Message)")
+            }
+        }
+    }
+
+    if ($createdUsers.Count)
+    {
+        $actions.Add([PSCustomObject]@{
+                Name    = 'Users'
+                Status  = 'Changed'
+                Details = $createdUsers.ToArray()
+            })
+    }
+
+    if ($existingUsers.Count)
+    {
+        $actions.Add([PSCustomObject]@{
+                Name    = 'ExistingUsers'
+                Status  = 'Ok'
+                Details = $existingUsers.ToArray()
+            })
+    }
+
+
+    foreach ($t in $taskData)
+    {
+        try
+        {
+            Register-ScheduledTask `
+                -TaskName $t.TaskName `
+                -Xml $t.TaskXML `
+                -User System `
+                -Force `
+                -ErrorAction Stop |
+                Out-Null
+
+            $registeredTasks.Add($t.TaskName)
+        } catch
+        {
+            $failures.Add(
+                "Scheduled task '$($t.TaskName)': $($_.Exception.Message)"
+            )
+        }
+    }
+    if ($registeredTasks.Count)
+    {
+        $actions.Add([PSCustomObject]@{
+                Name    = 'ScheduledTasks'
+                Status  = 'Changed'
+                Details = @($registeredTasks)
+            })
+    }
+
+    if ($disJoin)
+    {
+        try
+        {
+
+            Remove-Computer `
+                -Force `
+                -Restart `
+                -WorkGroupName $mobileName
+
+            $actions.Add([PSCustomObject]@{
+                    Name    = 'Domain'
+                    Status  = 'Changed'
+                    Details = @("Joined workgroup $mobileName")
+                })
+        } catch
+        {
+            $failures.Add("Domain Disjoin: $($_.Exception.Message)")
+        }
+    }
+
+    [PSCustomObject]@{
+        Platform = 'Windows'
+        Success  = ($failures.Count -eq 0)
+        Actions  = $actions.ToArray()
+        Failures = $failures.ToArray()
+    }
+}
+
+
+$script:WindowsUnregisterBlock = {
+    param($allUsers, $taskData, $mobileName, $archive)
+
+    $timeStamp   = (Get-Date).ToString('yyyyMMdd')
+    $monthYear   = (Get-Date).ToString('MM-yyyy')
+    $archivePath = "C:\Mobiles\Archive\$monthYear"
+
+    $actions  = [System.Collections.Generic.List[object]]::new()
+    $failures = [System.Collections.Generic.List[string]]::new()
+
+    $removedUsers  = [System.Collections.Generic.List[string]]::new()
+    $missingUsers  = [System.Collections.Generic.List[string]]::new()
+    $archives      = [System.Collections.Generic.List[string]]::new()
+    $tasksRemoved  = [System.Collections.Generic.List[string]]::new()
+    $tasksMissing  = [System.Collections.Generic.List[string]]::new()
+
+    if ($archive)
+    {
+        try
+        {
+            New-Item `
+                -ItemType Directory `
+                -Force `
+                -Path $archivePath `
+                -ErrorAction Stop |
+                Out-Null
+        } catch
+        {
+            $failures.Add(
+                "Archive directory '$archivePath': $($_.Exception.Message)"
+            )
+        }
+    }
+
+    foreach ($u in $allUsers)
+    {
+        $profilePath = "C:\Users\$($u.Name)"
+        $localUser   = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
+        $sid         = if ($localUser)
+        { $localUser.SID.Value 
+        } else
+        { $null 
+        }
+
+        if ($archive -and (Test-Path $profilePath))
+        {
+            $archiveFile = Join-Path `
+                $archivePath `
+                "$($u.Name)-$timeStamp.zip"
+
+            try
+            {
+                Compress-Archive `
+                    -Path $profilePath `
+                    -DestinationPath $archiveFile `
+                    -CompressionLevel Optimal `
+                    -Force `
+                    -ErrorAction Stop
+
+                $archives.Add($archiveFile)
+            } catch
+            {
+                $failures.Add(
+                    "Archive '$($u.Name)': $($_.Exception.Message)"
+                )
+
+                # Archive was requested, so don't destroy the source.
+                continue
+            }
+        }
+
+        try
+        {
+            $profileObject = Get-CimInstance `
+                -ClassName Win32_UserProfile `
+                -ErrorAction Stop |
+                Where-Object {
+                    ($sid -and $_.SID -eq $sid) -or
+                    $_.LocalPath -ieq $profilePath
+                }
+
+            if ($profileObject)
+            {
+                $profileObject | Remove-CimInstance -ErrorAction Stop
+            }
+
+            if (Test-Path $profilePath)
+            {
+                Remove-Item `
+                    -Force `
+                    -Recurse `
+                    -Path $profilePath `
+                    -ErrorAction Stop
+            }
+        } catch
+        {
+            $failures.Add(
+                "Profile '$($u.Name)': $($_.Exception.Message)"
+            )
+
+            # I'd probably also preserve the local account if profile cleanup failed.
+            continue
+        }
+
+        if ($localUser)
+        {
+            try
+            {
+                Remove-LocalUser `
+                    -Name $u.Name `
+                    -ErrorAction Stop
+
+                $removedUsers.Add($u.Name)
+            } catch
+            {
+                $failures.Add(
+                    "User '$($u.Name)': $($_.Exception.Message)"
+                )
+            }
+        } else
+        {
+            $missingUsers.Add($u.Name)
+        }
+    }
+
+    if ($archives.Count)
+    {
+        $actions.Add([PSCustomObject]@{
+                Name    = 'ProfilesArchived'
+                Status  = 'Changed'
+                Details = $archives.ToArray()
+            })
+    }
+
+    if ($removedUsers.Count)
+    {
+        $actions.Add([PSCustomObject]@{
+                Name    = 'UsersRemoved'
+                Status  = 'Changed'
+                Details = $removedUsers.ToArray()
+            })
+    }
+
+    if ($missingUsers.Count)
+    {
+        $actions.Add([PSCustomObject]@{
+                Name    = 'UsersAbsent'
+                Status  = 'Ok'
+                Details = $missingUsers.ToArray()
+            })
+    }
+
+    #
+    # Scheduled tasks
+    #
+    foreach ($t in $taskData)
+    {
+        $existingTask = Get-ScheduledTask `
+            -TaskName $t.TaskName `
+            -ErrorAction SilentlyContinue
+
+        if (-not $existingTask)
+        {
+            $tasksMissing.Add($t.TaskName)
+            continue
+        }
+
+        try
+        {
+            Unregister-ScheduledTask `
+                -TaskName $t.TaskName `
+                -Confirm:$false `
+                -ErrorAction Stop
+
+            $tasksRemoved.Add($t.TaskName)
+        } catch
+        {
+            $failures.Add(
+                "Scheduled task '$($t.TaskName)': $($_.Exception.Message)"
+            )
+        }
+    }
+
+    if ($tasksRemoved.Count)
+    {
+        $actions.Add([PSCustomObject]@{
+                Name    = 'ScheduledTasks'
+                Status  = 'Changed'
+                Details = $tasksRemoved.ToArray()
+            })
+    }
+
+    if ($tasksMissing.Count)
+    {
+        $actions.Add([PSCustomObject]@{
+                Name    = 'TasksAbsent'
+                Status  = 'Ok'
+                Details = $tasksMissing.ToArray()
+            })
+    }
+
+    #
+    # Re-enable BitLocker using TPM
+    #
+    try
+    {
+        $tpm = Get-Tpm -ErrorAction Stop
+
+        if ($tpm.TpmPresent -and $tpm.TpmEnabled)
+        {
+            Enable-BitLocker `
+                -MountPoint 'C:' `
+                -TpmProtector `
+                -ErrorAction Stop |
+                Out-Null
+
+            $actions.Add([PSCustomObject]@{
+                    Name    = 'BitLockerProtector'
+                    Status  = 'Changed'
+                    Details = @('Restored TPM-only unlock')
+                })
+        } else
+        {
+            $actions.Add([PSCustomObject]@{
+                    Name    = 'BitLockerProtector'
+                    Status  = 'Ok'
+                    Details = @('TPM unavailable or disabled')
+                })
+        }
+    } catch
+    {
+        $failures.Add(
+            "BitLocker protector: $($_.Exception.Message)"
+        )
+    }
+
+    [PSCustomObject]@{
+        Platform = 'Windows'
+        Success  = ($failures.Count -eq 0)
+        Actions  = $actions.ToArray()
+        Failures = $failures.ToArray()
+    }
+}
+
+
+
+function ConvertTo-Base64
+{
+    param (
+        [string]$text
+    )
+
+    return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($text))
 }
 
 
@@ -361,6 +772,8 @@ function Invoke-Linux
 }
 
 
+
+
 function Resolve-GroupType
 {
     param(
@@ -596,6 +1009,120 @@ function ConvertTo-BashArgument
 }
 
 
+
+function New-LogonGPO 
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$targetOUFriendlyName
+    )
+
+    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
+    $ScriptName = "logon.ps1"
+
+    # PowerShell payload
+    $ScriptBody = @'
+$LogFile = "$env:TEMP\ad_ps_logon.log"
+$TimeStamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+"[$TimeStamp] Executed PowerShell logon script for $env:USERNAME on $env:COMPUTERNAME" | Out-File -FilePath $LogFile -Append
+New-Item -Type File -Force -Path C:\Temp\RanLogonScript
+'@
+
+    $gpoName = "Mobile Logon Script"
+    $RootDSE = [ADSI]"LDAP://RootDSE"
+    $ctx = $RootDSE.DefaultNamingContext
+    $PolicyContainer = "CN=Policies,CN=System,$ctx"
+    $gpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}" # Ensure standard uppercase hex
+    $targetOU_DN = "OU=$targetOUFriendlyName,$ctx"
+    $gpoLdapPath = "[LDAP://CN=$gpoID,$PolicyContainer;0]"
+    $userVersion = 65536
+
+    # PowerShell Scripts CSE GUID
+    # [{Scripts-CSE}{Legacy-Tool-GUID}][{Scripts-CSE}{PowerShell-Tool-GUID}]
+    # $PsCseGuid = "[{42B5FAAE-6536-11D2-A45A-0000F87571E3}{40B66649-4972-11D1-A7CA-00AA00A72F28}][{42B5FAAE-6536-11D2-A45A-0000F87571E3}{40B66650-4972-11D1-A7CA-00AA00A72F28}]"
+    # $PsCSEGuid = "[{42B5FAAE-6536-11D2-A45A-0000F87571E3}{40B66649-4972-11D1-A7CA-00AA00A72F28}][{40B66650-4972-11D1-A7CA-00AA00A72F28}{42B5FAAE-6536-11D2-A45A-0000F87571E3}]"
+    $PSCSEGuid = "[{42B5FAAE-6536-11D2-A45A-0000F87571E3}{40B66649-4972-11D1-A7CA-00AA00A72F28}][{40B66650-4972-11D1-A7CA-00AA00A72F28}{42B5FAAE-6536-11D2-A45A-0000F87571E3}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}]"
+    $gpoPath = "\\$domain\sysvol\$domain\policies\$gpoID"
+
+    # 1. Check or Create GPC object cleanly
+    $gpoLdapUri = "LDAP://CN=$gpoID,$PolicyContainer"
+    if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri))
+    {
+        $newGPO = [ADSI]$gpoLdapUri
+    } else
+    {
+        $polEntry = [ADSI]"LDAP://$PolicyContainer"
+        $newGPO = $polEntry.Create("groupPolicyContainer", "CN=$gpoID")
+    }
+
+    $newGPO.Put("displayName", $gpoName)
+    $newGPO.Put("flags", 2)
+    $newGPO.Put("gPCFileSysPath", $gpoPath)
+    $newGPO.Put("gPCUserExtensionNames", $PsCseGuid)
+    $newGPO.Put("versionNumber", $userVersion)
+    $newGPO.SetInfo()
+
+    # 2. Build SYSVOL Directory Structure
+    $logonPath = Join-Path $gpoPath "User\Scripts\Logon"
+    New-Item -Path $logonPath -ItemType Directory -Force | Out-Null
+    New-Item -Path (Join-Path $gpoPath "Machine\Scripts") -ItemType Directory -Force | Out-Null
+
+    # 3. Write Configuration Files
+    $gptIniContent = @"
+[General]
+Version=$userVersion
+displayName=$gpoName
+"@
+    Set-Content -Path (Join-Path $gpoPath "gpt.ini") -Value $gptIniContent -Encoding Ascii
+
+    $PsScriptsIniContent = @"
+
+[ScriptsConfig]
+StartExecutePSFirst=true
+[Logon]
+0CmdLine=$ScriptName
+0Parameters=-ExecutionPolicy Bypass -WindowStyle Hidden
+"@
+    $ScriptsIniContent = @"
+
+[Logon]
+"@
+    # Note: -Encoding Unicode is required for Group Policy parsing
+    $utf16 = New-Object System.Text.UnicodeEncoding($false,$true)
+    [System.IO.File]::WriteAllText((Join-Path $gpoPath "User\Scripts\scripts.ini"),$ScriptsIniContent, $utf16)
+    [System.IO.File]::WriteAllText((Join-Path $gpoPath "User\Scripts\psscripts.ini"),$PsScriptsIniContent, $utf16)
+    # Set-Content -Path (Join-Path $gpoPath "User\Scripts\scripts.ini") -Value $ScriptsIniContent -Encoding Unicode
+    # Set-Content -Path (Join-Path $gpoPath "User\Scripts\psscripts.ini") -Value $PsScriptsIniContent -Encoding Unicode
+    Set-Content -Path (Join-Path $logonPath $ScriptName) -Value $ScriptBody -Encoding UTF8
+
+    # 4. Link GPO to target OU (Safe attribute access)
+    $targetOU = [ADSI]"LDAP://$targetOU_DN"
+    if (-not [System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN"))
+    {
+        throw "Target OU '$targetOU_DN' does not exist."
+    }
+
+    $existingLinks = $targetOU.Properties['gPLink'].Value
+    if ($existingLinks)
+    {
+        if ($existingLinks -notlike "*$gpoID*")
+        {
+            $targetOU.Properties['gPLink'].Value = "$gpoLdapPath$existingLinks"
+        }
+    } else
+    {
+        $targetOU.Properties['gPLink'].Value = $gpoLdapPath
+    }
+
+    if (-not $targetOU.Properties['gPOptions'].Value)
+    {
+        $targetOU.Properties['gPOptions'].Value = 0
+    }
+
+    $targetOU.SetInfo()
+    Write-Host "[+] Successfully created and linked GPO $gpoID to $targetOUFriendlyName" -ForegroundColor Green
+}
 
 
 function New-DeployerCertificate
@@ -874,22 +1401,35 @@ function Get-LinuxDeployScript
 {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory=$true)]
-        [array]$allUsers,
         [Parameter(Mandatory = $true)]
-        [string]$oldEncryption,
-        [Parameter(Mandatory = $true)]
-        [string]$encryptionPin
-
+        [array]$allUsers
     )
 
-    $scriptArray = [System.Collections.Generic[string]]::new()
+    $scriptArray = [System.Collections.Generic.List[string]]::new()
 
+    # --- Static Header Block ---
     $scriptArray.Add(@'
 #!/usr/bin/env bash
-mHome='/mobiles/home'
 
-dzdo mkdir -p $mHome
+mHome='/mobiles/home'
+declare -a created_users=()
+declare -a updated_users=()
+declare -a wheel_users=()
+declare -a expired_users=()
+declare -a luksUpdated=()
+declare -a systemd_timers=()
+declare -a failures=()
+
+# Helper function to serialize Bash arrays to JSON arrays safely
+array_to_json() {
+    if [[ $# -eq 0 ]]; then
+        echo '[]'
+    else
+        printf '%s\n' "$@" | jq -R . | jq -s .
+    fi
+}
+
+dzdo mkdir -p "$mHome" &>/dev/null || failures+=("mkdir:$mHome")
 
 cat << 'EOF' | dzdo tee /etc/systemd/system/mobile-logrotate.timer > /dev/null
 [Unit]
@@ -901,7 +1441,7 @@ Persistent=True
 WantedBy=timers.target
 EOF
 
-cat << 'EOF' |  dzdo tee /etc/systemd/system/mobile-logrotate.service > /dev/null
+cat << 'EOF' | dzdo tee /etc/systemd/system/mobile-logrotate.service > /dev/null
 [Unit]
 Description=Mobile Log Rotate Service
 [Service]
@@ -912,17 +1452,28 @@ ExecStart=/path-to-logrotate
 WantedBy=multi-user.target
 EOF
 
-dzdo systemctl daemon-reload
-dzdo systemctl enable --now mobile-logrotate.timer
+dzdo systemctl daemon-reload &>/dev/null
+if dzdo systemctl enable --now mobile-logrotate.timer &>/dev/null; then
+    systemd_timers+=("mobile-logrotate.timer")
+else
+    failures+=("systemd:mobile-logrotate.timer")
+fi
 
-mapfile -t luks_devices < <(lsblk -rno PATH,FSTYPE | awk '$2 == "crypto_LUKS" {print $1}')
+mapfile -t luks_devices < <(lsblk -rno PATH,FSTYPE 2>/dev/null | awk '$2 == "crypto_LUKS" {print $1}')
 for dev in "${luks_devices[@]}"; do
 '@)
+
+    # --- LUKS Dynamic Credentials Injection ---
     $scriptArray.Add(@"
-    printf "%s\n%s\n" "$oldEncryption" "$encryptionPin" | dzdo cryptsetup luksAddKey --force --batch-mode `$dev
+    if printf "%s\n%s\n" "$($script:Config.curLuks)" "$($script:Config.encryptionPin)" | dzdo cryptsetup luksAddKey --force --batch-mode "`$dev" &>/dev/null; then
+        luksUpdated+=("`$dev")
+    else
+        failures+=("luks:`$dev")
+    fi
 done
 "@)
 
+    # --- Filter & Sort Users ---
     $linuxUsers = foreach ($group in ($allUsers | Group-Object BaseName))
     {
         $group.Group |
@@ -933,34 +1484,100 @@ done
             Select-Object -First 1
     }
 
+    # --- User Provisioning Loop ---
     foreach ($u in $linuxUsers)
     {
-        $wheel = if ($u.LinuxAccountType -eq [GroupType]::Wheel)
-        {
-            '-G wheel'
+        $isWheel = $u.LinuxAccountType -eq [GroupType]::Wheel
+        $wheelArg = if ($isWheel)
+        { '-G wheel' 
         } else
-        {
-            ''
+        { '' 
         }
 
         $scriptArray.Add(@"
 if id '$($u.LinuxName)' &>/dev/null; then
-    dzdo usermod -p '$($u.LinuxPassword)' $wheel '$($u.LinuxName)'
+    if dzdo usermod -p '$($u.LinuxPassword)' $wheelArg '$($u.LinuxName)' &>/dev/null; then
+        updated_users+=('$($u.LinuxName)')
+        $([string]$(if ($isWheel) { "wheel_users+=('$($u.LinuxName)')" }))
+    else
+        failures+=('user:update:$($u.LinuxName)')
+    fi
 else
-    dzdo useradd -m -b "`$mHome" -c '$($u.Description)' -p '$($u.LinuxPassword)' $wheel '$($u.LinuxName)'
+    if dzdo useradd -m -b "`$mHome" -c '$($u.Description)' -p '$($u.LinuxPassword)' $wheelArg '$($u.LinuxName)' &>/dev/null; then
+        created_users+=('$($u.LinuxName)')
+        $([string]$(if ($isWheel) { "wheel_users+=('$($u.LinuxName)')" }))
+    else
+        failures+=('user:create:$($u.LinuxName)')
+    fi
 fi
 "@)
 
         if ($u.MustChangePassword)
         {
             $scriptArray.Add(@"
-dzdo chage -d 0 '$($u.LinuxName)'
+if dzdo chage -d 0 '$($u.LinuxName)' &>/dev/null; then
+    expired_users+=('$($u.LinuxName)')
+else
+    failures+=('expire:$($u.LinuxName)')
+fi
 "@)
         }
     }
 
-    return $scriptArray -join "`n" 
+    # --- Solid JSON Output Generation ---
+    $scriptArray.Add(@'
+# Build JSON Payload using safe array expansion
+jq -n \
+    --arg hostname "$(hostname)" \
+    --argjson success "$([[ ${#failures[@]} -eq 0 ]] && echo true || echo false)" \
+    --argjson created "$(array_to_json "${created_users[@]}")" \
+    --argjson updated "$(array_to_json "${updated_users[@]}")" \
+    --argjson wheel "$(array_to_json "${wheel_users[@]}")" \
+    --argjson expired "$(array_to_json "${expired_users[@]}")" \
+    --argjson luksUpdated "$(array_to_json "${luksUpdated[@]}")" \
+    --argjson timers "$(array_to_json "${systemd_timers[@]}")" \
+    --argjson failures "$(array_to_json "${failures[@]}")" \
+    '{
+        HostName: $hostname,
+        Platform: "Linux",
+        Success: $success,
+        Actions: [
+            {
+                Name: "UsersCreated",
+                Status: (if ($created | length) > 0 then "Changed" else "Ok" end),
+                Details: $created
+            },
+            {
+                Name: "UsersUpdated",
+                Status: (if ($updated | length) > 0 then "Changed" else "Ok" end),
+                Details: $updated
+            },
+            {
+                Name: "Wheel",
+                Status: (if ($wheel | length) > 0 then "Changed" else "Ok" end),
+                Details: $wheel
+            },
+            {
+                Name: "LuksUpdated",
+                Status: (if ($luksUpdated | length) > 0 then "Changed" else "Ok" end),
+                Details: $luksUpdated
+            },
+            {
+                Name: "TimersConfigured",
+                Status: (if ($timers | length) > 0 then "Changed" else "Ok" end),
+                Details: $timers
+            },
+            {
+                Name: "PasswordExpiry",
+                Status: (if ($expired | length) > 0 then "Changed" else "Ok" end),
+                Details: $expired
+            }
+        ],
+        Failures: $failures
+    }'
+'@)
 
+    return ($scriptArray -join "`n`n")
 }
 
 ### END UTILS
@@ -1092,22 +1709,26 @@ function Get-MobileData
     }
 
     $userPathExists = if (-not [string]::IsNullOrWhiteSpace($defaultUserpath))
-    { Test-Path $defaultUserpath
+    { 
+        Test-Path $defaultUserpath
     } else
-    {$false
+    {
+        $false
     }
     $mobileEntriesExist = if (-not [string]::IsNullOrWhiteSpace($mobileEntriesPath))
-    { Test-Path $mobileEntriesPath
+    { 
+        Test-Path $mobileEntriesPath
     } else
-    {$false
+    {
+        $false
     }
 
     Write-Debug "@
     =====
     Function = Get-MobileData
     [MobileName] = $mobileName
-    [defaultUserPath] = $defaultUserpath  ; Path Exists = $(Test-Path $userPathExists)
-    [MobileEntriesPath] = $mobileEntriesPath ; Path Exists = $(Test-Path $mobileEntriesExist)
+    [defaultUserPath] = $defaultUserpath  ; Path Exists = $($userPathExists)
+    [MobileEntriesPath] = $mobileEntriesPath ; Path Exists = $ $mobileEntriesExist)
     [fallbackPass] = $fallbackPass  
     =====
  @" 
@@ -1264,31 +1885,27 @@ function Get-TaskData
 
     $taskData = @()
     $disjoinData = Get-PostDeployScript -userRights -Sharing -hasLinux:$hasLinux
-    $disjoinB64 = [Convert]::ToBase64String(($disJoinData))
+    $disjoinB64 = ConvertTo-Base64 $disjoinData
+    $bootTrigger = @{
+        Type = [TaskTriggerType]::Boot
+        Delay = 'PT1M'
+    }
+    $weeklyTrigger = @{
+        Type = [TaskTriggerType]::Weekly
+        DaysOfWeek = 1
+        StartBoundary = (Get-Date "00:00:00").AddDays(1).ToString('s')
+    }
+
+
     $domainDisjoinTask = New-TaskXML -Description 'Runs once after domain disjoin' `
         -Author '[Mobile Administration]' -Execute 'powershell.exe' `
         -Arguments "-NoProfile -ExecutionPolicyBypass -Encoded $disjoinB64" `
-        -TriggerConfigs @(
-        @{
-            Type = [TaskTriggerType]::Boot
-            Delay = 'PT1M'
-        }
-
-
-    )
+        -TriggerConfigs @($bootTrigger)
 
 
     $logCollect = New-TaskXML -Description 'Mobile Auto Log Collecot' `
         -Author '[Mobile Administration]' -Execute 'C:\Supportbin\logcollect' `
-        -TriggerConfigs @(
-        @{
-            Type = [TaskTriggerType]::Weekly
-            DaysOfWeek = 1
-            StartBoundary = (Get-Date "00:00:00").AddDays(1).ToString('s')                   
-        }
-
-
-    )
+        -TriggerConfigs @($weeklyTrigger)
 
     $taskData += @([PsCustomObject]@{Taskname = "Mobile-LogCollect"; TaskXml = $logCollect})
     $taskData += @([PsCustomObject]@{Taskname = "Mobile-DisjoinTask"; TaskXml = $domainDisjoinTask})
@@ -1683,6 +2300,50 @@ function Set-MobileGpoPermission
 }
 
 
+function Format-DeploymentResults
+{
+    param($results)
+    foreach ($r in $results)
+    {
+        Write-Host "`n$($r.HostName)" -ForegroundColor Cyan
+
+        foreach ($action in $r.Actions)
+        {
+            $color = switch ($action.Status)
+            {
+                'Changed'
+                { 'Yellow' 
+                }
+                'Ok'
+                { 'Green' 
+                }
+                'Failed'
+                { 'Red' 
+                }
+                default
+                { 'Gray' 
+                }
+            }
+
+            $details = if ($action.Details)
+            {
+                $action.Details -join ', '
+            } else
+            {
+                ''
+            }
+
+            Write-Host (
+                "  {0,-20} {1,-10} {2}" -f
+                $action.Name,
+                $action.Status.ToLower(),
+                $details
+            ) -ForegroundColor $color
+        }
+    }
+}
+
+
 function Start-MobileDeployment
 {
     [CmdletBinding()]
@@ -1705,70 +2366,92 @@ function Start-MobileDeployment
     $mobileData = Get-MobileData -MobileName $MobileName 
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
-    $groupDict = @{
-        'Administrators' = @("isso","adm","priv")
-        'ISSO' = @("isso")
-        'DTRW' = @("dtrw")
-        'DTRO' = @("dtro")
-    }
     $disJoin = $false
 
-    $scriptBlock = {
-        param($allusers, $taskData, $groupDict,$mobileName, $disJoin)
-
-        foreach ($u in $allUsers)
-        {
-            $uParams = @{Name = $u.Name; FullName =$u.FullName; Password = $u.Password; Description = $u.Description}
-            New-LocalUser @uParams -ErrorAction SilentlyContinue
-
-            if ($u.MustChangePassword)
-            {
-                $a = [ADSI]"WinNT://./$($u.Name),user"
-                $a.PasswordExpired = 1
-                $a.SetInfo()
-            }
-
-        }
-
-        foreach ($grp in $groupDict.Keys)
-        {
-            Get-Localuser | Where-Object {$_.Name -match "($($groupDict[$grp] -join '|'))$"} | Add-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue | Out-Null
-        }
-
-        foreach ($t in $taskData)
-        {
-            Register-ScheduledTask -TaskName $t.TaskName -xml $t.TaskXML -User System -Force | Out-Null
-        }
-
-        if ($disJoin)
-        {
-            Remove-Computer -Force -Restart -WorkGroupName "$mobileName" -ErrorAction SilentlyContinue
-        }
-
-        return [PSCustomObject]@{
-            Success = $true
-        }
-
-    }
+    # $scriptBlock = {
+    #     param($allusers, $taskData, $groupDict,$mobileName, $disJoin)
+    #
+    #     foreach ($u in $allUsers)
+    #     {
+    #         $uParams = @{Name = $u.Name; FullName =$u.FullName; Password = $u.Password; Description = $u.Description}
+    #         New-LocalUser @uParams -ErrorAction SilentlyContinue
+    #
+    #         if ($u.MustChangePassword)
+    #         {
+    #             $a = [ADSI]"WinNT://./$($u.Name),user"
+    #             $a.PasswordExpired = 1
+    #             $a.SetInfo()
+    #         }
+    #
+    #         foreach ($g in $u.WindowsGroups)
+    #         {
+    #             Add-LocalGroupMember -Group $g -Member $u.Name -ErrorAction SilentlyContinue
+    #         }
+    #
+    #     }
+    #
+    #     foreach ($t in $taskData)
+    #     {
+    #         Register-ScheduledTask -TaskName $t.TaskName -xml $t.TaskXML -User System -Force | Out-Null
+    #     }
+    #
+    #     if ($disJoin)
+    #     {
+    #         Remove-Computer -Force -Restart -WorkGroupName "$mobileName" -ErrorAction SilentlyContinue
+    #     }
+    #
+    #     return [PSCustomObject]@{
+    #         Success = $true
+    #     }
+    #
+    # }
     $winErrors = [System.Collections.Generic.List[object]]::new()
-    $winResults = Invoke-Command -ComputerName $mobileData.Windows -ScriptBlock $scriptBlock -ArgumentList $mobileData.AllUsers,$taskData,$groupDict,$mobileName,$disJoin -ErrorVariable winErrors -ErrorAction SilentlyContinue
+    $winResults = Invoke-Command -ComputerName $mobileData.Windows -ScriptBlock $Script:WindowsDeployBlock -ArgumentList $mobileData.AllUsers,$taskData,$mobileName,$disJoin -ErrorVariable winErrors -ErrorAction SilentlyContinue
+    $winResults = foreach ($r in $winResults)
+    {
+        [PSCustomObject]@{
+            Hostname = $r.PSComputerName
+            Platform = "Windows"
+            Success = [bool]$r.Success
+            Actions = @($r.Actions)
+            Failures = @()
+        }
+    }
 
     foreach ($computer in $mobileData.Windows)
     {
-            
-        $hostError = $winErrors | Where-Object { $_.TargetObject -eq $computer }
-        $hostResult = $winResults | Where-Object { $_.PSComputerName -eq $computer }
+        $alreadyReturned = $winResults |
+            Where-Object HostName -eq $computer
 
-        if ($hostResult -and -not $hostError)
+        if ($alreadyReturned)
         {
-            Write-Host " [Windows] - $($computer) - [ OK ]" -ForegroundColor Green
+            continue
+        }
+
+        $hostErrors = @(
+            $winErrors |
+                Where-Object {
+                    $_.TargetObject -eq $computer -or
+                    $_.OriginInfo.PSComputerName -eq $computer
+                }
+        )
+
+        $messages = if ($hostErrors)
+        {
+            @($hostErrors | ForEach-Object {
+                    $_.Exception.Message
+                })
         } else
         {
-            Write-Host " [Windows] - $($computer) - [ FAIL ]" -ForegroundColor Red
-            if ($hostError)
-            {
-                Write-Warning "`t$($hostError.Exception.Message)" 
-            }
+            @('No result returned from remote host.')
+        }
+
+        $winResults += [PSCustomObject]@{
+            HostName = $computer
+            Platform = 'Windows'
+            Success  = $false
+            Actions  = @()
+            Failures = $messages
         }
     }
 
@@ -1776,27 +2459,44 @@ function Start-MobileDeployment
     # $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
     
     $linRes = @()
+    $linResults = @()
     if ($mobileData.Linux.Count -gt 0)
     {
         $linuxDeploy = Get-LinuxDeployScript -oldEncryption $oldEncryption -encryptionPin $defaultPin -nfsHome $nfsHome -allUsers $mobileData.AllUsers
         $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $key
     
-        foreach ($r in $linRes)
+        $linResults = foreach ($r in $linRes)
         {
-            if ($r.ExitCode -eq 0)
+            if ($r.ExitCode -eq 0 -and $r.StdOut)
             {
-                Write-Host "[Linux] - $($r.Target) - [ OK ]" -ForegroundColor green
-
+                try
+                {
+                    $r.StdOut | ConvertFrom-Json
+                } catch
+                {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Actions  = @()
+                        Failures = @('Invalid JSON response')
+                    }
+                }
             } else
             {
-            
-                Write-Host "[Linux] - $($r.Target) - [ FAIL ]" -ForegroundColor red
-
+                [PSCustomObject]@{
+                    HostName = $r.Target
+                    Platform = 'Linux'
+                    Success  = $false
+                    Actions  = @()
+                    Failures = @($r.StdErr)
+                }
             }
         }
 
 
     }
+    Format-DeploymentResults @($winResults) + @($linResults)
 }
 
 
@@ -2159,7 +2859,7 @@ function Find-ADComputerMatch
     $searcher.PropertiesToLoad.AddRange(@('name', 'dNSHostName', 'operatingSystem'))
 
     $results = @($searcher.FindAll())
-    $matches = foreach ($res in $results)
+    $pMatches = foreach ($res in $results)
     {
         $props = $res.Properties
         [PSCustomObject]@{
@@ -2182,7 +2882,7 @@ function Find-ADComputerMatch
         }
     }
 
-    return $matches
+    return $pMatches
 }
 
 function Find-ADUserMatch
@@ -2198,7 +2898,7 @@ function Find-ADUserMatch
     $searcher.PropertiesToLoad.AddRange(@('sAMAccountName', 'displayName', 'givenName', 'sn', 'mail'))
 
     $results = @($searcher.FindAll())
-    $matches = foreach ($res in $results)
+    $pMatches = foreach ($res in $results)
     {
         $props = $res.Properties
         $first = if ($props.Contains('givenName'))
@@ -2242,7 +2942,7 @@ function Find-ADUserMatch
         }
     }
 
-    return $matches
+    return $pMatches
 }
 
 function New-MobileDeployment
@@ -2277,10 +2977,10 @@ function New-MobileDeployment
             { break 
             }
 
-            $matches = @(Find-ADComputerMatch -SearchTerm $raw)
+            $pMatches = @(Find-ADComputerMatch -SearchTerm $raw)
 
             # 1. Exact match
-            $exact = $matches | Where-Object { $_.Name -ieq $raw }
+            $exact = $pMatches | Where-Object { $_.Name -ieq $raw }
             if ($exact)
             {
                 Write-Host "Found AD Computer: $($exact.Name)" -ForegroundColor Green
@@ -2289,11 +2989,11 @@ function New-MobileDeployment
             }
 
             # 2. Ambiguous match -> Terminal single-select picker
-            if ($matches.Count -gt 1)
+            if ($pMatches.Count -gt 1)
             {
                 $picked = Show-TerminalSinglePicker `
                     -Title "Multiple $PlatformLabel AD Matches for '$raw'" `
-                    -Options $matches `
+                    -Options $pMatches `
                     -DisplayProperty "DisplayText"
                 
                 if ($picked)
@@ -2301,12 +3001,12 @@ function New-MobileDeployment
                     $collected.Add($picked.Name)
                     continue
                 }
-            } elseif ($matches.Count -eq 1)
+            } elseif ($pMatches.Count -eq 1)
             {
                 $confirmMatch = Read-Host -Prompt "Did you mean '$($matches[0].Name)'? (y/n)"
                 if ($confirmMatch -match '^(y|yes)$')
                 {
-                    $collected.Add($matches[0].Name)
+                    $collected.Add($pMatches[0].Name)
                     continue
                 }
             }
@@ -2481,79 +3181,385 @@ function Write-MobileFile
 }
 
 
+function Get-LinuxUnregisterScript
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [array]$AllUsers,
+
+        [Parameter()]
+        [bool]$Archive = $true
+    )
+
+    $scriptArray = [System.Collections.Generic.List[string]]::new()
+
+    $archiveValue = if ($Archive)
+    { 'true' 
+    } else
+    { 'false' 
+    }
+
+    $scriptArray.Add(@"
+#!/usr/bin/env bash
+
+archive=$archiveValue
+
+monthYear=`$(date '+%m-%Y')
+timeStamp=`$(date '+%Y%m%d')
+
+mobileHome='/mobiles/home'
+archiveRoot='/mobiles/archive'
+archivePath="`$archiveRoot/`$monthYear"
+
+declare -a removed_users=()
+declare -a missing_users=()
+declare -a archived_users=()
+declare -a removed_tasks=()
+declare -a missing_tasks=()
+declare -a failures=()
+
+if [[ "`$archive" == true ]]; then
+    if ! dzdo mkdir -p "`$archivePath"; then
+        failures+=("archive-directory:`$archivePath")
+    fi
+fi
+
+"@)
+
+    $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName))
+    {
+        $group.Group |
+            Where-Object { $null -ne $_.LinuxAccountType } |
+            Sort-Object {
+                $script:GroupMetadata[$_.GroupType].LinuxPriority
+            } -Descending |
+            Select-Object -First 1
+    }
+
+
+    foreach ($u in $linuxUsers)
+    {
+        $scriptArray.Add(@"
+username='$($u.LinuxName)'
+homePath="`$mobileHome/`$username"
+
+if id "`$username" &>/dev/null; then
+
+    #
+    # Archive before destructive cleanup
+    #
+    if [[ "`$archive" == true && -d "`$homePath" ]]; then
+        archiveFile="`$archivePath/`$username-`$timeStamp.tar.gz"
+
+        if dzdo tar -czf "`$archiveFile" -C "`$(dirname "`$homePath")" "`$(basename "`$homePath")"; then
+            archived_users+=("`$username")
+        else
+            failures+=("archive:`$username")
+            continue
+        fi
+    fi
+
+    #
+    # Remove account and home
+    #
+    if dzdo userdel -r "`$username"; then
+        removed_users+=("`$username")
+    else
+        failures+=("user:`$username")
+    fi
+
+else
+    missing_users+=("`$username")
+
+    #
+    # Account may already be gone while home remains.
+    # Preserve/archive it before cleanup.
+    #
+    if [[ -d "`$homePath" ]]; then
+
+        if [[ "`$archive" == true ]]; then
+            archiveFile="`$archivePath/`$username-`$timeStamp.tar.gz"
+
+            if dzdo tar -czf "`$archiveFile" -C "`$(dirname "`$homePath")" "`$(basename "`$homePath")"; then
+                archived_users+=("`$username")
+            else
+                failures+=("archive:`$username")
+                continue
+            fi
+        fi
+
+        if ! dzdo rm -rf -- "`$homePath"; then
+            failures+=("profile:`$username")
+        fi
+    fi
+fi
+
+"@)
+    }
+
+    $scriptArray.Add(@'
+#
+# Remove mobile-specific systemd units.
+#
+mobile_units=(
+    "mobile-logrotate.timer"
+    "mobile-logrotate.service"
+)
+
+for unit in "${mobile_units[@]}"; do
+    if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit"; then
+
+        if dzdo systemctl disable --now "$unit" >/dev/null 2>&1; then
+            if dzdo rm -f "/etc/systemd/system/$unit"; then
+                removed_tasks+=("$unit")
+            else
+                failures+=("unit-file:$unit")
+            fi
+        else
+            failures+=("unit:$unit")
+        fi
+
+    else
+        missing_tasks+=("$unit")
+    fi
+done
+
+dzdo systemctl daemon-reload >/dev/null 2>&1 || failures+=("systemd:daemon-reload")
+
+
+#
+# Emit structured result.
+#
+to_json_array()
+{
+    if (($# == 0)); then
+        printf '[]'
+    else
+        printf '%s\n' "$@" |
+            jq -Rsc 'split("\n")[:-1]'
+    fi
+}
+
+created_json=$(to_json_array "${removed_users[@]}")
+missing_json=$(to_json_array "${missing_users[@]}")
+archive_json=$(to_json_array "${archived_users[@]}")
+tasks_json=$(to_json_array "${removed_tasks[@]}")
+missing_tasks_json=$(to_json_array "${missing_tasks[@]}")
+failures_json=$(to_json_array "${failures[@]}")
+
+jq -n \
+    --arg hostname "$(hostname)" \
+    --argjson removed "$created_json" \
+    --argjson missing "$missing_json" \
+    --argjson archived "$archive_json" \
+    --argjson tasks "$tasks_json" \
+    --argjson missingTasks "$missing_tasks_json" \
+    --argjson failures "$failures_json" \
+'
+{
+    HostName: $hostname,
+    Platform: "Linux",
+    Success: (($failures | length) == 0),
+
+    Actions: [
+        {
+            Name: "ProfilesArchived",
+            Status: (
+                if ($archived | length) > 0
+                then "Changed"
+                else "Ok"
+                end
+            ),
+            Details: $archived
+        },
+        {
+            Name: "UsersRemoved",
+            Status: (
+                if ($removed | length) > 0
+                then "Changed"
+                else "Ok"
+                end
+            ),
+            Details: $removed
+        },
+        {
+            Name: "UsersAbsent",
+            Status: "Ok",
+            Details: $missing
+        },
+        {
+            Name: "SystemdUnits",
+            Status: (
+                if ($tasks | length) > 0
+                then "Changed"
+                else "Ok"
+                end
+            ),
+            Details: $tasks
+        },
+        {
+            Name: "UnitsAbsent",
+            Status: "Ok",
+            Details: $missingTasks
+        }
+    ],
+
+    Failures: $failures
+}
+'
+'@)
+
+    return $scriptArray -join "`n"
+}
+
+function Unregister-Deployment
+{
+    [CmdletBinding()]
+
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [string]$MobileName,
+        [Parameter()]
+        [string]$sshKeyName = $Script:Config.sshKeyName,
+        [string]$sshKeyPath = $Script:Config.SSHKeyPath,
+        [string]$certName = $Script:Config.certName,
+        [string]$adminRoot = $Script:Config.adminRoot,
+        [string]$defaultPass = $Script:Config.defaultPass, 
+        [string]$defaultPin = $Script:Config.defaultPin,
+        [string]$oldEncryption = $Script:Config.curLuks,
+        [string]$mobileDump = $Script:Config.mobileDump,
+        [bool]$archive = $false
+    )
+    $mobileData = Get-MobileData -MobileName $MobileName 
+    $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
+    $winErrors = [System.Collections.Generic.List[object]]::new()
+
+    $winResults = @()
+    $linResults = @()
+
+    if (@($mobileData.Windows).Count -gt 0)
+    {
+        $winErrors = [System.Collections.Generic.List[object]]::new()
+
+        $rawWindows = Invoke-Command `
+            -ComputerName $mobileData.Windows `
+            -ScriptBlock $script:WindowsUnregisterBlock `
+            -ArgumentList $mobileData.AllUsers, $taskData, $mobileName, $archive `
+            -ErrorAction SilentlyContinue `
+            -ErrorVariable winErrors
+
+        $winResults = @(
+            foreach ($r in $rawWindows)
+            {
+                [PSCustomObject]@{
+                    HostName = $r.PSComputerName
+                    Platform = 'Windows'
+                    Success  = [bool]$r.Success
+                    Actions  = @($r.Actions)
+                    Failures = @($r.Failures)
+                }
+            }
+        )
+
+        foreach ($computer in $mobileData.Windows)
+        {
+            $alreadyReturned = $winResults |
+                Where-Object HostName -eq $computer
+
+            if ($alreadyReturned)
+            {
+                continue
+            }
+
+            $hostErrors = @(
+                $winErrors |
+                    Where-Object {
+                        $_.TargetObject -eq $computer -or
+                        $_.OriginInfo.PSComputerName -eq $computer
+                    }
+            )
+
+            $messages = if ($hostErrors)
+            {
+                @(
+                    $hostErrors |
+                        ForEach-Object { $_.Exception.Message }
+                )
+            } else
+            {
+                @('No result returned from remote host.')
+            }
+
+            $winResults += [PSCustomObject]@{
+                HostName = $computer
+                Platform = 'Windows'
+                Success  = $false
+                Actions  = @()
+                Failures = $messages
+            }
+        }
+    }
+
+    if (@($mobileData.Linux).Count -gt 0)
+    {
+        $linuxUnregister = Get-LinuxUnregisterScript `
+            -AllUsers $mobileData.AllUsers `
+            -Archive:$archive
+
+        $rawLinux = Invoke-Linux `
+            -Computers $mobileData.Linux `
+            -Script $linuxUnregister `
+            -KeyPath $sshKeyPath
+
+        $linResults = @(
+            foreach ($r in $rawLinux)
+            {
+                if ($r.ExitCode -eq 0 -and $r.StdOut)
+                {
+                    try
+                    {
+                        $r.StdOut | ConvertFrom-Json
+                    } catch
+                    {
+                        [PSCustomObject]@{
+                            HostName = $r.Target
+                            Platform = 'Linux'
+                            Success  = $false
+                            Actions  = @()
+                            Failures = @(
+                                "Invalid JSON response: $($_.Exception.Message)"
+                            )
+                        }
+                    }
+                } else
+                {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Actions  = @()
+                        Failures = @(
+                            if ($r.StdErr)
+                            {
+                                $r.StdErr
+                            } else
+                            {
+                                "SSH exited with code $($r.ExitCode)"
+                            }
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    Format-DeploymentResults (@($winResults) + @($linResults))
+
+
+}
 
 
 
-# function Unregister-Deployment
-# {
-#     [CmdletBinding()]
-#     param(
-#         [Parameter(Mandatory = $true)]
-#         [string]$MobileName,
-#
-#         [Parameter(Mandatory = $true)]
-#         [hashtable]$Config,
-#
-#         [Parameter()]
-#         [string]$archiveDir = "C:\Mobiles\"
-#
-#     )
-#
-#     $cfg = Get-MobileConfig $config
-#     $mobileData = Get-MobileData  -MobileName $MobileName -defaultUserpath $cfg.DefaultUsers -mobileEntriesPath $cfg.MobileEntries -fallbackPass $cfg.DefaultPass
-#     $taskData = Get-TaskData
-#
-#     $scriptBlock = {
-#         param([array]$AllUsers, [hashtable]$Tasks, [string]$archiveDir)
-#
-#         $curDate = Get-Date
-#         $archivePath = Join-Path $archiveDir "$($curDate.Year)"
-#         if (-not (Test-Path $archivePath))
-#         {
-#             New-Item -ItemType Directory -Force $archivePath
-#         }
-#
-#
-#
-#         foreach ($u in $AllUsers)
-#         {
-#             $name = $u.Name
-#             $sid = (Get-LocalUser -Name $name -ErrorAction SilentlyContinue).Sid.Value
-#
-#             $profilePath = "C:\Users\$name"
-#             if (Test-Path $profilePath)
-#             {
-#                 $ts = (Get-Date).ToString('yyyyMMdd')
-#                 $archiveFile = Join-Path $archivePath "$($name)_${ts}.zip"
-#                 Compress-Archive -Path $profilePath -DestinationPath $archiveFile -CompressionLevel Optimal
-#
-#             }
-#             $profileObject = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.SID -eq $sid -or $_.LocalPath -ieq $profilePath }
-#
-#             if ($profileObject)
-#             {$profileObject | Remove-CimInstance
-#             } elseif (Test-Path $profilePath)
-#             { Remove-Item -Force -Recurse -Path $profilePath -ErrorAction SilentlyContinue
-#             }
-#             Remove-LocalUser $name -ErrorAction SilentlyContinue
-#         }
-#
-#     }
-#
-#
-#     Invoke-Command -ComputerName $mobileData.Windows -ScriptBlock $scriptBlock -ArgumentList $mobileData.AllUsers,$taskData,$archiveDir
-#     $linuxDeploy = Get-LinuxDeployScript -oldEncryption $config.curLuks -encryptionPin $Config.encryptionPin  
-#     $jobs = foreach ($h in $mobileData.Linux)
-#     {
-#         Start-Job -ScriptBlock {
-#             param($target, $payload, $key)
-#             $payload | ssh -i $key -o BatchMode=yes -o StrictHostKeyChecking=no $target "bash -s --"
-#
-#         } -ArgumentList $h,$bashScript,$sshKey
-#     }
-#     $linRes = $jobs | Receive-Job -Wait -AutoRemoveJob
-#
-# }
-#
-#
-#
+
+
