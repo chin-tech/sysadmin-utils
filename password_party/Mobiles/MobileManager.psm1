@@ -2675,6 +2675,7 @@ function Invoke-InformationCollector
 
 hostname_value="$(hostname -s)"
 cores_value="$(nproc)"
+os=$(. /etc/os-release && echo "${ID^^}-${VERSION_ID}")
 kernel_value="$(uname -r)"
 
 clamav_value="$(clamscan -V 2>/dev/null | awk -F'/' '{print $NF}' | xargs -I{} date -d "{}" +'%d/%m/%Y')"
@@ -2749,10 +2750,11 @@ jq -n \
     --arg avDefs "$clamav_value" \
     --arg lastUpdate "$last_update_value" \
     --argjson packages "$packages_json" \
+    --argjson os "$os" \
 '
 {
     HostName: $hostname,
-    Platform: "Linux",
+    Platform: $os,
 
     Summary: {
         Kernel: $kernel,
@@ -2776,6 +2778,9 @@ jq -n \
     $windowsInformationBlock = {
 
         $os = Get-CimInstance Win32_OperatingSystem
+        $osInfo = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion'
+        $osString = "$($osInfo.ProductName) - $($osInfo.DisplayVersion)"
+        $KernelString = "$($osInfo.LCUVer)"
 
         $cores = (
             Get-CimInstance Win32_Processor |
@@ -2903,10 +2908,10 @@ jq -n \
 
         [PSCustomObject]@{
             HostName = $env:COMPUTERNAME
-            Platform = 'Windows'
+            Platform = $osString
 
             Summary = [PSCustomObject]@{
-                Kernel             = "$($os.Version) ($($os.BuildNumber))"
+                Kernel             = $KernelString
                 Cores              = $cores
                 PackageCount       = $packages.Count
                 AdminRotateVersion = $adminRotateScriptVersion
