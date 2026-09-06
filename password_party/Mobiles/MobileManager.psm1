@@ -2227,7 +2227,7 @@ function Get-MobileOverview
             -linComputers $data.Linux `
             -sshKeyPath $sshKeyPath
 
-        Format-InformationResults -InputObject $computerData
+        $computerData | Format-InformationResults
         #
         # # Render Windows Audit Results
         # if ($computerData.Windows.Count -gt 0 -or $computerData.WinFails.Count -gt 0)
