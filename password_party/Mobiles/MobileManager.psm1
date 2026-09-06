@@ -2743,6 +2743,7 @@ package_count="$(
 
 jq -n \
     --arg hostname "$hostname_value" \
+    --arg os "$os" \
     --arg kernel "$kernel_value" \
     --argjson cores "$cores_value" \
     --argjson packageCount "$package_count" \
@@ -2750,7 +2751,6 @@ jq -n \
     --arg avDefs "$clamav_value" \
     --arg lastUpdate "$last_update_value" \
     --argjson packages "$packages_json" \
-    --argjson os "$os" \
 '
 {
     HostName: $hostname,
