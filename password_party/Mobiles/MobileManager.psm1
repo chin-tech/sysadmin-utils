@@ -1130,7 +1130,7 @@ function New-DeployerCertificate
     [CmdletBinding()]
     param(
         [Parameter()][securestring]$certPass = (ConvertTo-SecureString -AsPlainText -Force 'deployer'),
-        [Parameter()][string]$outPath = "\\nas\home\$env:USERNAME"
+        [Parameter()][string]$outPath = $Script:Config.NfsHome
     )
     $c = New-SelfSignedCertificate -Subject 'CN=MobileDeployer' -Type DocumentEncryptionCert -CertStoreLocation "Cert:\CurrentUser\My" -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)
     Export-PFXCertificate -Cert $c -FilePath (Join-Path $outPath "Deployer.pfx") -Password $certPass
@@ -2564,7 +2564,7 @@ function Start-MobileDeployment
     if ($mobileData.Linux.Count -gt 0)
     {
         $linuxDeploy = Get-LinuxDeployScript -allUsers $mobileData.AllUsers
-        $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $key
+        $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $sshKeyPath
     
         $linResults = foreach ($r in $linRes)
         {
