@@ -133,155 +133,285 @@ $script:GroupMetadata = @{
 
 
 
+# $script:WindowsDeployBlock = {
+#     param($payload)
+#
+#     $actions = [System.Collections.Generic.List[object]]::new()
+#     $failures = [System.Collections.Generic.List[string]]::new()
+#
+#
+#     $createdUsers = [System.Collections.Generic.List[string]]::new()
+#     $existingUsers = [System.Collections.Generic.List[string]]::new()
+#     $registeredTasks = [System.Collections.Generic.List[string]]::new()
+#     if ($payload.AllUsers.count -eq 0) {
+#         Write-Host "--- NO USERS ----"
+#         $failures.Add("No users")
+#     }
+#
+#     if ($payload.TaskData.Count -eq 0) {
+#         Write-Host " -- NO TASKS --"
+#     }
+#
+#     foreach ($u in $payload.allUsers)
+#     {
+#         $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
+#
+#         if ($existing)
+#         {
+#             $existingUsers.Add($u.Name)
+#         } else
+#         {
+#             $uParams = @{
+#                 Name        = $u.Name
+#                 FullName    = $u.FullName
+#                 Password    = $u.Password
+#                 Description = $u.Description
+#             }
+#
+#             try
+#             {
+#                 $null = New-LocalUser @uParams -ErrorAction Stop
+#                 $createdUsers.Add($u.Name)
+#
+#             } catch
+#             {
+#                 $failures.Add("User: '$($u.Name)': $($_.Exception.Message)")
+#             }
+#         }
+#
+#         if ($u.MustChangePassword)
+#         {
+#             try
+#             {
+#                 $a = [ADSI]"WinNT://./$($u.Name),user"
+#                 $a.PasswordExpired = 1
+#                 $null = $a.SetInfo()
+#             } catch
+#             {
+#                 $failures.Add(
+#                     "Password expiry '$($u.Name)': $($_.Exception.Message)"
+#                 )
+#             }
+#         }
+#
+#         foreach ($g in $u.WindowsGroups)
+#         {
+#             try
+#             {
+#                 $null =Add-LocalGroupMember `
+#                     -Group $g `
+#                     -Member $u.Name `
+#                     -ErrorAction Stop
+#             } catch [Microsoft.PowerShell.Commands.MemberExistsException]
+#             {
+#                 ## Not really an error in our case.
+#             } catch
+#             {
+#                 $failures.Add("Group '$g' for $($u.Name) : $($_.Exception.Message)")
+#             }
+#         }
+#     }
+#
+#     if ($createdUsers.Count)
+#     {
+#         $actions.Add([PSCustomObject]@{
+#                 Name    = 'Users'
+#                 Status  = 'Changed'
+#                 Details = $createdUsers.ToArray()
+#             })
+#     }
+#
+#     if ($existingUsers.Count)
+#     {
+#         $actions.Add([PSCustomObject]@{
+#                 Name    = 'ExistingUsers'
+#                 Status  = 'Ok'
+#                 Details = $existingUsers.ToArray()
+#             })
+#     }
+#
+#
+#     foreach ($t in $payload.TaskData)
+#     {
+#         try
+#         {
+#             Register-ScheduledTask `
+#                 -TaskName $t.TaskName `
+#                 -Xml $t.TaskXML `
+#                 -User System `
+#                 -Force `
+#                 -ErrorAction Stop |
+#                 Out-Null
+#
+#             $registeredTasks.Add($t.TaskName)
+#         } catch
+#         {
+#             $failures.Add(
+#                 "Scheduled task '$($t.TaskName)': $($_.Exception.Message)"
+#             )
+#         }
+#     }
+#     if ($registeredTasks.Count)
+#     {
+#         $actions.Add([PSCustomObject]@{
+#                 Name    = 'ScheduledTasks'
+#                 Status  = 'Changed'
+#                 Details = @($registeredTasks)
+#             })
+#     }
+#
+#     if ($payload.DisJoin)
+#     {
+#         try
+#         {
+#
+#             Remove-Computer `
+#                 -Force `
+#                 -Restart `
+#                 -WorkGroupName $payload.Mobilename
+#
+#             $actions.Add([PSCustomObject]@{
+#                     Name    = 'Domain'
+#                     Status  = 'Changed'
+#                     Details = @("Joined workgroup $mobileName")
+#                 })
+#         } catch
+#         {
+#             $failures.Add("Domain Disjoin: $($_.Exception.Message)")
+#         }
+#     }
+#
+#     [PSCustomObject]@{
+#         Platform = 'Windows'
+#         Success  = ($failures.Count -eq 0)
+#         Actions  = $actions.ToArray()
+#         Failures = $failures.ToArray()
+#     }
+# }
+
 $script:WindowsDeployBlock = {
     param($payload)
 
-    $actions = [System.Collections.Generic.List[object]]::new()
+    $actions  = [System.Collections.Generic.List[object]]::new()
     $failures = [System.Collections.Generic.List[string]]::new()
-    
 
-    $createdUsers = [System.Collections.Generic.List[string]]::new()
-    $existingUsers = [System.Collections.Generic.List[string]]::new()
+    $createdUsers    = [System.Collections.Generic.List[string]]::new()
+    $existingUsers   = [System.Collections.Generic.List[string]]::new()
     $registeredTasks = [System.Collections.Generic.List[string]]::new()
-    if ($payload.AllUsers.count -eq 0) {
-        Write-Host "--- NO USERS ----"
-        $failures.Add("No users")
+
+    # Reusable execution wrapper
+    function Invoke-Step {
+        param(
+            [Parameter(Mandatory)] [string]$Context,
+            [Parameter(Mandatory)] [scriptblock]$Action,
+            [type[]]$IgnoreExceptions = @()
+        )
+        try {
+            & $Action
+            return $true
+        }
+        catch {
+            foreach ($ignored in $IgnoreExceptions) {
+                if ($_.Exception -is $ignored) { return $false }
+            }
+            $failures.Add("$Context: $($_.Exception.Message)")
+            return $false
+        }
     }
 
-    if ($payload.TaskData.Count -eq 0) {
-        Write-Host " -- NO TASKS --"
+    if (-not $payload.AllUsers -or $payload.AllUsers.Count -eq 0) {
+        $failures.Add("No users provided in payload")
     }
 
-    foreach ($u in $payload.allUsers)
-    {
-        $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
-
-        if ($existing)
-        {
+    # --- User Provisioning ---
+    foreach ($u in $payload.AllUsers) {
+        if (Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue) {
             $existingUsers.Add($u.Name)
-        } else
-        {
+        }
+        else {
             $uParams = @{
                 Name        = $u.Name
                 FullName    = $u.FullName
                 Password    = $u.Password
                 Description = $u.Description
+                ErrorAction = 'Stop'
             }
-
-            try
-            {
-                Write-Host "Adding user $($u.Name)"
-                $null = New-LocalUser @uParams -ErrorAction Stop
+            if (Invoke-Step -Context "User '$($u.Name)'" -Action { New-LocalUser @uParams | Out-Null }) {
                 $createdUsers.Add($u.Name)
-
-            } catch
-            {
-                $failures.Add("User: '$($u.Name)': $($_.Exception.Message)")
             }
         }
 
-        if ($u.MustChangePassword)
-        {
-            try
-            {
-                $a = [ADSI]"WinNT://./$($u.Name),user"
-                $a.PasswordExpired = 1
-                $null = $a.SetInfo()
-            } catch
-            {
-                $failures.Add(
-                    "Password expiry '$($u.Name)': $($_.Exception.Message)"
-                )
+        if ($u.MustChangePassword) {
+            Invoke-Step -Context "Password expiry '$($u.Name)'" -Action {
+                $adsiUser = [ADSI]"WinNT://./$($u.Name),user"
+                $adsiUser.PasswordExpired = 1
+                $adsiUser.SetInfo()
             }
         }
 
-        foreach ($g in $u.WindowsGroups)
-        {
-            try
-            {
-                $null =Add-LocalGroupMember `
-                    -Group $g `
-                    -Member $u.Name `
-                    -ErrorAction Stop
-            } catch [Microsoft.PowerShell.Commands.MemberExistsException]
-            {
-                ## Not really an error in our case.
-            } catch
-            {
-                $failures.Add("Group '$g' for $($u.Name) : $($_.Exception.Message)")
-            }
+        foreach ($g in $u.WindowsGroups) {
+            Invoke-Step -Context "Group '$g' for $($u.Name)" `
+                        -IgnoreExceptions @([Microsoft.PowerShell.Commands.MemberExistsException]) `
+                        -Action {
+                            Add-LocalGroupMember -Group $g -Member $u.Name -ErrorAction Stop
+                        }
         }
     }
 
-    if ($createdUsers.Count)
-    {
+    if ($createdUsers.Count) {
         $actions.Add([PSCustomObject]@{
-                Name    = 'Users'
-                Status  = 'Changed'
-                Details = $createdUsers.ToArray()
-            })
+            Name    = 'Users'
+            Status  = 'Changed'
+            Details = $createdUsers.ToArray()
+        })
     }
 
-    if ($existingUsers.Count)
-    {
+    if ($existingUsers.Count) {
         $actions.Add([PSCustomObject]@{
-                Name    = 'ExistingUsers'
-                Status  = 'Ok'
-                Details = $existingUsers.ToArray()
-            })
+            Name    = 'ExistingUsers'
+            Status  = 'Ok'
+            Details = $existingUsers.ToArray()
+        })
     }
 
-
-    foreach ($t in $payload.TaskData)
-    {
-        try
-        {
-            Register-ScheduledTask `
-                -TaskName $t.TaskName `
-                -Xml $t.TaskXML `
-                -User System `
-                -Force `
-                -ErrorAction Stop |
-                Out-Null
-
+    # --- Scheduled Tasks ---
+    foreach ($t in $payload.TaskData) {
+        $taskRan = Invoke-Step -Context "Scheduled task '$($t.TaskName)'" -Action {
+            Register-ScheduledTask -TaskName $t.TaskName `
+                                   -Xml $t.TaskXML `
+                                   -User 'System' `
+                                   -Force `
+                                   -ErrorAction Stop | Out-Null
+        }
+        if ($taskRan) {
             $registeredTasks.Add($t.TaskName)
-        } catch
-        {
-            $failures.Add(
-                "Scheduled task '$($t.TaskName)': $($_.Exception.Message)"
-            )
         }
     }
-    if ($registeredTasks.Count)
-    {
+
+    if ($registeredTasks.Count) {
         $actions.Add([PSCustomObject]@{
-                Name    = 'ScheduledTasks'
-                Status  = 'Changed'
-                Details = @($registeredTasks)
-            })
+            Name    = 'ScheduledTasks'
+            Status  = 'Changed'
+            Details = $registeredTasks.ToArray()
+        })
     }
 
-    if ($payload.DisJoin)
-    {
-        try
-        {
-
-            Remove-Computer `
-                -Force `
-                -Restart `
-                -WorkGroupName $payload.Mobilename
-
+    # --- Domain Disjoin ---
+    if ($payload.DisJoin) {
+        $disjoinTarget = $payload.MobileName
+        $disjoinRan = Invoke-Step -Context "Domain Disjoin" -Action {
+            Remove-Computer -WorkGroupName $disjoinTarget -Force -Restart -ErrorAction Stop
+        }
+        if ($disjoinRan) {
             $actions.Add([PSCustomObject]@{
-                    Name    = 'Domain'
-                    Status  = 'Changed'
-                    Details = @("Joined workgroup $mobileName")
-                })
-        } catch
-        {
-            $failures.Add("Domain Disjoin: $($_.Exception.Message)")
+                Name    = 'Domain'
+                Status  = 'Changed'
+                Details = @("Joined workgroup $disjoinTarget")
+            })
         }
     }
 
+    # --- Return Normalized Object ---
     [PSCustomObject]@{
         Platform = 'Windows'
         Success  = ($failures.Count -eq 0)
