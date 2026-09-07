@@ -2471,17 +2471,25 @@ function Start-MobileDeployment
     Write-Host "---Deployment Started---"
 
     $winErrors = [System.Collections.Generic.List[object]]::new()
-    $winResults = Invoke-Command -ComputerName $mobileData.Windows -ScriptBlock $Script:WindowsDeployBlock -ArgumentList $mobileData.AllUsers,$taskData,$mobileName,$disJoin -ErrorVariable winErrors -ErrorAction SilentlyContinue
-    $winResults = foreach ($r in $winResults)
+    $rawWindows = Invoke-Command `
+    -ComputerName $mobileData.Windows `
+    -ScriptBlock $Script:WindowsDeployBlock `
+    -ArgumentList $mobileData.AllUsers, $taskData, $mobileName, $disJoin `
+    -ErrorVariable winErrors `
+    -ErrorAction SilentlyContinue
+
+    $winResults = @(
+    foreach ($r in $rawWindows)
     {
         [PSCustomObject]@{
-            Hostname = $r.PSComputerName
-            Platform = "Windows"
-            Success = [bool]$r.Success
-            Actions = @($r.Actions)
-            Failures = @()
+            HostName = $r.PSComputerName
+            Platform = 'Windows'
+            Success  = [bool]$r.Success
+            Actions  = @($r.Actions)
+            Failures = @($r.Failures)
         }
     }
+)
 
     Write-Host "[+] Windows Finished"
 
@@ -2547,7 +2555,11 @@ function Start-MobileDeployment
                         Platform = 'Linux'
                         Success  = $false
                         Actions  = @()
-                        Failures = @('Invalid JSON response')
+                        Failures = @(
+                        "Invalid JSON response: $($_.Exception.Message)"
+                        "STDOUT: $($r.StdOut)"
+                        "STDERR: $($r.StdErr)"
+                    )
                     }
                 }
             } else
@@ -2564,7 +2576,20 @@ function Start-MobileDeployment
 
 
     }
-    Format-DeploymentResults @($winResults) + @($linResults)
+Write-Host "`n--- RAW LINUX RESULTS ---" -ForegroundColor Magenta
+
+foreach ($r in $linRes)
+{
+    Write-Host "Target:   [$($r.Target)]"
+    Write-Host "ExitCode: [$($r.ExitCode)]"
+    Write-Host "STDOUT:"
+    Write-Host $r.StdOut
+    Write-Host "STDERR:"
+    Write-Host $r.StdErr
+    Write-Host "-------------------------"
+}
+    $results = @($winResults) + @($linResults)
+    Format-DeploymentResults -results $results
 }
 
 
