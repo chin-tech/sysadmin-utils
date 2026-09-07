@@ -300,35 +300,43 @@ $script:WindowsDeployBlock = {
     $registeredTasks = [System.Collections.Generic.List[string]]::new()
 
     # Reusable execution wrapper
-    function Invoke-Step {
+    function Invoke-Step
+    {
         param(
             [Parameter(Mandatory)] [string]$Context,
             [Parameter(Mandatory)] [scriptblock]$Action,
             [type[]]$IgnoreExceptions = @()
         )
-        try {
+        try
+        {
             & $Action
             return $true
-        }
-        catch {
-            foreach ($ignored in $IgnoreExceptions) {
-                if ($_.Exception -is $ignored) { return $false }
+        } catch
+        {
+            foreach ($ignored in $IgnoreExceptions)
+            {
+                if ($_.Exception -is $ignored)
+                { return $false 
+                }
             }
             $failures.Add("${Context}: $($_.Exception.Message)")
             return $false
         }
     }
 
-    if (-not $payload.AllUsers -or $payload.AllUsers.Count -eq 0) {
+    if (-not $payload.AllUsers -or $payload.AllUsers.Count -eq 0)
+    {
         $failures.Add("No users provided in payload")
     }
 
     # --- User Provisioning ---
-    foreach ($u in $payload.AllUsers) {
-        if (Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue) {
+    foreach ($u in $payload.AllUsers)
+    {
+        if (Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue)
+        {
             $existingUsers.Add($u.Name)
-        }
-        else {
+        } else
+        {
             $uParams = @{
                 Name        = $u.Name
                 FullName    = $u.FullName
@@ -336,12 +344,14 @@ $script:WindowsDeployBlock = {
                 Description = $u.Description
                 ErrorAction = 'Stop'
             }
-            if (Invoke-Step -Context "User '$($u.Name)'" -Action { New-LocalUser @uParams | Out-Null }) {
+            if (Invoke-Step -Context "User '$($u.Name)'" -Action { New-LocalUser @uParams | Out-Null })
+            {
                 $createdUsers.Add($u.Name)
             }
         }
 
-        if ($u.MustChangePassword) {
+        if ($u.MustChangePassword)
+        {
             Invoke-Step -Context "Password expiry '$($u.Name)'" -Action {
                 $adsiUser = [ADSI]"WinNT://./$($u.Name),user"
                 $adsiUser.PasswordExpired = 1
@@ -349,65 +359,73 @@ $script:WindowsDeployBlock = {
             }
         }
 
-        foreach ($g in $u.WindowsGroups) {
+        foreach ($g in $u.WindowsGroups)
+        {
             Invoke-Step -Context "Group '$g' for $($u.Name)" `
-                        -IgnoreExceptions @([Microsoft.PowerShell.Commands.MemberExistsException]) `
-                        -Action {
-                            Add-LocalGroupMember -Group $g -Member $u.Name -ErrorAction Stop
-                        }
+                -IgnoreExceptions @([Microsoft.PowerShell.Commands.MemberExistsException]) `
+                -Action {
+                Add-LocalGroupMember -Group $g -Member $u.Name -ErrorAction Stop
+            }
         }
     }
 
-    if ($createdUsers.Count) {
+    if ($createdUsers.Count)
+    {
         $actions.Add([PSCustomObject]@{
-            Name    = 'Users'
-            Status  = 'Changed'
-            Details = $createdUsers.ToArray()
-        })
+                Name    = 'Users'
+                Status  = 'Changed'
+                Details = $createdUsers.ToArray()
+            })
     }
 
-    if ($existingUsers.Count) {
+    if ($existingUsers.Count)
+    {
         $actions.Add([PSCustomObject]@{
-            Name    = 'ExistingUsers'
-            Status  = 'Ok'
-            Details = $existingUsers.ToArray()
-        })
+                Name    = 'ExistingUsers'
+                Status  = 'Ok'
+                Details = $existingUsers.ToArray()
+            })
     }
 
     # --- Scheduled Tasks ---
-    foreach ($t in $payload.TaskData) {
+    foreach ($t in $payload.TaskData)
+    {
         $taskRan = Invoke-Step -Context "Scheduled task '$($t.TaskName)'" -Action {
             Register-ScheduledTask -TaskName $t.TaskName `
-                                   -Xml $t.TaskXML `
-                                   -User 'System' `
-                                   -Force `
-                                   -ErrorAction Stop | Out-Null
+                -Xml $t.TaskXML `
+                -User 'System' `
+                -Force `
+                -ErrorAction Stop | Out-Null
         }
-        if ($taskRan) {
+        if ($taskRan)
+        {
             $registeredTasks.Add($t.TaskName)
         }
     }
 
-    if ($registeredTasks.Count) {
+    if ($registeredTasks.Count)
+    {
         $actions.Add([PSCustomObject]@{
-            Name    = 'ScheduledTasks'
-            Status  = 'Changed'
-            Details = $registeredTasks.ToArray()
-        })
+                Name    = 'ScheduledTasks'
+                Status  = 'Changed'
+                Details = $registeredTasks.ToArray()
+            })
     }
 
     # --- Domain Disjoin ---
-    if ($payload.DisJoin) {
+    if ($payload.DisJoin)
+    {
         $disjoinTarget = $payload.MobileName
         $disjoinRan = Invoke-Step -Context "Domain Disjoin" -Action {
             Remove-Computer -WorkGroupName $disjoinTarget -Force -Restart -ErrorAction Stop
         }
-        if ($disjoinRan) {
+        if ($disjoinRan)
+        {
             $actions.Add([PSCustomObject]@{
-                Name    = 'Domain'
-                Status  = 'Changed'
-                Details = @("Joined workgroup $disjoinTarget")
-            })
+                    Name    = 'Domain'
+                    Status  = 'Changed'
+                    Details = @("Joined workgroup $disjoinTarget")
+                })
         }
     }
 
@@ -1039,96 +1057,61 @@ function New-TaskXML
     $taskDef.Principal.UserId = $UserId
     $taskDef.Principal.LogonType = $LogonType
     $taskDef.Principal.RunLevel = $RunLevel
+    function Get-ValOrFallBack 
+    {
+        param($map, $key, $default)
+        if ($map.ContainsKey($key))
+        { 
+            $map[$key]
+
+        } else
+        { 
+            $default 
+        }
+    }
 
     # 4. Triggers Configuration
     foreach ($cfg in $TriggerConfigs)
     {
         $tType = [TaskTriggerType]$cfg.Type
         $trigger = $taskDef.Triggers.Create([int]$tType)
-        $trigger.Enabled = if ($cfg.ContainsKey('Enabled'))
-        { $cfg.Enabled 
-        } else
-        { $true 
-        }
-        
-        if ($cfg.ContainsKey('StartBoundary'))
-        {
-            $trigger.StartBoundary = $cfg.StartBoundary
-        }
+        $trigger.Enabled = Get-ValOrFallBack $cfg "Enabled" $true        
 
         switch ($tType)
         {
             ([TaskTriggerType]::Logon)
             {
                 # Specific user or $null / empty string for all users
-                if ($cfg.ContainsKey('UserId'))
-                {
-                    $trigger.UserId = $cfg.UserId
-                }
-                if ($cfg.ContainsKey('Delay'))
-                {
-                    $trigger.Delay = $cfg.Delay # e.g. "PT30S"
-                }
+                $trigger.UserID  = Get-ValOrFallBack $cfg "UserId" $null
+                $triger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
             }
             ([TaskTriggerType]::Boot)
             {
-                if ($cfg.ContainsKey('Delay'))
-                {
-                    $trigger.Delay = $cfg.Delay # e.g. "PT1M"
-                }
+                $triger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
             }
             ([TaskTriggerType]::Daily)
             {
-                $trigger.DaysInterval = if ($cfg.ContainsKey('DaysInterval'))
-                { 
-                    $cfg.DaysInterval 
-                } else
-                { 
-                    1 
-                }
-                if (-not $trigger.StartBoundary)
-                {
-                    $trigger.StartBoundary = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
-                }
+
+                $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
+                $trigger.DaysInterval = Get-ValOrFallBack $cfg "DaysInterval" 1 
             }
             ([TaskTriggerType]::Weekly)
             {
-                $trigger.WeeksInterval = if ($cfg.ContainsKey('WeeksInterval'))
-                { $cfg.WeeksInterval 
-                } else
-                { 1 
-                }
+                $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
+                $trigger.WeeksInterval = Get-ValOrFallBack $cfg 'WeeksInterval' 1
                 # DaysOfWeek bitmask: 1=Sun, 2=Mon, 4=Tue, 8=Wed, 16=Thu, 32=Fri, 64=Sat
-                $trigger.DaysOfWeek = if ($cfg.ContainsKey('DaysOfWeek'))
-                { $cfg.DaysOfWeek 
-                } else
-                { 2 
-                } # Monday default
-                if (-not $trigger.StartBoundary)
-                {
-                    $trigger.StartBoundary = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
-                }
+                $trigger.DaysOfWeek = Get-ValOrFallBack $cfg 'DaysOfWeek' 1
             }
             ([TaskTriggerType]::Time)
             {
-                if (-not $trigger.StartBoundary)
-                {
-                    $trigger.StartBoundary = (Get-Date).AddMinutes(5).ToString("yyyy-MM-ddTHH:mm:ss")
-                }
+                ## StartBoundary set earlier
+                $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
+                continue
             }
             ([TaskTriggerType]::Registration)
             {
-                if ($cfg.ContainsKey('Delay'))
-                {
-                    $trigger.Delay = $cfg.Delay
-                }
-                if ($cfg.ContainsKey('EndBoundary'))
-                { $trigger.EndBoundary = $cfg.EndBoundary
-                } else
-                { 
-                    (Get-Date).AddSeconds(15).ToString('s')
-
-                }
+                $trigger.Delay = Get-ValOrFallBack $cfg 'Delay' 'PT0S'
+                $trigger.EndBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddSeconds(15).ToString('s')
             }
         }
     }
@@ -2083,12 +2066,42 @@ function Format-HostCollector
         $columns = @(
             @{ Header = 'HOST';    Getter = { param($r) $r.HostName.ToUpper() } }
             @{ Header = 'OS';      Getter = { param($r) $r.Platform } }
-            @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
-            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
-            @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
-            @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
-            @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion) { $r.Summary.AdminRotateVersion } else { '-' } } }
-            @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount) { $r.Summary.PackageCount } else { '-' } } }
+            @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel)
+                    { $r.Summary.Kernel 
+                    } else
+                    { '-' 
+                    } } 
+            }
+            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs)
+                    { $r.Summary.AVDefs 
+                    } else
+                    { '-' 
+                    } } 
+            }
+            @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion)
+                    { $r.Summary.IvantiVersion 
+                    } else
+                    { '-' 
+                    } } 
+            }
+            @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License)
+                    { $r.Summary.License 
+                    } else
+                    { '-' 
+                    } } 
+            }
+            @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion)
+                    { $r.Summary.AdminRotateVersion 
+                    } else
+                    { '-' 
+                    } } 
+            }
+            @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount)
+                    { $r.Summary.PackageCount 
+                    } else
+                    { '-' 
+                    } } 
+            }
             # @{ Header = 'CPU';     Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.Cores) { $r.Summary.Cores } else { '-' } } }
         )
 
@@ -2123,8 +2136,7 @@ function Format-HostCollector
             if ($r.Success)
             {
                 Write-Host ($fmt -f $row.Cells)
-            }
-            else
+            } else
             {
                 $failCells = $row.Cells.Clone()
                 $failCells[-1] = ''   # blank the last column so FAILED can be appended after
@@ -2619,27 +2631,27 @@ function Start-MobileDeployment
 
     $winErrors = [System.Collections.Generic.List[object]]::new()
     $rawWindows = Invoke-Command `
-    -ComputerName $mobileData.Windows `
-    -ScriptBlock $Script:WindowsDeployBlock `
-    -ArgumentList $windowsPayload `
-    -ErrorVariable winErrors `
-    -ErrorAction SilentlyContinue
+        -ComputerName $mobileData.Windows `
+        -ScriptBlock $Script:WindowsDeployBlock `
+        -ArgumentList $windowsPayload `
+        -ErrorVariable winErrors `
+        -ErrorAction SilentlyContinue
 
     $rawWindows | ForEach-Object { $_.PSObject.TypeNames[0]}
     $rawWindows | Format-List *
 
     $winResults = @(
-    foreach ($r in $rawWindows)
-    {
-        [PSCustomObject]@{
-            HostName = $r.PSComputerName
-            Platform = 'Windows'
-            Success  = [bool]$r.Success
-            Actions  = @($r.Actions)
-            Failures = @($r.Failures)
+        foreach ($r in $rawWindows)
+        {
+            [PSCustomObject]@{
+                HostName = $r.PSComputerName
+                Platform = 'Windows'
+                Success  = [bool]$r.Success
+                Actions  = @($r.Actions)
+                Failures = @($r.Failures)
+            }
         }
-    }
-)
+    )
 
     Write-Host "[+] Windows Finished"
 
@@ -2706,10 +2718,10 @@ function Start-MobileDeployment
                         Success  = $false
                         Actions  = @()
                         Failures = @(
-                        "Invalid JSON response: $($_.Exception.Message)"
-                        "STDOUT: $($r.StdOut)"
-                        "STDERR: $($r.StdErr)"
-                    )
+                            "Invalid JSON response: $($_.Exception.Message)"
+                            "STDOUT: $($r.StdOut)"
+                            "STDERR: $($r.StdErr)"
+                        )
                     }
                 }
             } else
