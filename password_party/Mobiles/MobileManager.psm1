@@ -2626,6 +2626,7 @@ function Start-MobileDeployment
     -ErrorAction SilentlyContinue
 
     $rawWindows | ForEach-Object { $_.PSObject.TypeNames[0]}
+    $rawWindows | Format-List *
 
     $winResults = @(
     foreach ($r in $rawWindows)
