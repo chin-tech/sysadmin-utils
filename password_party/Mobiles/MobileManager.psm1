@@ -2462,50 +2462,14 @@ function Start-MobileDeployment
         [string]$nfsHome   = $Script:Config.NfsHome
     )
 
-    $cfg = Get-MobileConfig $Config
+    # $cfg = Get-MobileConfig $Config
     Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
     $mobileData = Get-MobileData -MobileName $MobileName 
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
-    $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
+    $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
     $disJoin = $false
+    Write-Host "---Deployment Started---"
 
-    # $scriptBlock = {
-    #     param($allusers, $taskData, $groupDict,$mobileName, $disJoin)
-    #
-    #     foreach ($u in $allUsers)
-    #     {
-    #         $uParams = @{Name = $u.Name; FullName =$u.FullName; Password = $u.Password; Description = $u.Description}
-    #         New-LocalUser @uParams -ErrorAction SilentlyContinue
-    #
-    #         if ($u.MustChangePassword)
-    #         {
-    #             $a = [ADSI]"WinNT://./$($u.Name),user"
-    #             $a.PasswordExpired = 1
-    #             $a.SetInfo()
-    #         }
-    #
-    #         foreach ($g in $u.WindowsGroups)
-    #         {
-    #             Add-LocalGroupMember -Group $g -Member $u.Name -ErrorAction SilentlyContinue
-    #         }
-    #
-    #     }
-    #
-    #     foreach ($t in $taskData)
-    #     {
-    #         Register-ScheduledTask -TaskName $t.TaskName -xml $t.TaskXML -User System -Force | Out-Null
-    #     }
-    #
-    #     if ($disJoin)
-    #     {
-    #         Remove-Computer -Force -Restart -WorkGroupName "$mobileName" -ErrorAction SilentlyContinue
-    #     }
-    #
-    #     return [PSCustomObject]@{
-    #         Success = $true
-    #     }
-    #
-    # }
     $winErrors = [System.Collections.Generic.List[object]]::new()
     $winResults = Invoke-Command -ComputerName $mobileData.Windows -ScriptBlock $Script:WindowsDeployBlock -ArgumentList $mobileData.AllUsers,$taskData,$mobileName,$disJoin -ErrorVariable winErrors -ErrorAction SilentlyContinue
     $winResults = foreach ($r in $winResults)
@@ -2518,6 +2482,8 @@ function Start-MobileDeployment
             Failures = @()
         }
     }
+
+    Write-Host "[+] Windows Finished"
 
     foreach ($computer in $mobileData.Windows)
     {
@@ -2563,6 +2529,7 @@ function Start-MobileDeployment
     $linResults = @()
     if ($mobileData.Linux.Count -gt 0)
     {
+        Write-Host "[-] Starting Linux Deployment"
         $linuxDeploy = Get-LinuxDeployScript -allUsers $mobileData.AllUsers
         $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $sshKeyPath
     
