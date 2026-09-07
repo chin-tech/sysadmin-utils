@@ -1083,11 +1083,12 @@ function New-TaskXML
             {
                 # Specific user or $null / empty string for all users
                 $trigger.UserID  = Get-ValOrFallBack $cfg "UserId" $null
-                $triger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
+                $trigger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
             }
             ([TaskTriggerType]::Boot)
             {
-                $triger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
+                $trigger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
+                $trigger.EndBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddMinutes(30).ToString('s')
             }
             ([TaskTriggerType]::Daily)
             {
@@ -1106,7 +1107,6 @@ function New-TaskXML
             {
                 ## StartBoundary set earlier
                 $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
-                continue
             }
             ([TaskTriggerType]::Registration)
             {
@@ -1115,6 +1115,7 @@ function New-TaskXML
             }
         }
     }
+    
 
     # 5. Action Configuration (0 = ExecAction)
     $action = $taskDef.Actions.Create(0)
