@@ -1682,7 +1682,7 @@ function Get-MobileData
         
         [Parameter(ParameterSetName = 'ExplicitPaths')]
         [ValidateNotNullOrEmpty()]
-        [string]$defaultUserpath = $Script:Config.defaultUsers,
+        [string]$defaultUserpath = $Script:Config.mobileDefaultUsers,
         [Parameter(ParameterSetName = 'ExplicitPaths')]
         [ValidateNotNullOrEmpty()]
         [string]$mobileEntriesPath = $Script:Config.MobileEntries,
