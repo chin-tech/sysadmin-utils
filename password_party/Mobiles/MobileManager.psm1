@@ -147,6 +147,8 @@ $script:WindowsDeployBlock = {
         Write-Host "--- NO USERS ----"
         $failures.Add("No users")
     }
+
+    Write-Host "USERS ---"
     if ($payload.TaskData.Count -eq 0) {
         Write-Host " -- NO TASKS --"
     }
