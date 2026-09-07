@@ -148,7 +148,6 @@ $script:WindowsDeployBlock = {
         $failures.Add("No users")
     }
 
-    Write-Host "USERS ---"
     if ($payload.TaskData.Count -eq 0) {
         Write-Host " -- NO TASKS --"
     }
@@ -171,6 +170,7 @@ $script:WindowsDeployBlock = {
 
             try
             {
+                Write-Host "Adding user $($u.Name)"
                 $null = New-LocalUser @uParams -ErrorAction Stop
                 $createdUsers.Add($u.Name)
 
