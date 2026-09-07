@@ -2462,7 +2462,7 @@ function Start-MobileDeployment
     )
 
     $cfg = Get-MobileConfig $Config
-    Initialize-Functionality -sshKeyName $sshKeyName -nfsHome $nfsHome -adminRoot $adminRoot -sshKeyPath -certName $certName
+    Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot -sshKeyPath -certName $certName
     $mobileData = Get-MobileData -MobileName $MobileName 
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
