@@ -134,7 +134,7 @@ $script:GroupMetadata = @{
 
 
 $script:WindowsDeployBlock = {
-    param($allUsers, $taskData, $mobileName, $disJoin)
+    param($payload)
 
     $actions = [System.Collections.Generic.List[object]]::new()
     $failures = [System.Collections.Generic.List[object]]::new()
@@ -144,7 +144,7 @@ $script:WindowsDeployBlock = {
     $existingUsers = [System.Collections.Generic.List[string]]::new()
     $registeredTasks = [System.Collections.Generic.List[string]]::new()
 
-    foreach ($u in $allUsers)
+    foreach ($u in $payload.allUsers)
     {
         $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
 
@@ -223,7 +223,7 @@ $script:WindowsDeployBlock = {
     }
 
 
-    foreach ($t in $taskData)
+    foreach ($t in $payload.TaskData)
     {
         try
         {
@@ -252,7 +252,7 @@ $script:WindowsDeployBlock = {
             })
     }
 
-    if ($disJoin)
+    if ($payload.DisJoin)
     {
         try
         {
@@ -260,7 +260,7 @@ $script:WindowsDeployBlock = {
             Remove-Computer `
                 -Force `
                 -Restart `
-                -WorkGroupName $mobileName
+                -WorkGroupName $payload.Mobilename
 
             $actions.Add([PSCustomObject]@{
                     Name    = 'Domain'
@@ -2470,11 +2470,19 @@ function Start-MobileDeployment
     $disJoin = $false
     Write-Host "---Deployment Started---"
 
+    $windowsPayload = [PsCustomObject]@{
+        allUsers = @($mobileData.AllUsers)
+        taskData = @($taskData)
+        MobileName = $MobileName
+        Disjoin = $disJoin
+
+    }
+
     $winErrors = [System.Collections.Generic.List[object]]::new()
     $rawWindows = Invoke-Command `
     -ComputerName $mobileData.Windows `
     -ScriptBlock $Script:WindowsDeployBlock `
-    -ArgumentList $mobileData.AllUsers, $taskData, $mobileName, $disJoin `
+    -ArgumentList $windowsPayload `
     -ErrorVariable winErrors `
     -ErrorAction SilentlyContinue
 
