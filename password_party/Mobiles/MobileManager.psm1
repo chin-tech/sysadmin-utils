@@ -1196,7 +1196,6 @@ function Initialize-Functionality
     [CmdletBinding()]
     param(
         [Parameter()]
-        [string]$sshKeyName = $script:Config.SshKeyName,
         [string]$sshKeyPath = $script:Config.SSHKeyPath,
         [string]$nfsHome = $script:Config.nfsHome,
         [string]$adminRoot = $script:Config.AdminRoot,
@@ -1736,6 +1735,8 @@ function Get-MobileData
     if (-not $userPathExists -or -not $mobileEntriesExist)
     {
         Write-Error "[!] Ensure proper directory setup"
+        Write-Error "--- ${defaultUserPath}:${userPathExists}"
+        Write-Error "--- ${mobileEntriesPath}:${mobileEntriesExist}"
         exit 1
     }
 
@@ -1941,15 +1942,15 @@ function Format-HostCollector
 
         # Column definitions: header text + the property/logic used to derive each row's value
         $columns = @(
-            @{ Header = 'HOST';    Getter = { param($r) $r.HostName } }
+            @{ Header = 'HOST';    Getter = { param($r) $r.HostName.ToUpper() } }
             @{ Header = 'OS';      Getter = { param($r) $r.Platform } }
             @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
-            @{ Header = 'CPU';     Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.Cores) { $r.Summary.Cores } else { '-' } } }
             @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
             @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
             @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
             @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion) { $r.Summary.AdminRotateVersion } else { '-' } } }
             @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount) { $r.Summary.PackageCount } else { '-' } } }
+            # @{ Header = 'CPU';     Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.Cores) { $r.Summary.Cores } else { '-' } } }
         )
 
         $sorted = $results | Sort-Object Platform, HostName
