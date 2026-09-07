@@ -1616,7 +1616,7 @@ done
     foreach ($u in $linuxUsers)
     {
         $isWheel = $u.LinuxAccountType -eq [GroupType]::Wheel
-        Write-Host "$($u.LinuxName) -- Wheel:$($isWheel)"
+        Write-Host "$($u.Name) - $($u.LinuxName) -- Wheel:$($isWheel)"
         $wheelArg = if ($isWheel)
         { '-G wheel' 
         } else
