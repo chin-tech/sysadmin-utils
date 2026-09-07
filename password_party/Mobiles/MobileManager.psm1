@@ -1051,7 +1051,11 @@ function New-TaskXML
     $taskDef.Settings.DisallowStartIfOnBatteries = $false
     $taskDef.Settings.StopIfGoingOnBatteries = $false
     $taskDef.Settings.ExecutionTimeLimit = $ExecutionTimeLimit
-    $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
+    $hasEndBoundary = $TriggerConfigs | Where-Object { $_.ContainsKey("EndBoundary") }
+    if ($hasEndBoundary)
+    {
+        $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
+    }
 
     # 3. Principal Configuration
     $taskDef.Principal.UserId = $UserId
@@ -1089,6 +1093,7 @@ function New-TaskXML
             {
                 $trigger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
                 $trigger.EndBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddMinutes(30).ToString('s')
+                $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
             }
             ([TaskTriggerType]::Daily)
             {
@@ -1112,6 +1117,7 @@ function New-TaskXML
             {
                 $trigger.Delay = Get-ValOrFallBack $cfg 'Delay' 'PT0S'
                 $trigger.EndBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddSeconds(15).ToString('s')
+                $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
             }
         }
     }
