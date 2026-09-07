@@ -162,7 +162,7 @@ $script:WindowsDeployBlock = {
 
             try
             {
-                New-LocalUser @uParams -ErrorAction Stop
+                $null = New-LocalUser @uParams -ErrorAction Stop
                 $createdUsers.Add($u.Name)
 
             } catch
@@ -177,7 +177,7 @@ $script:WindowsDeployBlock = {
             {
                 $a = [ADSI]"WinNT://./$($u.Name),user"
                 $a.PasswordExpired = 1
-                $a.SetInfo()
+                $null = $a.SetInfo()
             } catch
             {
                 $failures.Add(
@@ -190,7 +190,7 @@ $script:WindowsDeployBlock = {
         {
             try
             {
-                Add-LocalGroupMember `
+                $null =Add-LocalGroupMember `
                     -Group $g `
                     -Member $u.Name `
                     -ErrorAction Stop
@@ -2478,6 +2478,8 @@ function Start-MobileDeployment
     -ErrorVariable winErrors `
     -ErrorAction SilentlyContinue
 
+    $rawWindows | ForEach-Object { $_.PSObject.TypeNames[0]}
+
     $winResults = @(
     foreach ($r in $rawWindows)
     {
@@ -2576,18 +2578,6 @@ function Start-MobileDeployment
 
 
     }
-Write-Host "`n--- RAW LINUX RESULTS ---" -ForegroundColor Magenta
-
-foreach ($r in $linRes)
-{
-    Write-Host "Target:   [$($r.Target)]"
-    Write-Host "ExitCode: [$($r.ExitCode)]"
-    Write-Host "STDOUT:"
-    Write-Host $r.StdOut
-    Write-Host "STDERR:"
-    Write-Host $r.StdErr
-    Write-Host "-------------------------"
-}
     $results = @($winResults) + @($linResults)
     Format-DeploymentResults -results $results
 }
