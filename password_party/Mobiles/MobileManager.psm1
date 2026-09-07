@@ -1920,12 +1920,10 @@ function Format-HostCollector
         [Parameter(Mandatory, ValueFromPipeline)]
         [object[]]$InputObject
     )
-
     begin
     {
         $results = [System.Collections.Generic.List[object]]::new()
     }
-
     process
     {
         foreach ($item in $InputObject)
@@ -1933,7 +1931,6 @@ function Format-HostCollector
             $results.Add($item)
         }
     }
-
     end
     {
         if ($results.Count -eq 0)
@@ -1942,111 +1939,56 @@ function Format-HostCollector
             return
         }
 
-        $fmt = "  {0,-12} {1,-7} {2,-27} {3,3} {4,5} {5,-8} {6,-11} {7,-10} {8,-10}"
+        # Column definitions: header text + the property/logic used to derive each row's value
+        $columns = @(
+            @{ Header = 'HOST';    Getter = { param($r) $r.HostName } }
+            @{ Header = 'OS';      Getter = { param($r) $r.Platform } }
+            @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
+            @{ Header = 'CPU';     Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.Cores) { $r.Summary.Cores } else { '-' } } }
+            @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount) { $r.Summary.PackageCount } else { '-' } } }
+            @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion) { $r.Summary.AdminRotateVersion } else { '-' } } }
+            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
+            @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
+            @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
+        )
 
-        Write-Host (
-            $fmt -f
-            'HOST',
-            'OS',
-            'KERNEL',
-            'CPU',
-            'PKGS',
-            'LAPS',
-            'AV DEFS',
-            'IVANTI',
-            'LICENSE'
-        ) -ForegroundColor DarkGray
+        $sorted = $results | Sort-Object Platform, HostName
 
-        foreach ($r in ($results | Sort-Object Platform, HostName))
+        # Pre-compute every cell value once, then derive each column's width from
+        # the longest of: its header, or any value that will appear under it.
+        $rows = foreach ($r in $sorted)
         {
+            [PSCustomObject]@{
+                Result = $r
+                Cells  = $columns | ForEach-Object { & $_.Getter $r }
+            }
+        }
+
+        $widths = for ($i = 0; $i -lt $columns.Count; $i++)
+        {
+            $maxCellLen = ($rows.Cells | ForEach-Object { "$($_[$i])".Length } | Measure-Object -Maximum).Maximum
+            [Math]::Max($columns[$i].Header.Length, $maxCellLen)
+        }
+
+        # Build the format string dynamically: "  {0,-W0} {1,-W1} ... {N,-Wn}"
+        $fmt = "  " + (
+            (0..($columns.Count - 1) | ForEach-Object { "{$($_),-$($widths[$_])}" }) -join ' '
+        )
+
+        Write-Host ($fmt -f $columns.Header) -ForegroundColor DarkGray
+
+        foreach ($row in $rows)
+        {
+            $r = $row.Result
             if ($r.Success)
             {
-                $summary = $r.Summary
-
-                $kernel = if ($summary.Kernel)
-                {
-                    $summary.Kernel
-                } else
-                {
-                    'N/A'
-                }
-
-                $cores = if ($null -ne $summary.Cores)
-                {
-                    $summary.Cores
-                } else
-                {
-                    '-'
-                }
-
-                $packages = if ($null -ne $summary.PackageCount)
-                {
-                    $summary.PackageCount
-                } else
-                {
-                    '-'
-                }
-
-                $laps = if ($summary.AdminRotateVersion)
-                {
-                    $summary.AdminRotateVersion
-                } else
-                {
-                    '-'
-                }
-
-                $av = if ($summary.AVDefs)
-                {
-                    $summary.AVDefs
-                } else
-                {
-                    '-'
-                }
-
-                $ivanti = if ($summary.IvantiVersion)
-                {
-                    $summary.IvantiVersion
-                } else
-                {
-                    '-'
-                }
-                $license = if( $summary.License)
-                {
-                    $summary.License
-                } else
-                {
-                    '-'
-
-                }
-
-                Write-Host (
-                    $fmt -f
-                    $r.HostName,
-                    $r.Platform,
-                    $kernel,
-                    $cores,
-                    $packages,
-                    $laps,
-                    $av,
-                    $ivanti,
-                    $license
-                ) 
-
-            } else
+                Write-Host ($fmt -f $row.Cells)
+            }
+            else
             {
-                Write-Host (
-                    $fmt -f
-                    $r.HostName,
-                    $r.Platform,
-                    '-',
-                    '-',
-                    '-',
-                    '-',
-                    '-',
-                    '-',
-                    ''
-                ) -NoNewline
-
+                $failCells = $row.Cells.Clone()
+                $failCells[-1] = ''   # blank the last column so FAILED can be appended after
+                Write-Host ($fmt -f $failCells) -NoNewline
                 Write-Host 'FAILED' -ForegroundColor Red
             }
         }
@@ -2054,25 +1996,17 @@ function Format-HostCollector
         #
         # Failures beneath table
         #
-        $failed = @(
-            $results |
-                Where-Object { -not $_.Success }
-        )
-
+        $failed = @($results | Where-Object { -not $_.Success })
         if ($failed.Count)
         {
             Write-Host ""
             Write-Host "  Failures:" -ForegroundColor DarkRed
-
+            $hostWidth = ($failed.HostName | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
             foreach ($r in $failed)
             {
                 foreach ($failure in @($r.Failures))
                 {
-                    Write-Host (
-                        "    {0,-16} {1}" -f
-                        $r.HostName,
-                        $failure
-                    ) -ForegroundColor Red
+                    Write-Host ("    {0,-$hostWidth} {1}" -f $r.HostName, $failure) -ForegroundColor Red
                 }
             }
         }
@@ -2821,10 +2755,10 @@ jq -n \
                 "$($map[$buildNumber])-$buildNumber"
             } else
             {
-                "WINUNKNOWN-$buildNumber"
+                "WIN-UNK-$buildNumber"
             }
         }
-        $osString = "$(Get-WinVersion $osInfo.currentBuildNumber)"
+        $osString = "$(Get-WinVersion [int]$osInfo.currentBuildNumber)"
 
         $cores = (
             Get-CimInstance Win32_Processor |
