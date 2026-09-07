@@ -137,12 +137,19 @@ $script:WindowsDeployBlock = {
     param($payload)
 
     $actions = [System.Collections.Generic.List[object]]::new()
-    $failures = [System.Collections.Generic.List[object]]::new()
+    $failures = [System.Collections.Generic.List[string]]::new()
     
 
     $createdUsers = [System.Collections.Generic.List[string]]::new()
     $existingUsers = [System.Collections.Generic.List[string]]::new()
     $registeredTasks = [System.Collections.Generic.List[string]]::new()
+    if ($payload.AllUsers.count -eq 0) {
+        Write-Host "--- NO USERS ----"
+        $failures.Add("No users")
+    }
+    if ($payload.TaskData.Count -eq 0) {
+        Write-Host " -- NO TASKS --"
+    }
 
     foreach ($u in $payload.allUsers)
     {
