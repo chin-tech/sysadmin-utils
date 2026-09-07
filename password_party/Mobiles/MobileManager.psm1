@@ -2824,7 +2824,7 @@ jq -n \
                 "WINUNKNOWN-$buildNumber"
             }
         }
-        $osString = "$(Get-WinVersion $osInfo.buildNumber)"
+        $osString = "$(Get-WinVersion $osInfo.currentBuildNumber)"
 
         $cores = (
             Get-CimInstance Win32_Processor |
