@@ -1196,7 +1196,7 @@ function Initialize-Functionality
     [CmdletBinding()]
     param(
         [Parameter()]
-        [string]$sshKeyPath = $script:Config.SSHKeyPath,
+        [string]$sshKeyPath = $script:Config.SshKeyPath,
         [string]$nfsHome = $script:Config.nfsHome,
         [string]$adminRoot = $script:Config.AdminRoot,
         [string]$certName = $script:Config.certName
@@ -1401,7 +1401,7 @@ function Get-LinuxDeployScript
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
-        [array]$allUsers
+        [array]$allUsers,
     )
 
     $scriptArray = [System.Collections.Generic.List[string]]::new()
@@ -2463,7 +2463,7 @@ function Start-MobileDeployment
     )
 
     $cfg = Get-MobileConfig $Config
-    Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot -sshKeyPath -certName $certName
+    Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
     $mobileData = Get-MobileData -MobileName $MobileName 
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
@@ -2563,7 +2563,7 @@ function Start-MobileDeployment
     $linResults = @()
     if ($mobileData.Linux.Count -gt 0)
     {
-        $linuxDeploy = Get-LinuxDeployScript -oldEncryption $oldEncryption -encryptionPin $defaultPin -nfsHome $nfsHome -allUsers $mobileData.AllUsers
+        $linuxDeploy = Get-LinuxDeployScript -allUsers $mobileData.AllUsers
         $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $key
     
         $linResults = foreach ($r in $linRes)
