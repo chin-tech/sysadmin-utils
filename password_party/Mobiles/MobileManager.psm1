@@ -314,7 +314,7 @@ $script:WindowsDeployBlock = {
             foreach ($ignored in $IgnoreExceptions) {
                 if ($_.Exception -is $ignored) { return $false }
             }
-            $failures.Add("$Context: $($_.Exception.Message)")
+            $failures.Add("${Context}: $($_.Exception.Message)")
             return $false
         }
     }
