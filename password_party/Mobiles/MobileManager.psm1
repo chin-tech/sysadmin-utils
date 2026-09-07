@@ -1401,7 +1401,7 @@ function Get-LinuxDeployScript
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
-        [array]$allUsers,
+        [array]$allUsers
     )
 
     $scriptArray = [System.Collections.Generic.List[string]]::new()
