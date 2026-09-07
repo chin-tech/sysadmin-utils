@@ -1735,8 +1735,8 @@ function Get-MobileData
     if (-not $userPathExists -or -not $mobileEntriesExist)
     {
         Write-Error "[!] Ensure proper directory setup"
-        Write-Error "--- ${defaultUserPath}:${userPathExists}"
-        Write-Error "--- ${mobileEntriesPath}:${mobileEntriesExist}"
+        Write-Warning "--- ${defaultUserPath}:${userPathExists}"
+        Write-Warning "--- ${mobileEntriesPath}:${mobileEntriesExist}"
         exit 1
     }
 
@@ -2458,7 +2458,8 @@ function Start-MobileDeployment
         [string]$defaultPass = $Script:Config.defaultPass, 
         [string]$defaultPin = $Script:Config.defaultPin,
         [string]$oldEncryption = $Script:Config.curLuks,
-        [string]$mobileDump = $Script:Config.mobileDump
+        [string]$mobileDump = $Script:Config.mobileDump,
+        [string]$nfsHome   = $Script:Config.NfsHome
     )
 
     $cfg = Get-MobileConfig $Config
