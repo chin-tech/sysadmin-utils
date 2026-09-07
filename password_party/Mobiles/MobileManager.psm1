@@ -1966,7 +1966,7 @@ function Format-HostCollector
 
         $widths = for ($i = 0; $i -lt $columns.Count; $i++)
         {
-            $maxCellLen = ($rows.Cells | ForEach-Object { "$($_[$i])".Length } | Measure-Object -Maximum).Maximum
+            $maxCellLen = ($rows | ForEach-Object { "$($_.Cells[$i])".Length } | Measure-Object -Maximum).Maximum
             [Math]::Max($columns[$i].Header.Length, $maxCellLen)
         }
 
@@ -2758,7 +2758,7 @@ jq -n \
                 "WIN-UNK-$buildNumber"
             }
         }
-        $osString = "$(Get-WinVersion [int]$osInfo.currentBuildNumber)"
+        $osString = "$(Get-WinVersion ([int]$osInfo.currentBuildNumber))"
 
         $cores = (
             Get-CimInstance Win32_Processor |
