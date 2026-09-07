@@ -1615,7 +1615,7 @@ done
     # --- User Provisioning Loop ---
     foreach ($u in $linuxUsers)
     {
-        $isWheel = $u.LinuxAccountType -eq [GroupType]::Wheel
+        $isWheel = $u.LinuxAccountType -eq [LinuxAccountType]::Wheel
         Write-Host "$($u.Name) - $($u.LinuxName) -- Wheel:$($isWheel)"
         $wheelArg = if ($isWheel)
         { '-G wheel' 
@@ -1643,6 +1643,7 @@ fi
 
         if ($u.MustChangePassword)
         {
+            Write-Host "$($u.Name) - $($u.LinuxName) MustChangePassword:$($u.MustChangePassword)"
             $scriptArray.Add(@"
 if dzdo chage -d 0 '$($u.LinuxName)' &>/dev/null; then
     expired_users+=('$($u.LinuxName)')
