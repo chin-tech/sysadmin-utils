@@ -345,13 +345,13 @@ $script:WindowsDeployBlock = {
         if ($tpm.IsPresent -and $tpm.IsEnabled) {
             $bitLockerParams.TpmAndPinProtector = $true
             $bitLockerParams.Pin = ConvertTo-SecureString `
-                -String $payload.BitlockerPass `
+                -String $payload.Bitlocker `
                 -AsPlainText `
                 -Force
         } else {
             $bitLockerParams.PasswordProtector = $true
             $bitLockerParams.Password = ConvertTo-SecureString `
-                -String $payload.BitlockerPass `
+                -String $payload.Bitlocker `
                 -AsPlainText `
                 -Force
         }
