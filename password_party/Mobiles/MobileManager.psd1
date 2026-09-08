@@ -43,8 +43,8 @@
                 sshKeyName     = 'deployer'
                 certName       = 'deployer'
                 fallbackPass    = 'defaultPass123!@#'
-                curLuks         = 'defaultLuks'
-                encryptionPin     = 'defaultPin'
+                curLuks         = 'defaultLuks123!@#'
+                encryptionPin     = 'defaultPin123!@#'
                 adminRoot = "C:\TEMP"
                 nfsHomeRoot   = "C:\TEMP\"
 
