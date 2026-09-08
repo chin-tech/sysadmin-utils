@@ -2411,7 +2411,9 @@ function Format-DeploymentResults {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [array]$Results
+        [array]$Results,
+        [array]$allUsers
+
     )
 
     if (-not $Results) {
@@ -2507,79 +2509,93 @@ function Format-DeploymentResults {
     # USER MATRIX
     #
     Write-Host ""
-    Write-Host "[USER ACCOUNTS]" -ForegroundColor Cyan
-
-    $hostWidth = [Math]::Max(
-        10,
-        ($hosts | ForEach-Object Length | Measure-Object -Maximum).Maximum
-    )
-
-    $userWidth = 22
-
-    Write-Host ("{0,-$hostWidth}" -f 'HOST') -NoNewline -ForegroundColor DarkGray
-
-    foreach ($user in $canonicalUsers) {
-        Write-Host (" {0,-$userWidth}" -f $user) -NoNewline -ForegroundColor DarkGray
-    }
-
-    Write-Host ""
+    Write-Host "[USERS]" -ForegroundColor Cyan
 
     foreach ($host in $hosts) {
         $result = $hostMap[$host]
 
-        Write-Host ("{0,-$hostWidth}" -f $host) -NoNewline
+        Write-Host ""
+        Write-Host $host -ForegroundColor Cyan
 
-        foreach ($canonicalUser in $canonicalUsers) {
+        $baseNames = @(
+            $AllUsers.BaseName |
+                Sort-Object -Unique
+        )
 
-            $baseName = ($canonicalUser -split '\.')[0]
+        foreach ($baseName in $baseNames) {
+
+            $userDefs = @(
+                $AllUsers |
+                    Where-Object BaseName -eq $baseName
+            )
 
             #
-            # All account variants for this logical user.
+            # Metadata-backed roles
             #
-            $userActions = @(
+            $roles = @(
+                $userDefs |
+                    Select-Object -ExpandProperty GroupType -Unique |
+                    ForEach-Object {
+                        $_.ToString()
+                    }
+            )
+
+            #
+            # Deployment actions for this user
+            #
+            $accountActions = @(
                 $result.Actions |
                     Where-Object {
                         $_.Category -eq 'User' -and
-                        ($_.Name -split '\.')[0] -eq $baseName
+                        $_.Name -in $userDefs.Name
                     }
             )
 
-            $expiryActions = @(
-                $result.Actions |
-                    Where-Object {
-                        $_.Category -eq 'PasswordExpiry' -and
-                        ($_.Name -split '\.')[0] -eq $baseName
-                    }
-            )
-
-            if (-not $userActions) {
-                $status = '-'
-            } elseif ($userActions.Status -contains 'Failed') {
-                $status = 'Failed'
-            } elseif ($userActions.Status -contains 'Created') {
-                $status = 'Created'
+            #
+            # Account state
+            #
+            $accountStatus = if ($accountActions.Status -contains 'Failed') {
+                'Failed'
+            } elseif ($accountActions.Status -contains 'Created') {
+                'Created'
+            } elseif ($accountActions.Status -contains 'Existing') {
+                'Existing'
             } else {
-                $status = 'Existing'
+                '-'
             }
 
             #
-            # Password expiry is a modifier, not its own task.
+            # Password state comes from canonical user data too
             #
-            if (
-                $status -notin @('Failed', '-') -and
-                $expiryActions.Status -contains 'Success'
-            ) {
-                $status += ' / Change'
+            $mustChange = $userDefs.MustChangePassword -contains $true
+
+            $passwordStatus = if ($mustChange) {
+                'DefaultPass'
+            } else {
+                'UserSet'
             }
 
-            $color = Get-StatusColor $status
+            $roleText = $roles -join ', '
 
-            Write-Host (" {0,-$userWidth}" -f $status) `
-                -NoNewline `
-                -ForegroundColor $color
+            $color = switch ($accountStatus) {
+                'Failed'   { 'Red' 
+                }
+                'Created'  { 'Yellow' 
+                }
+                'Existing' { 'Green' 
+                }
+                default    { 'Gray' 
+                }
+            }
+
+            Write-Host (
+                "  {0,-12}: {1,-24} - {2,-9} - {3}" -f
+                $baseName,
+                $roleText,
+                $accountStatus,
+                $passwordStatus
+            ) -ForegroundColor $color
         }
-
-        Write-Host ""
     }
 
     #
@@ -2814,7 +2830,7 @@ function Start-MobileDeployment {
 
     }
     $results = @($winResults) + @($linResults)
-    Format-DeploymentResults -results $results
+    Format-DeploymentResults -results $results -allUsers $mobileData.AllUsers
 }
 
 
