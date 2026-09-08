@@ -2795,7 +2795,7 @@ function Start-MobileDeployment {
         [string]$certName = $Script:Config.certName,
         [string]$adminRoot = $Script:Config.adminRoot,
         [string]$defaultPass = $Script:Config.defaultPass, 
-        [string]$defaultPin = $Script:Config.defaultPin,
+        [string]$defaultPin = $Script:Config.encryptionPin,
         [string]$oldEncryption = $Script:Config.curLuks,
         [string]$mobileDump = $Script:Config.mobileDump,
         [string]$nfsHome   = $Script:Config.NfsHome
