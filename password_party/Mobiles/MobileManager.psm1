@@ -1471,7 +1471,7 @@ fi
 # Locate LUKS devices
 #
 mapfile -t luks_devices < <(
-    lsblk -rno PATH,FSTYPE 2>/dev/null |
+    lsblk -rno NAME,FSTYPE 2>/dev/null |
         awk '$2 == "crypto_LUKS" {print $1}'
 )
 
