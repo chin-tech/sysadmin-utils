@@ -1482,13 +1482,7 @@ for dev in "${luks_devices[@]}"; do
     # LUKS credentials
     #
     $scriptArray.Add(@"
-    if printf "%s\n%s\n" `
-        "$($script:Config.curLuks)" `
-        "$($script:Config.encryptionPin)" |
-        dzdo cryptsetup luksAddKey `
-            --force `
-            --batch-mode `
-            "`$dev" &>/dev/null
+    if printf "%s\n%s\n"  "$($script:Config.curLuks)"  "$($script:Config.encryptionPin)" | dzdo cryptsetup luksAddKey  --force  --batch-mode  "$dev" &>/dev/null
     then
         luks_updated+=("`$dev")
     else
@@ -1522,9 +1516,7 @@ done
 #
 if id '$($u.LinuxName)' &>/dev/null; then
 
-    if dzdo usermod `
-        -p '$($u.LinuxPassword)' `
-        '$($u.LinuxName)' &>/dev/null
+    if dzdo usermod  -p '$($u.LinuxPassword)'  '$($u.LinuxName)' &>/dev/null
     then
         existing_users+=('$($u.LinuxName)')
     else
@@ -1534,12 +1526,7 @@ if id '$($u.LinuxName)' &>/dev/null; then
 
 else
 
-    if dzdo useradd `
-        -m `
-        -b "`$mHome" `
-        -c '$($u.Description)' `
-        -p '$($u.LinuxPassword)' `
-        '$($u.LinuxName)' &>/dev/null
+    if dzdo useradd  -m  -b "$mHome"  -c '$($u.Description)'  -p '$($u.LinuxPassword)'  '$($u.LinuxName)' &>/dev/null
     then
         created_users+=('$($u.LinuxName)')
     else
