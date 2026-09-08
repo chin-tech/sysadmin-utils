@@ -129,6 +129,7 @@ class WindowsPayload {
     [bool]   $Archive
     [PSObject[]] $AllUsers
     [PSObject[]] $TaskData
+    [string] $Bitlocker
 
 
     # WindowsPayload([string]mobileName, [PSObject[]]$users, [PsObject[]]$tasks) {
@@ -2796,12 +2797,12 @@ function Start-MobileDeployment {
     $disJoin = $false
     Write-Host "---Deployment Started---"
 
-    $windowsPayload = [PsCustomObject]@{
+    $windowsPayload = [WindowsPayload]@{
         allUsers = @($mobileData.AllUsers)
         taskData = @($taskData)
         MobileName = $MobileName
         Disjoin = $disJoin
-        Bitlocker = $oldEncryption
+        Bitlocker = $defaultPin
 
     }
 
@@ -4009,6 +4010,7 @@ function Unregister-Deployment {
             TaskData = $taskData
             Archive =  $archive
             AllUsers = $mobileData.AllUsers
+            Bitlocker = $oldEncryption
         }
 
         $rawWindows = Invoke-Command `
