@@ -141,7 +141,7 @@ class WindowsPayload {
 
 
 $script:WindowsDeployBlock = {
-    param([WindowsPayload]$payload)
+    param([PsCustomObject]$payload)
 
     $actions  = [System.Collections.Generic.List[object]]::new()
     $failures = [System.Collections.Generic.List[string]]::new()
@@ -402,7 +402,7 @@ $script:WindowsDeployBlock = {
 
 
 $script:WindowsUnregisterBlock = {
-    param([WindowsPayload]$payload)
+    param([PsCustomObject]$payload)
 
     $timeStamp   = (Get-Date).ToString('yyyyMMdd')
     $monthYear   = (Get-Date).ToString('MM-yyyy')
