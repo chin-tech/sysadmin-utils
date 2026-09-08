@@ -2805,6 +2805,7 @@ function Start-MobileDeployment {
         Bitlocker = $defaultPin
 
     }
+    Write-Host $windowsPayload
 
     $winErrors = [System.Collections.Generic.List[object]]::new()
     $rawWindows = Invoke-Command `
