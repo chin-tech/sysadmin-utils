@@ -2414,7 +2414,7 @@ function Format-DeploymentResults {
         [array]$Results
     )
 
-    if (-not $Results -or $Results.Count -eq 0) {
+    if (-not $Results) {
         Write-Host "No deployment results returned." -ForegroundColor Yellow
         return
     }
@@ -2426,343 +2426,251 @@ function Format-DeploymentResults {
             return '-'
         }
 
-        return ($Name -split '\.')[0]
+        ($Name -split '\.')[0]
     }
 
-    function Get-CellStatus {
+    function Get-StatusColor {
+        param([string]$Status)
+
+        switch -Regex ($Status) {
+            'Failed'   { 'Red' 
+            }
+            'Created'  { 'Yellow' 
+            }
+            'Existing' { 'Green' 
+            }
+            'Success'  { 'Green' 
+            }
+            'Change'   { 'Yellow' 
+            }
+            'N/A'      { 'DarkGray' 
+            }
+            '^-$'      { 'DarkGray' 
+            }
+            default    { 'Gray' 
+            }
+        }
+    }
+
+    function Get-AggregateStatus {
         param(
             [Parameter(Mandatory)]
             $Result,
 
             [Parameter(Mandatory)]
-            [string]$Category,
-
-            [Parameter(Mandatory)]
-            [string]$Name,
-
-            [switch]$NotApplicable
+            [string]$Category
         )
 
-        if ($NotApplicable) {
-            return 'N/A'
-        }
-
-        $action = @(
+        $actions = @(
             $Result.Actions |
-                Where-Object {
-                    $_.Category -eq $Category -and
-                    $_.Name -eq $Name
-                }
-            ) | Select-Object -First 1
+                Where-Object Category -eq $Category
+        )
 
-            if ($action) {
-                return $action.Status
-            }
-
-            if (-not $Result.Success) {
-                return 'Failed'
-            }
-
+        if (-not $actions) {
             return '-'
         }
 
-        function Write-Matrix {
-            param(
-                [Parameter(Mandatory)]
-                [string]$Title,
-
-                [Parameter(Mandatory)]
-                [array]$Rows,
-
-                [Parameter(Mandatory)]
-                [array]$Columns,
-
-                [Parameter(Mandatory)]
-                [scriptblock]$GetValue
-            )
-
-            if ($Rows.Count -eq 0 -or $Columns.Count -eq 0) {
-                return
-            }
-
-            Write-Host ""
-            Write-Host "[$Title]" -ForegroundColor Cyan
-
-            $rowNameWidth = [Math]::Max(
-                10,
-                ($Rows | ForEach-Object { $_.Length } |
-                    Measure-Object -Maximum).Maximum
-        )
-
-        $columnWidths = @{}
-
-        foreach ($column in $Columns) {
-            $maxValueWidth = 0
-
-            foreach ($row in $Rows) {
-                $value = & $GetValue $row $column
-
-                if ($null -ne $value) {
-                    $maxValueWidth = [Math]::Max(
-                        $maxValueWidth,
-                        $value.ToString().Length
-                    )
-                }
-            }
-
-            $columnWidths[$column] = [Math]::Max(
-                $column.Length,
-                $maxValueWidth
-            ) + 2
+        if ($actions.Status -contains 'Failed') {
+            return 'Failed'
         }
 
-        Write-Host (
-            "{0,-$rowNameWidth}" -f 'HOST'
-        ) -NoNewline -ForegroundColor DarkGray
-
-        foreach ($column in $Columns) {
-            $width = $columnWidths[$column]
-
-            Write-Host (
-                " {0,-$width}" -f $column
-            ) -NoNewline -ForegroundColor DarkGray
-        }
-
-        Write-Host ""
-
-        foreach ($row in $Rows) {
-            Write-Host (
-                "{0,-$rowNameWidth}" -f $row
-            ) -NoNewline -ForegroundColor White
-
-            foreach ($column in $Columns) {
-                $value = & $GetValue $row $column
-                $width = $columnWidths[$column]
-
-                $color = switch ($value) {
-                    'Created'  { 'Yellow' 
-                    }
-                    'Existing' { 'Green' 
-                    }
-                    'Success'  { 'Green' 
-                    }
-                    'Failed'   { 'Red' 
-                    }
-                    'N/A'      { 'DarkGray' 
-                    }
-                    '-'        { 'DarkGray' 
-                    }
-                    default    { 'Gray' 
-                    }
-                }
-
-                Write-Host (
-                    " {0,-$width}" -f $value
-                ) -NoNewline -ForegroundColor $color
-            }
-
-            Write-Host ""
-        }
+        return 'Success'
     }
 
     #
-    # Normalize host lookup
+    # Host lookup
     #
     $hostMap = @{}
 
-    foreach ($result in $Results) {
-        $shortName = Get-ShortHostName $result.HostName
-        $hostMap[$shortName] = $result
+    foreach ($r in $Results) {
+        $host = Get-ShortHostName $r.HostName
+        $hostMap[$host] = $r
     }
 
-    $hosts = @(
-        $hostMap.Keys |
-            Sort-Object
-    )
+    $hosts = @($hostMap.Keys | Sort-Object)
 
     #
-    # Users
+    # Collapse users down to LinuxName/BaseName style.
     #
-    $users = @(
+    # Prefer .local as the canonical displayed user.
+    #
+    $canonicalUsers = @(
         $Results.Actions |
             Where-Object Category -eq 'User' |
-            Select-Object -ExpandProperty Name -Unique |
-            Sort-Object
+            ForEach-Object {
+                ($_.Name -split '\.')[0] + '.local'
+            } |
+            Sort-Object -Unique
     )
 
-    Write-Matrix `
-        -Title 'USER ACCOUNTS' `
-        -Rows $hosts `
-        -Columns $users `
-        -GetValue {
-        param($host, $user)
+    #
+    # USER MATRIX
+    #
+    Write-Host ""
+    Write-Host "[USER ACCOUNTS]" -ForegroundColor Cyan
 
+    $hostWidth = [Math]::Max(
+        10,
+        ($hosts | ForEach-Object Length | Measure-Object -Maximum).Maximum
+    )
+
+    $userWidth = 22
+
+    Write-Host ("{0,-$hostWidth}" -f 'HOST') -NoNewline -ForegroundColor DarkGray
+
+    foreach ($user in $canonicalUsers) {
+        Write-Host (" {0,-$userWidth}" -f $user) -NoNewline -ForegroundColor DarkGray
+    }
+
+    Write-Host ""
+
+    foreach ($host in $hosts) {
         $result = $hostMap[$host]
 
-        Get-CellStatus `
-            -Result $result `
-            -Category 'User' `
-            -Name $user
+        Write-Host ("{0,-$hostWidth}" -f $host) -NoNewline
+
+        foreach ($canonicalUser in $canonicalUsers) {
+
+            $baseName = ($canonicalUser -split '\.')[0]
+
+            #
+            # All account variants for this logical user.
+            #
+            $userActions = @(
+                $result.Actions |
+                    Where-Object {
+                        $_.Category -eq 'User' -and
+                        ($_.Name -split '\.')[0] -eq $baseName
+                    }
+            )
+
+            $expiryActions = @(
+                $result.Actions |
+                    Where-Object {
+                        $_.Category -eq 'PasswordExpiry' -and
+                        ($_.Name -split '\.')[0] -eq $baseName
+                    }
+            )
+
+            if (-not $userActions) {
+                $status = '-'
+            } elseif ($userActions.Status -contains 'Failed') {
+                $status = 'Failed'
+            } elseif ($userActions.Status -contains 'Created') {
+                $status = 'Created'
+            } else {
+                $status = 'Existing'
+            }
+
+            #
+            # Password expiry is a modifier, not its own task.
+            #
+            if (
+                $status -notin @('Failed', '-') -and
+                $expiryActions.Status -contains 'Success'
+            ) {
+                $status += ' / Change'
+            }
+
+            $color = Get-StatusColor $status
+
+            Write-Host (" {0,-$userWidth}" -f $status) `
+                -NoNewline `
+                -ForegroundColor $color
+        }
+
+        Write-Host ""
     }
 
     #
-    # Other deployment actions
+    # TASK MATRIX
     #
-    # Each unique Category/Name pair becomes one task column.
-    #
-    $taskDefinitions = @(
-        $Results.Actions |
-            Where-Object Category -ne 'User' |
-            ForEach-Object {
-                [PSCustomObject]@{
-                    Category = $_.Category
-                    Name     = $_.Name
-                    Key      = "$($_.Category)|$($_.Name)"
-                }
-            } |
-            Sort-Object Category, Name -Unique
-    )
+    Write-Host ""
+    Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
 
     $taskColumns = @(
-        $taskDefinitions |
-            ForEach-Object {
-                switch ($_.Category) {
-                    'Privilege' {
-                        $_.Name
-                    }
-
-                    'PasswordExpiry' {
-                        "Expire:$($_.Name)"
-                    }
-
-                    'ScheduledTask' {
-                        $_.Name
-                    }
-
-                    'DiskEncryption' {
-                        "Encrypt:$($_.Name)"
-                    }
-
-                    'Domain' {
-                        $_.Name
-                    }
-
-                    'PostDisjoin' {
-                        $_.Name
-                    }
-
-                    default {
-                        "$($_.Category):$($_.Name)"
-                    }
-                }
-            }
+        'Privileges',
+        'ScheduledTasks',
+        'Encryption',
+        'DomainDisjoin',
+        'PostDisjoin'
     )
 
-    if ($taskDefinitions.Count -gt 0) {
-        Write-Host ""
-        Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
+    $taskWidth = 18
 
-        $hostWidth = [Math]::Max(
-            10,
-            ($hosts | ForEach-Object Length |
-                Measure-Object -Maximum).Maximum
-        )
+    Write-Host ("{0,-$hostWidth}" -f 'HOST') -NoNewline -ForegroundColor DarkGray
 
-        $columnWidths = @()
+    foreach ($task in $taskColumns) {
+        Write-Host (" {0,-$taskWidth}" -f $task) -NoNewline -ForegroundColor DarkGray
+    }
 
-        for ($i = 0; $i -lt $taskColumns.Count; $i++) {
-            $columnWidths += [Math]::Max(
-                10,
-                $taskColumns[$i].Length + 2
-            )
-        }
+    Write-Host ""
 
-        Write-Host (
-            "{0,-$hostWidth}" -f 'HOST'
-        ) -NoNewline -ForegroundColor DarkGray
+    foreach ($host in $hosts) {
+        $result = $hostMap[$host]
 
-        for ($i = 0; $i -lt $taskColumns.Count; $i++) {
-            Write-Host (
-                " {0,-$($columnWidths[$i])}" -f $taskColumns[$i]
-            ) -NoNewline -ForegroundColor DarkGray
-        }
+        Write-Host ("{0,-$hostWidth}" -f $host) -NoNewline
 
-        Write-Host ""
+        $statuses = [ordered]@{
+            Privileges = Get-AggregateStatus `
+                -Result $result `
+                -Category 'Privilege'
 
-        foreach ($host in $hosts) {
-            $result = $hostMap[$host]
+            ScheduledTasks = Get-AggregateStatus `
+                -Result $result `
+                -Category 'ScheduledTask'
 
-            Write-Host (
-                "{0,-$hostWidth}" -f $host
-            ) -NoNewline
+            Encryption = Get-AggregateStatus `
+                -Result $result `
+                -Category 'DiskEncryption'
 
-            for ($i = 0; $i -lt $taskDefinitions.Count; $i++) {
-                $definition = $taskDefinitions[$i]
-                $width = $columnWidths[$i]
-
-                #
-                # Platform-specific applicability.
-                #
-                $notApplicable = switch ($definition.Category) {
-                    'Domain' {
-                        $result.Platform -ne 'Windows'
-                    }
-
-                    'PostDisjoin' {
-                        $result.Platform -ne 'Windows'
-                    }
-
-                    default {
-                        $false
-                    }
-                }
-
-                $status = Get-CellStatus `
+            DomainDisjoin = if ($result.Platform -eq 'Windows') {
+                Get-AggregateStatus `
                     -Result $result `
-                    -Category $definition.Category `
-                    -Name $definition.Name `
-                    -NotApplicable:$notApplicable
-
-                $color = switch ($status) {
-                    'Success' { 'Green' 
-                    }
-                    'Failed'  { 'Red' 
-                    }
-                    'N/A'     { 'DarkGray' 
-                    }
-                    '-'       { 'DarkGray' 
-                    }
-                    default   { 'Gray' 
-                    }
-                }
-
-                Write-Host (
-                    " {0,-$width}" -f $status
-                ) -NoNewline -ForegroundColor $color
+                    -Category 'Domain'
+            } else {
+                'N/A'
             }
 
-            Write-Host ""
+            PostDisjoin = if ($result.Platform -eq 'Windows') {
+                Get-AggregateStatus `
+                    -Result $result `
+                    -Category 'PostDisjoin'
+            } else {
+                'N/A'
+            }
         }
+
+        foreach ($task in $taskColumns) {
+            $status = $statuses[$task]
+            $color = Get-StatusColor $status
+
+            Write-Host (" {0,-$taskWidth}" -f $status) `
+                -NoNewline `
+                -ForegroundColor $color
+        }
+
+        Write-Host ""
     }
 
     #
-    # Failures
+    # FAILURES
     #
-    $failedResults = @(
+    $failed = @(
         $Results |
             Where-Object {
                 @($_.Failures).Count -gt 0
             }
     )
 
-    if ($failedResults.Count -gt 0) {
+    if ($failed.Count) {
         Write-Host ""
         Write-Host "[FAILURES]" -ForegroundColor Red
 
-        foreach ($result in $failedResults) {
-            $host = Get-ShortHostName $result.HostName
+        foreach ($r in $failed) {
+            $host = Get-ShortHostName $r.HostName
 
-            foreach ($failure in @($result.Failures)) {
+            foreach ($failure in @($r.Failures)) {
                 Write-Host (
                     "  {0,-12} {1}" -f $host, $failure
                 ) -ForegroundColor Red
