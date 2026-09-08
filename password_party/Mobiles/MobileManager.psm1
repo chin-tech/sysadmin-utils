@@ -2119,7 +2119,14 @@ function Format-HostCollector {
         if ($failed.Count) {
             Write-Host ""
             Write-Host "  Failures:" -ForegroundColor DarkRed
-            $hostWidth = ($failed.HostName | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
+            $hostWidth = [Math]::Max(
+                10,
+                [int](
+                    $hosts |
+                        ForEach-Object { $_.Length } |
+                        Measure-Object -Maximum
+                ).Maximum
+            )
             foreach ($r in $failed) {
                 foreach ($failure in @($r.Failures)) {
                     Write-Host ("    {0,-$hostWidth} {1}" -f $r.HostName, $failure) -ForegroundColor Red
@@ -2543,11 +2550,31 @@ function Format-DeploymentResults {
             #
             # Deployment actions for this user
             #
+            #
+            # Get the account name(s) actually deployed on this platform.
+            #
+            $accountNames = if ($result.Platform -eq 'Linux') {
+                @(
+                    $userDefs.LinuxName |
+                        Where-Object { $_ } |
+                        Sort-Object -Unique
+                )
+            } else {
+                @(
+                    $userDefs.Name |
+                        Where-Object { $_ } |
+                        Sort-Object -Unique
+                )
+            }
+
+            #
+            # Find deployment results for those accounts.
+            #
             $accountActions = @(
                 $result.Actions |
                     Where-Object {
                         $_.Category -eq 'User' -and
-                        $_.Name -in $userDefs.Name
+                        $_.Name -in $accountNames
                     }
             )
 
