@@ -402,7 +402,7 @@ $script:WindowsDeployBlock = {
 
 
 $script:WindowsUnregisterBlock = {
-    param([WindowsPayload]payload)
+    param([WindowsPayload]$payload)
 
     $timeStamp   = (Get-Date).ToString('yyyyMMdd')
     $monthYear   = (Get-Date).ToString('MM-yyyy')
