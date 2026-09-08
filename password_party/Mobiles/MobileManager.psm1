@@ -2797,7 +2797,7 @@ function Start-MobileDeployment {
     $disJoin = $false
     Write-Host "---Deployment Started---"
 
-    $windowsPayload = [WindowsPayload]@{
+    $windowsPayload = [PSCustomObject]@{
         allUsers = @($mobileData.AllUsers)
         taskData = @($taskData)
         MobileName = $MobileName
@@ -4005,13 +4005,15 @@ function Unregister-Deployment {
 
     if (@($mobileData.Windows).Count -gt 0) {
         $winErrors = [System.Collections.Generic.List[object]]::new()
-        $payload = [WindowsPayload]@{
+        
+        $payload = [PSCustomObject]@{
             MobileName = $MobileName
             TaskData = $taskData
             Archive =  $archive
             AllUsers = $mobileData.AllUsers
             Bitlocker = $oldEncryption
         }
+        Write-Host $payload
 
         $rawWindows = Invoke-Command `
             -ComputerName $mobileData.Windows `
