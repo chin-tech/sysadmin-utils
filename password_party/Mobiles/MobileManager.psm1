@@ -2814,6 +2814,7 @@ function Start-MobileDeployment {
         taskData = @($taskData)
         MobileName = $MobileName
         Disjoin = $disJoin
+        Bitlocker = $oldEncryption
 
     }
 
@@ -2825,7 +2826,8 @@ function Start-MobileDeployment {
         -ErrorVariable winErrors `
         -ErrorAction SilentlyContinue
 
-    $rawWindows | ForEach-Object { $_.PSObject.TypeNames[0]}
+    Write-Host "[+] Windows Finished"
+    Write-Host "`t Fotmatting Output"
     $rawWindows | Format-List *
 
     $winResults = @(
@@ -2840,7 +2842,6 @@ function Start-MobileDeployment {
         }
     )
 
-    Write-Host "[+] Windows Finished"
 
     foreach ($computer in $mobileData.Windows) {
         $alreadyReturned = $winResults |
