@@ -206,7 +206,7 @@ $script:WindowsDeployBlock = {
             Add-Action `
                 -Category 'User' `
                 -Name $u.Name `
-                -Status 'Existing'
+                -Status 'Existed'
         } else {
             $uParams = @{
                 Name        = $u.Name
@@ -914,15 +914,16 @@ function New-TaskXML {
         [Parameter()][string]$Author = "SYSTEM",
         [Parameter()][string]$Version = "1.0",
         
-        [Parameter(Mandatory=$true)]
+        [Parameter()]
         [string]$Execute,
+        [string]$ToEncode,
         
         [Parameter()]
         [string]$Arguments = "",
         
         # Pass a hashtable or array of hashtables describing triggers
         [Parameter()]
-        [hashtable[]]$TriggerConfigs = @(@{ Type = [TaskTriggerType]::Boot }),
+        [hashtable[]]$TriggerConfigs = @(@{ Type = [TaskTriggerType]::Registration }),
         
         [Parameter()][string]$UserId = "NT AUTHORITY\SYSTEM",
         [Parameter()][int]$LogonType = 5, # 5 = TASK_LOGON_SERVICE / SYSTEM
@@ -931,6 +932,12 @@ function New-TaskXML {
         [Parameter()][bool]$Hidden = $true,
         [Parameter()][string]$ExecutionTimeLimit = "PT72H"
     )
+
+    $defaultPSArgs = if ($Execute.ToLower().Contains('powershell')) { "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive "
+    }
+    $encoded = if (-not ([string]::IsNullOrWhiteSpace())) { "-Encoded $(ConvertTo-Base64 $ToEncode)"
+    }
+    $arguments += ($defaultPSArgs + $encoded + $arguments)
 
     $ts = New-Object -ComObject "Schedule.Service"
     $ts.Connect()
@@ -1614,7 +1621,7 @@ actions="$(
                 {
                     Category: "User",
                     Name: .,
-                    Status: "Existing",
+                    Status: "Existed",
                     Details: null
                 }
             ),
@@ -2446,7 +2453,7 @@ function Format-DeploymentResults {
             }
             'Created'  { 'Yellow' 
             }
-            'Existing' { 'Green' 
+            'Existed' { 'Green' 
             }
             'Success'  { 'Green' 
             }
@@ -2585,8 +2592,8 @@ function Format-DeploymentResults {
                 'Failed'
             } elseif ($accountActions.Status -contains 'Created') {
                 'Created'
-            } elseif ($accountActions.Status -contains 'Existing') {
-                'Existing'
+            } elseif ($accountActions.Status -contains 'Existed') {
+                'Existed'
             } else {
                 '-'
             }
@@ -2597,9 +2604,9 @@ function Format-DeploymentResults {
             $mustChange = $userDefs.MustChangePassword -contains $true
 
             $passwordStatus = if ($mustChange) {
-                'DefaultPass'
+                '[~Default]'
             } else {
-                'UserSet'
+                '[~Good]'
             }
 
             $roleText = $roles -join ', '
@@ -2609,7 +2616,7 @@ function Format-DeploymentResults {
                 }
                 'Created'  { 'Yellow' 
                 }
-                'Existing' { 'Green' 
+                'Existed' { 'Green' 
                 }
                 default    { 'Gray' 
                 }
