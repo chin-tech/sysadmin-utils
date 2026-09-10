@@ -2623,7 +2623,7 @@ function Format-DeploymentResults {
             }
 
             Write-Host (
-                "  {0,-12}: {1,-24} - {2,-9} - {3}" -f
+                "  {0,-12}: {1,-24} | {2,-9} | {3}" -f
                 $baseName,
                 $roleText,
                 $accountStatus,
@@ -2647,6 +2647,14 @@ function Format-DeploymentResults {
     )
 
     $taskWidth = 18
+    $hostWidth = [Math]::Max(
+        10,
+        [int](
+            $hosts |
+                ForEach-Object { $_.Length } |
+                Measure-Object -Maximum
+        ).Maximum
+    )
 
     Write-Host ("{0,-$hostWidth}" -f 'HOST') -NoNewline -ForegroundColor DarkGray
 
