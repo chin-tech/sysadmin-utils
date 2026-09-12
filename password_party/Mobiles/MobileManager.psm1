@@ -198,15 +198,10 @@ $script:WindowsDeployBlock = {
     #
     foreach ($u in $payload.AllUsers) {
 
-        $existing = Get-LocalUser `
-            -Name $u.Name `
-            -ErrorAction SilentlyContinue
+        $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
 
-        if ($existing) {
-            Add-Action `
-                -Category 'User' `
-                -Name $u.Name `
-                -Status 'Existed'
+        if ($existing) { 
+            Add-Action  -Category 'User'  -Name $u.Name  -Status 'Existed' 
         } else {
             $uParams = @{
                 Name        = $u.Name
@@ -216,22 +211,10 @@ $script:WindowsDeployBlock = {
                 ErrorAction = 'Stop'
             }
 
-            if (
-                Invoke-Step `
-                    -Context "User '$($u.Name)'" `
-                    -Action {
-                    New-LocalUser @uParams
-                }
-            ) {
-                Add-Action `
-                    -Category 'User' `
-                    -Name $u.Name `
-                    -Status 'Created'
+            if ( Invoke-Step  -Context "User '$($u.Name)'"  -Action { New-LocalUser @uParams }) {
+                Add-Action  -Category 'User'  -Name $u.Name  -Status 'Created' 
             } else {
-                Add-Action `
-                    -Category 'User' `
-                    -Name $u.Name `
-                    -Status 'Failed'
+                Add-Action  -Category 'User'  -Name $u.Name  -Status 'Failed'
             }
         }
 
@@ -240,18 +223,9 @@ $script:WindowsDeployBlock = {
         #
         if ($u.MustChangePassword) {
 
-            $success = Invoke-Step `
-                -Context "Password expiry '$($u.Name)'" `
-                -Action {
-                $adsiUser = [ADSI]"WinNT://./$($u.Name),user"
-                $adsiUser.PasswordExpired = 1
-                $adsiUser.SetInfo()
-            }
+            $success = Invoke-Step  -Context "Password expiry '$($u.Name)'"  -Action { $adsiUser = [ADSI]"WinNT://./$($u.Name),user"; $adsiUser.PasswordExpired = 1; $adsiUser.SetInfo() }
 
-            Add-Action `
-                -Category 'PasswordExpiry' `
-                -Name $u.Name `
-                -Status $(if ($success) { 'Changed' 
+            Add-Action  -Category 'PasswordExpiry'  -Name $u.Name  -Status $(if ($success) { 'Changed' 
                 } else { 'Failed' 
                 })
         }
@@ -261,41 +235,26 @@ $script:WindowsDeployBlock = {
         #
         foreach ($g in $u.WindowsGroups) {
 
+            if (-not (Get-LocalGroup $g -ErrorAction SilentlyContinue)) {
+                New-LocalGroup $g
+            }
+
             $alreadyMember = $false
 
             try {
-                $alreadyMember = [bool](
-                    Get-LocalGroupMember `
-                        -Group $g `
-                        -Member $u.Name `
-                        -ErrorAction Stop
-                )
+                $alreadyMember = [bool]( Get-LocalGroupMember  -Group $g  -Member $u.Name  -ErrorAction Stop)
             } catch {
                 # Absence is expected here.
             }
 
             if ($alreadyMember) {
-                Add-Action `
-                    -Category 'Privilege' `
-                    -Name "$($u.Name):$g" `
-                    -Status 'Existing'
-
+                Add-Action  -Category 'Privilege'  -Name "$($u.Name):$g"  -Status 'Existed'
                 continue
             }
 
-            $success = Invoke-Step `
-                -Context "Group '$g' for '$($u.Name)'" `
-                -Action {
-                Add-LocalGroupMember `
-                    -Group $g `
-                    -Member $u.Name `
-                    -ErrorAction Stop
-            }
+            $success = Invoke-Step  -Context "Group '$g' for '$($u.Name)'"  -Action { Add-LocalGroupMember  -Group $g  -Member $u.Name  -ErrorAction Stop }
 
-            Add-Action `
-                -Category 'Privilege' `
-                -Name "$($u.Name):$g" `
-                -Status $(if ($success) { 'Changed' 
+            Add-Action  -Category 'Privilege'  -Name "$($u.Name):$g"  -Status $(if ($success) { 'Changed' 
                 } else { 'Failed' 
                 })
         }
@@ -306,21 +265,9 @@ $script:WindowsDeployBlock = {
     #
     foreach ($t in $payload.TaskData) {
 
-        $success = Invoke-Step `
-            -Context "Scheduled task '$($t.TaskName)'" `
-            -Action {
-            Register-ScheduledTask `
-                -TaskName $t.TaskName `
-                -Xml $t.TaskXML `
-                -User System `
-                -Force `
-                -ErrorAction Stop
-        }
+        $success = Invoke-Step  -Context "Scheduled task '$($t.TaskName)'"  -Action { Register-ScheduledTask  -TaskName $t.TaskName  -Xml $t.TaskXML  -User System  -Force  -ErrorAction Stop }
 
-        Add-Action `
-            -Category 'ScheduledTask' `
-            -Name $t.TaskName `
-            -Status $(if ($success) { 'Changed' 
+        Add-Action  -Category 'ScheduledTask'  -Name $t.TaskName  -Status $(if ($success) { 'Changed' 
             } else { 'Failed' 
             })
     }
@@ -328,10 +275,7 @@ $script:WindowsDeployBlock = {
     #
     # BitLocker
     #
-    $drives = @(
-        Get-BitLockerVolume |
-            Where-Object VolumeType -eq 'OperatingSystem'
-    )
+    $drives = @( Get-BitLockerVolume | Where-Object VolumeType -eq 'OperatingSystem')
 
     $tpm = Get-Tpm
 
@@ -344,28 +288,16 @@ $script:WindowsDeployBlock = {
 
         if ($tpm.IsPresent -and $tpm.IsEnabled) {
             $bitLockerParams.TpmAndPinProtector = $true
-            $bitLockerParams.Pin = ConvertTo-SecureString `
-                -String $payload.Bitlocker `
-                -AsPlainText `
-                -Force
+            $bitLockerParams.Pin = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
         } else {
             $bitLockerParams.PasswordProtector = $true
-            $bitLockerParams.Password = ConvertTo-SecureString `
-                -String $payload.Bitlocker `
-                -AsPlainText `
-                -Force
+            $bitLockerParams.Password = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
         }
 
-        $success = Invoke-Step `
-            -Context "BitLocker '$($drive.MountPoint)'" `
-            -Action {
-            Enable-BitLocker @bitLockerParams
+        $success = Invoke-Step  -Context "BitLocker '$($drive.MountPoint)'"  -Action { Enable-BitLocker @bitLockerParams
         }
 
-        Add-Action `
-            -Category 'DiskEncryption' `
-            -Name $drive.MountPoint `
-            -Status $(if ($success) { 'Changed' 
+        Add-Action  -Category 'DiskEncryption'  -Name $drive.MountPoint  -Status $(if ($success) { 'Changed' 
             } else { 'Failed' 
             })
     }
@@ -375,20 +307,9 @@ $script:WindowsDeployBlock = {
     #
     if ($payload.DisJoin) {
 
-        $success = Invoke-Step `
-            -Context 'Domain Disjoin' `
-            -Action {
-            Remove-Computer `
-                -WorkGroupName $payload.MobileName `
-                -Force `
-                -Restart:$false `
-                -ErrorAction Stop
-        }
+        $success = Invoke-Step  -Context 'Domain Disjoin'  -Action { Remove-Computer  -WorkGroupName $payload.MobileName  -Force  -Restart:$false  -ErrorAction Stop }
 
-        Add-Action `
-            -Category 'Domain' `
-            -Name 'Disjoin' `
-            -Status $(if ($success) { 'Changed' 
+        Add-Action  -Category 'Domain'  -Name 'Disjoin'  -Status $(if ($success) { 'Changed' 
             } else { 'Failed' 
             })
     }
@@ -2426,12 +2347,13 @@ function Format-DeploymentResults {
     param(
         [Parameter(Mandatory)]
         [array]$Results,
-        [array]$allUsers
 
+        [Parameter(Mandatory)]
+        [array]$AllUsers
     )
 
     if (-not $Results) {
-        Write-Host "No deployment results returned." -ForegroundColor Yellow
+        Write-Warning "No deployment results returned."
         return
     }
 
@@ -2442,30 +2364,7 @@ function Format-DeploymentResults {
             return '-'
         }
 
-        ($Name -split '\.')[0]
-    }
-
-    function Get-StatusColor {
-        param([string]$Status)
-
-        switch -Regex ($Status) {
-            'Failed'   { 'Red' 
-            }
-            'Created'  { 'Yellow' 
-            }
-            'Existed' { 'Green' 
-            }
-            'Success'  { 'Green' 
-            }
-            'Change'   { 'Yellow' 
-            }
-            'N/A'      { 'DarkGray' 
-            }
-            '^-$'      { 'DarkGray' 
-            }
-            default    { 'Gray' 
-            }
-        }
+        return ($Name -split '\.')[0]
     }
 
     function Get-AggregateStatus {
@@ -2487,56 +2386,20 @@ function Format-DeploymentResults {
         }
 
         if ($actions.Status -contains 'Failed') {
-            return 'Failed'
+            return 'FAILED'
         }
 
-        return 'Success'
+        return 'OK'
     }
 
     #
-    # Host lookup
+    # USERS
     #
-    $hostMap = @{}
+    $userRows = foreach ($result in $Results) {
 
-    foreach ($r in $Results) {
-        $host = Get-ShortHostName $r.HostName
-        $hostMap[$host] = $r
-    }
+        $host = Get-ShortHostName $result.HostName
 
-    $hosts = @($hostMap.Keys | Sort-Object)
-
-    #
-    # Collapse users down to LinuxName/BaseName style.
-    #
-    # Prefer .local as the canonical displayed user.
-    #
-    $canonicalUsers = @(
-        $Results.Actions |
-            Where-Object Category -eq 'User' |
-            ForEach-Object {
-                ($_.Name -split '\.')[0] + '.local'
-            } |
-            Sort-Object -Unique
-    )
-
-    #
-    # USER MATRIX
-    #
-    Write-Host ""
-    Write-Host "[USERS]" -ForegroundColor Cyan
-
-    foreach ($host in $hosts) {
-        $result = $hostMap[$host]
-
-        Write-Host ""
-        Write-Host $host -ForegroundColor Cyan
-
-        $baseNames = @(
-            $AllUsers.BaseName |
-                Sort-Object -Unique
-        )
-
-        foreach ($baseName in $baseNames) {
+        foreach ($baseName in ($AllUsers.BaseName | Sort-Object -Unique)) {
 
             $userDefs = @(
                 $AllUsers |
@@ -2544,21 +2407,17 @@ function Format-DeploymentResults {
             )
 
             #
-            # Metadata-backed roles
+            # Canonical roles come directly from the user model.
             #
             $roles = @(
                 $userDefs |
                     Select-Object -ExpandProperty GroupType -Unique |
-                    ForEach-Object {
-                        $_.ToString()
-                    }
+                    ForEach-Object { $_.ToString() }
             )
 
             #
-            # Deployment actions for this user
-            #
-            #
-            # Get the account name(s) actually deployed on this platform.
+            # Determine the account names actually deployed
+            # on this platform.
             #
             $accountNames = if ($result.Platform -eq 'Linux') {
                 @(
@@ -2574,9 +2433,6 @@ function Format-DeploymentResults {
                 )
             }
 
-            #
-            # Find deployment results for those accounts.
-            #
             $accountActions = @(
                 $result.Actions |
                     Where-Object {
@@ -2586,90 +2442,52 @@ function Format-DeploymentResults {
             )
 
             #
-            # Account state
+            # We're intentionally collapsing Created/Existing
+            # because deployment reporting only cares whether
+            # the desired account state succeeded.
             #
-            $accountStatus = if ($accountActions.Status -contains 'Failed') {
-                'Failed'
-            } elseif ($accountActions.Status -contains 'Created') {
-                'Created'
-            } elseif ($accountActions.Status -contains 'Existed') {
-                'Existed'
-            } else {
+            $status = if (-not $accountActions) {
                 '-'
-            }
-
-            #
-            # Password state comes from canonical user data too
-            #
-            $mustChange = $userDefs.MustChangePassword -contains $true
-
-            $passwordStatus = if ($mustChange) {
-                '[~Default]'
+            } elseif ($accountActions.Status -contains 'Failed') {
+                'FAILED'
             } else {
-                '[~Good]'
+                'OK'
             }
 
-            $roleText = $roles -join ', '
-
-            $color = switch ($accountStatus) {
-                'Failed'   { 'Red' 
-                }
-                'Created'  { 'Yellow' 
-                }
-                'Existed' { 'Green' 
-                }
-                default    { 'Gray' 
-                }
+            $password = if ($userDefs.MustChangePassword -contains $true) {
+                'Default'
+            } else {
+                'UserSet'
             }
 
-            Write-Host (
-                "  {0,-12}: {1,-24} | {2,-9} | {3}" -f
-                $baseName,
-                $roleText,
-                $accountStatus,
-                $passwordStatus
-            ) -ForegroundColor $color
+            [PSCustomObject]@{
+                Host     = $host
+                User     = $baseName
+                Groups   = $roles -join ', '
+                Status   = $status
+                Password = $password
+            }
         }
     }
 
-    #
-    # TASK MATRIX
-    #
     Write-Host ""
-    Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
-
-    $taskColumns = @(
-        'Privileges',
-        'ScheduledTasks',
-        'Encryption',
-        'DomainDisjoin',
-        'PostDisjoin'
-    )
-
-    $taskWidth = 18
-    $hostWidth = [Math]::Max(
-        10,
-        [int](
-            $hosts |
-                ForEach-Object { $_.Length } |
-                Measure-Object -Maximum
-        ).Maximum
-    )
-
-    Write-Host ("{0,-$hostWidth}" -f 'HOST') -NoNewline -ForegroundColor DarkGray
-
-    foreach ($task in $taskColumns) {
-        Write-Host (" {0,-$taskWidth}" -f $task) -NoNewline -ForegroundColor DarkGray
-    }
-
+    Write-Host "[USERS]" -ForegroundColor Cyan
     Write-Host ""
 
-    foreach ($host in $hosts) {
-        $result = $hostMap[$host]
+    $userRows |
+        Sort-Object Host, User |
+        Format-Table Host, User, Groups, Status, Password -AutoSize
 
-        Write-Host ("{0,-$hostWidth}" -f $host) -NoNewline
+    #
+    # DEPLOYMENT TASKS
+    #
+    $taskRows = foreach ($result in $Results) {
 
-        $statuses = [ordered]@{
+        $host = Get-ShortHostName $result.HostName
+
+        [PSCustomObject]@{
+            Host = $host
+
             Privileges = Get-AggregateStatus `
                 -Result $result `
                 -Category 'Privilege'
@@ -2698,42 +2516,43 @@ function Format-DeploymentResults {
                 'N/A'
             }
         }
-
-        foreach ($task in $taskColumns) {
-            $status = $statuses[$task]
-            $color = Get-StatusColor $status
-
-            Write-Host (" {0,-$taskWidth}" -f $status) `
-                -NoNewline `
-                -ForegroundColor $color
-        }
-
-        Write-Host ""
     }
+
+    Write-Host ""
+    Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
+    Write-Host ""
+
+    $taskRows |
+        Sort-Object Host |
+        Format-Table `
+            Host,
+        Privileges,
+        ScheduledTasks,
+        Encryption,
+        DomainDisjoin,
+        PostDisjoin `
+            -AutoSize
 
     #
     # FAILURES
     #
-    $failed = @(
-        $Results |
-            Where-Object {
-                @($_.Failures).Count -gt 0
-            }
-    )
+    $failureRows = foreach ($result in $Results) {
 
-    if ($failed.Count) {
-        Write-Host ""
-        Write-Host "[FAILURES]" -ForegroundColor Red
-
-        foreach ($r in $failed) {
-            $host = Get-ShortHostName $r.HostName
-
-            foreach ($failure in @($r.Failures)) {
-                Write-Host (
-                    "  {0,-12} {1}" -f $host, $failure
-                ) -ForegroundColor Red
+        foreach ($failure in @($result.Failures)) {
+            [PSCustomObject]@{
+                Host    = Get-ShortHostName $result.HostName
+                Failure = $failure
             }
         }
+    }
+
+    if ($failureRows) {
+        Write-Host ""
+        Write-Host "[FAILURES]" -ForegroundColor Red
+        Write-Host ""
+
+        $failureRows |
+            Format-Table Host, Failure -AutoSize
     }
 }
 
@@ -2761,7 +2580,6 @@ function Start-MobileDeployment {
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
     $disJoin = $false
-    Write-Host "---Deployment Started---"
 
     $windowsPayload = [PSCustomObject]@{
         allUsers = @($mobileData.AllUsers)
@@ -2782,8 +2600,6 @@ function Start-MobileDeployment {
         -ErrorAction SilentlyContinue
 
     Write-Host "[+] Windows Finished"
-    Write-Host "`t Fotmatting Output"
-    $rawWindows | Format-List *
 
     $winResults = @(
         foreach ($r in $rawWindows) {
