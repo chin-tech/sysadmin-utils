@@ -856,7 +856,7 @@ function New-TaskXML {
 
     $defaultPSArgs = if ($Execute.ToLower().Contains('powershell')) { "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive "
     }
-    $encoded = if (-not ([string]::IsNullOrWhiteSpace())) { "-Encoded $(ConvertTo-Base64 $ToEncode)"
+    $encoded = if (-not ([string]::IsNullOrWhiteSpace($toEncode))) { "-Encoded $(ConvertTo-Base64 $ToEncode)"
     }
     $arguments += ($defaultPSArgs + $encoded + $arguments)
 
@@ -955,98 +955,76 @@ function ConvertTo-BashArgument {
 
 
 
-function New-LogonGPO {
+function New-CustomGPO {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$targetOUFriendlyName
+        [string]$TargetOUFriendlyName,
+
+        [Parameter()]
+        [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
+
+        [Parameter()]
+        [string]$GpoDisplayName = "Mobile Logon"
     )
 
+    $cleanGuid = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
+
     $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
-    $ScriptName = "logon.ps1"
+    $rootDSE = [ADSI]"LDAP://RootDSE"
+    $namingContext = $rootDSE.defaultNamingContext
+    $policyContainer = "CN=Policies,CN=System,$namingContext"
+    $targetOU_DN = "OU=$TargetOUFriendlyName,$namingContext"
 
-    # PowerShell payload
-    $ScriptBody = @'
-$LogFile = "$env:TEMP\ad_ps_logon.log"
-$TimeStamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-"[$TimeStamp] Executed PowerShell logon script for $env:USERNAME on $env:COMPUTERNAME" | Out-File -FilePath $LogFile -Append
-New-Item -Type File -Force -Path C:\Temp\RanLogonScript
-'@
+    $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGuid"
+    $gpoLdapPath   = "[LDAP://CN=$cleanGuid,$policyContainer;0]"
 
-    $gpoName = "Mobile Logon Script"
-    $RootDSE = [ADSI]"LDAP://RootDSE"
-    $ctx = $RootDSE.DefaultNamingContext
-    $PolicyContainer = "CN=Policies,CN=System,$ctx"
-    $gpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}" # Ensure standard uppercase hex
-    $targetOU_DN = "OU=$targetOUFriendlyName,$ctx"
-    $gpoLdapPath = "[LDAP://CN=$gpoID,$PolicyContainer;0]"
-    $userVersion = 65536
-
-    # PowerShell Scripts CSE GUID
-    # [{Scripts-CSE}{Legacy-Tool-GUID}][{Scripts-CSE}{PowerShell-Tool-GUID}]
-    # $PsCseGuid = "[{42B5FAAE-6536-11D2-A45A-0000F87571E3}{40B66649-4972-11D1-A7CA-00AA00A72F28}][{42B5FAAE-6536-11D2-A45A-0000F87571E3}{40B66650-4972-11D1-A7CA-00AA00A72F28}]"
-    # $PsCSEGuid = "[{42B5FAAE-6536-11D2-A45A-0000F87571E3}{40B66649-4972-11D1-A7CA-00AA00A72F28}][{40B66650-4972-11D1-A7CA-00AA00A72F28}{42B5FAAE-6536-11D2-A45A-0000F87571E3}]"
-    $PSCSEGuid = "[{42B5FAAE-6536-11D2-A45A-0000F87571E3}{40B66649-4972-11D1-A7CA-00AA00A72F28}][{40B66650-4972-11D1-A7CA-00AA00A72F28}{42B5FAAE-6536-11D2-A45A-0000F87571E3}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}]"
-    $gpoPath = "\\$domain\sysvol\$domain\policies\$gpoID"
-
-    # 1. Check or Create GPC object cleanly
-    $gpoLdapUri = "LDAP://CN=$gpoID,$PolicyContainer"
+    # 1. Create or bind to the AD Group Policy Container (GPC)
+    $gpoLdapUri = "LDAP://CN=$cleanGuid,$policyContainer"
     if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
-        $newGPO = [ADSI]$gpoLdapUri
+        $gpoEntry = [ADSI]$gpoLdapUri
+        Write-Host "[-] GPC object already exists in AD: $cleanGuid" -ForegroundColor Yellow
     } else {
-        $polEntry = [ADSI]"LDAP://$PolicyContainer"
-        $newGPO = $polEntry.Create("groupPolicyContainer", "CN=$gpoID")
+        $policiesDir = [ADSI]"LDAP://$policyContainer"
+        $gpoEntry = $policiesDir.Create("groupPolicyContainer", "CN=$cleanGuid")
     }
 
-    $newGPO.Put("displayName", $gpoName)
-    $newGPO.Put("flags", 2)
-    $newGPO.Put("gPCFileSysPath", $gpoPath)
-    $newGPO.Put("gPCUserExtensionNames", $PsCseGuid)
-    $newGPO.Put("versionNumber", $userVersion)
-    $newGPO.SetInfo()
+    $gpoEntry.Put("displayName", $GpoDisplayName)
+    $gpoEntry.Put("flags", 0)                 # 0 = Both User & Computer enabled
+    $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
+    $gpoEntry.Put("versionNumber", 0)          # 0 = Brand new / clean version
+    $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
+    $gpoEntry.SetInfo()
 
-    # 2. Build SYSVOL Directory Structure
-    $logonPath = Join-Path $gpoPath "User\Scripts\Logon"
-    New-Item -Path $logonPath -ItemType Directory -Force | Out-Null
-    New-Item -Path (Join-Path $gpoPath "Machine\Scripts") -ItemType Directory -Force | Out-Null
+    # 2. Build standard SYSVOL folder structure
+    $machinePath = Join-Path $gpoSysvolPath "Machine"
+    $userPath    = Join-Path $gpoSysvolPath "User"
 
-    # 3. Write Configuration Files
+    @($gpoSysvolPath, $machinePath, $userPath) | ForEach-Object {
+        if (-not (Test-Path $_)) {
+            New-Item -Path $_ -ItemType Directory -Force | Out-Null
+        }
+    }
+
+    # 3. Create minimal gpt.ini
     $gptIniContent = @"
 [General]
-Version=$userVersion
-displayName=$gpoName
+Version=0
+displayName=$GpoDisplayName
 "@
-    Set-Content -Path (Join-Path $gpoPath "gpt.ini") -Value $gptIniContent -Encoding Ascii
+    Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIniContent -Encoding Ascii
 
-    $PsScriptsIniContent = @"
-
-[ScriptsConfig]
-StartExecutePSFirst=true
-[Logon]
-0CmdLine=$ScriptName
-0Parameters=-ExecutionPolicy Bypass -WindowStyle Hidden
-"@
-    $ScriptsIniContent = @"
-
-[Logon]
-"@
-    # Note: -Encoding Unicode is required for Group Policy parsing
-    $utf16 = New-Object System.Text.UnicodeEncoding($false,$true)
-    [System.IO.File]::WriteAllText((Join-Path $gpoPath "User\Scripts\scripts.ini"),$ScriptsIniContent, $utf16)
-    [System.IO.File]::WriteAllText((Join-Path $gpoPath "User\Scripts\psscripts.ini"),$PsScriptsIniContent, $utf16)
-    # Set-Content -Path (Join-Path $gpoPath "User\Scripts\scripts.ini") -Value $ScriptsIniContent -Encoding Unicode
-    # Set-Content -Path (Join-Path $gpoPath "User\Scripts\psscripts.ini") -Value $PsScriptsIniContent -Encoding Unicode
-    Set-Content -Path (Join-Path $logonPath $ScriptName) -Value $ScriptBody -Encoding UTF8
-
-    # 4. Link GPO to target OU (Safe attribute access)
-    $targetOU = [ADSI]"LDAP://$targetOU_DN"
+    # 4. Link GPO to target OU
     if (-not [System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
-        throw "Target OU '$targetOU_DN' does not exist."
+        Write-Warning "Target OU '$targetOU_DN' does not exist. GPO created, but link was skipped."
+        return
     }
 
+    $targetOU = [ADSI]"LDAP://$targetOU_DN"
     $existingLinks = $targetOU.Properties['gPLink'].Value
+
     if ($existingLinks) {
-        if ($existingLinks -notlike "*$gpoID*") {
+        if ($existingLinks -notlike "*$cleanGuid*") {
             $targetOU.Properties['gPLink'].Value = "$gpoLdapPath$existingLinks"
         }
     } else {
@@ -1058,9 +1036,240 @@ StartExecutePSFirst=true
     }
 
     $targetOU.SetInfo()
-    Write-Host "[+] Successfully created and linked GPO $gpoID to $targetOUFriendlyName" -ForegroundColor Green
+    Write-Host "[+] Created clean GPO '$GpoDisplayName' ($cleanGuid) and linked to '$TargetOUFriendlyName'." -ForegroundColor Green
+    Write-Host "[+] Ready for editing via GPMC." -ForegroundColor DarkGray
 }
 
+
+### INITIALIZE
+
+function New-InitResult {
+    param(
+        [Parameter(Mandatory)][string]$Component,
+        [Parameter(Mandatory)][ValidateSet('OK', 'CREATED', 'REPAIRED', 'FAILED', 'SKIPPED')][string]$Status,
+        [Parameter(Mandatory)][string]$Details,
+        [switch]$Fatal
+    )
+    [PSCustomObject]@{
+        Component = $Component
+        Status    = $Status
+        Details   = $Details
+        Fatal     = [bool]$Fatal
+    }
+}
+
+function Test-AndFixDirectories {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$PathMap
+    )
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($name in $PathMap.Keys) {
+        $path = $PathMap[$name]
+
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            $results.Add((New-InitResult -Component "Dir:$name" -Status 'FAILED' -Details "Path configuration is blank" -Fatal))
+            continue
+        }
+
+        if (Test-Path -Path $path) {
+            $results.Add((New-InitResult -Component "Dir:$name" -Status 'OK' -Details $path))
+        } else {
+            try {
+                New-Item -ItemType Directory -Path $path -Force -ErrorAction Stop | Out-Null
+                $results.Add((New-InitResult -Component "Dir:$name" -Status 'CREATED' -Details $path))
+            } catch {
+                $results.Add((New-InitResult -Component "Dir:$name" -Status 'FAILED' -Details "Failed to create '$path': $($_.Exception.Message)" -Fatal))
+            }
+        }
+    }
+    return $results
+}
+
+
+function Test-AndFixDeployerCert {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CertName,
+        [Parameter(Mandatory)][string]$PfxStoragePath,
+        [securestring]$CertPassword
+    )
+
+    $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My |
+        Where-Object { $_.Subject -like "*$CertName*" } |
+        Select-Object -First 1
+
+    if ($existingCert) {
+        return (New-InitResult -Component 'Cert:Store' -Status 'OK' -Details "Thumbprint: $($existingCert.Thumbprint)")
+    }
+
+    $pfxFile = Join-Path $PfxStoragePath "$CertName.pfx"
+    $cerFile = Join-Path $PfxStoragePath "$CertName.cer"
+
+    # Case A: Import existing PFX from centralized share
+    if (Test-Path $pfxFile) {
+        if (-not $CertPassword) {
+            $CertPassword = Read-Host -AsSecureString -Prompt "[!] Certificate password required to import '$pfxFile'"
+        }
+        try {
+            Import-PfxCertificate -FilePath $pfxFile -CertStoreLocation Cert:\CurrentUser\My -Password $CertPassword -ErrorAction Stop | Out-Null
+            return (New-InitResult -Component 'Cert:Store' -Status 'REPAIRED' -Details "Imported $pfxFile")
+        } catch {
+            return (New-InitResult -Component 'Cert:Store' -Status 'FAILED' -Details "Failed to import $pfxFile: $($_.Exception.Message)" -Fatal)
+        }
+    }
+
+    # Case B: Mint new certificate, export to share, install locally
+    try {
+        if (-not $CertPassword) {
+            $CertPassword = ConvertTo-SecureString -AsPlainText -Force 'deployer'
+        }
+
+        $c = New-SelfSignedCertificate `
+            -Subject "CN=$CertName" `
+            -Type DocumentEncryptionCert `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -KeyExportPolicy Exportable `
+            -NotAfter (Get-Date).AddYears(5) `
+            -ErrorAction Stop
+
+        Export-PfxCertificate -Cert $c -FilePath $pfxFile -Password $CertPassword -ErrorAction Stop | Out-Null
+        Export-Certificate -Cert $c -FilePath $cerFile -ErrorAction Stop | Out-Null
+
+        return (New-InitResult -Component 'Cert:Store' -Status 'CREATED' -Details "Minted new cert and stored to $pfxFile")
+    } catch {
+        return (New-InitResult -Component 'Cert:Store' -Status 'FAILED' -Details "Creation failed: $($_.Exception.Message)" -Fatal)
+    }
+}
+
+function Test-AndFixSshEnvironment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$KeyPath,
+        [Parameter(Mandatory)][string]$NfsHome
+    )
+
+    if ([string]::IsNullOrWhiteSpace($KeyPath) -or $KeyPath.EndsWith('\')) {
+        return (New-InitResult -Component 'SSH:Config' -Status 'FAILED' -Details "Invalid SSH key path: '$KeyPath'" -Fatal)
+    }
+
+    $nfsSsh      = Join-Path $NfsHome '.ssh'
+    $localSsh    = Join-Path $env:USERPROFILE '.ssh'
+    $rAuthorized = Join-Path $nfsSsh 'authorized_keys'
+
+    try {
+        # 1. Directory checks
+        foreach ($dir in @($localSsh, $nfsSsh)) {
+            if (-not (Test-Path $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+            }
+        }
+
+        # 2. Permissions lock-down (Inheritance removal + single-owner grant)
+        icacls.exe $localSsh /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)(F)" 2>$null | Out-Null
+        icacls.exe $nfsSsh   /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)(F)" 2>$null | Out-Null
+
+        # 3. Keypair generation
+        $keyCreated = $false
+        if (-not (Test-Path $KeyPath)) {
+            $keyDir = Split-Path -Parent $KeyPath
+            if (-not (Test-Path $keyDir)) { New-Item -ItemType Directory -Path $keyDir -Force | Out-Null }
+            ssh-keygen -f "$KeyPath" -C 'MobileDeployer' -N '""' -t ecdsa -q
+            $keyCreated = $true
+        }
+
+        icacls.exe $KeyPath /inheritance:r /grant:r "$($env:USERNAME):(R)" 2>$null | Out-Null
+
+        # 4. Authorized keys enrollment
+        $pubKey = (ssh-keygen -yf $KeyPath).Trim()
+        if (-not (Test-Path $rAuthorized)) {
+            New-Item -ItemType File -Path $rAuthorized -Force | Out-Null
+        }
+
+        $existingAuth = Get-Content -Path $rAuthorized -ErrorAction SilentlyContinue
+        if ($existingAuth -notcontains $pubKey) {
+            Add-Content -Path $rAuthorized -Value $pubKey -Encoding UTF8
+            icacls.exe $rAuthorized /inheritance:r /grant:r "$($env:USERNAME):(R)" 2>$null | Out-Null
+        }
+
+        $status = if ($keyCreated) { 'CREATED' } else { 'OK' }
+        return (New-InitResult -Component 'SSH:Environment' -Status $status -Details "Key at $KeyPath enrolled in $rAuthorized")
+    } catch {
+        return (New-InitResult -Component 'SSH:Environment' -Status 'FAILED' -Details $_.Exception.Message -Fatal)
+    }
+}
+
+
+function Initialize-Environment {
+    [CmdletBinding()]
+    param(
+        [Parameter()][string]$SshKeyPath   = $Script:Config.SSHKeyPath,
+        [Parameter()][string]$NfsHome      = $Script:Config.NfsHome,
+        [Parameter()][string]$AdminRoot    = $Script:Config.AdminRoot,
+        [Parameter()][string]$MobileDump   = $Script:Config.MobileDump,
+        [Parameter()][string]$MobileEntries= $Script:Config.MobileEntries,
+        [Parameter()][string]$CertName     = ($Script:Config.CertName ? $Script:Config.CertName : 'MobileDeployer'),
+        [Parameter()][switch]$HaltOnError
+    )
+
+    Write-Host "`n[+] Executing System Pre-Flight & Provisioning..." -ForegroundColor Cyan
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    # 1. Directory Structure Mapping
+    $requiredPaths = @{
+        'NfsHome'       = $NfsHome
+        'AdminRoot'     = $AdminRoot
+        'MobileDump'    = $MobileDump
+        'MobileEntries' = $MobileEntries
+    }
+    $results.AddRange((Test-AndFixDirectories -PathMap $requiredPaths))
+
+    # 2. SSH Environment
+    $results.Add((Test-AndFixSshEnvironment -KeyPath $SshKeyPath -NfsHome $NfsHome))
+
+    # 3. Document Encryption Cert
+    $results.Add((Test-AndFixDeployerCert -CertName $CertName -PfxStoragePath $AdminRoot))
+
+    #
+    # Pretty-Print Provisioning Ledger
+    #
+    $colorMap = @{
+        'OK'       = 'Green'
+        'CREATED'  = 'Cyan'
+        'REPAIRED' = 'Yellow'
+        'SKIPPED'  = 'DarkGray'
+        'FAILED'   = 'Red'
+    }
+
+    Write-Host ""
+    Write-Host ("  {0,-20} {1,-10} {2}" -f 'COMPONENT', 'STATUS', 'DETAILS') -ForegroundColor DarkGray
+    Write-Host ("  {0,-20} {1,-10} {2}" -f ('-' * 20), ('-' * 10), ('-' * 45)) -ForegroundColor DarkGray
+
+    foreach ($r in $results) {
+        $color = $colorMap[$r.Status]
+        Write-Host ("  {0,-20} " -f $r.Component) -NoNewline
+        Write-Host ("[{0,-8}]" -f $r.Status) -ForegroundColor $color -NoNewline
+        Write-Host (" {0}" -f $r.Details)
+    }
+    Write-Host ""
+
+    #
+    # Final Validation Guard
+    #
+    $criticalFails = @($results | Where-Object { $_.Fatal -and $_.Status -eq 'FAILED' })
+
+    if ($criticalFails.Count -gt 0) {
+        Write-Host "[!] Preflight checks failed with $($criticalFails.Count) fatal error(s)." -ForegroundColor Red
+        if ($HaltOnError) {
+            throw "Environment provisioning incomplete. Halting execution."
+        }
+        return $false
+    }
+
+    Write-Host "[+] All dependencies satisfied. Environment ready for deployment." -ForegroundColor Green
+    return $true
+}
 
 function New-DeployerCertificate {
     [CmdletBinding()]
@@ -1122,6 +1331,8 @@ function Initialize-Ssh-Environment {
 
 }
 
+
+
 function Initialize-Functionality {
     [CmdletBinding()]
     param(
@@ -1155,113 +1366,279 @@ function Initialize-Functionality {
         }
     }
 }
+function New-WindowsPostTask-SupportAcl {
+    [CmdletBinding()]
+    param(
+        [string]$Path = 'C:\Support'
+    )
+
+    return @"
+# Task: Support ACL
+
+try {
+    & icacls.exe '$Path' /inheritance:r /T /Q | Out-Null
+
+    if (`$LASTEXITCODE -ne 0) {
+        throw "inheritance command failed with `$LASTEXITCODE"
+    }
+
+    & icacls.exe '$Path' /grant Administrators:F ISSO:F /T /Q | Out-Null
+
+    if (`$LASTEXITCODE -ne 0) {
+        throw "grant command failed with `$LASTEXITCODE"
+    }
+
+    record_action 'SupportAcl' '$Path' 'Success'
+}
+catch {
+    record_action 'SupportAcl' '$Path' 'Failed'
+    record_failure "Support ACL: `$(`$_.Exception.Message)"
+}
+"@
+}
+
+function New-WindowsPostTask-NetworkSharing {
+    [CmdletBinding()]
+    param(
+        [string[]]$DriveLetters
+    )
+
+    $driveInit = if ($DriveLetters) {
+        '$driveList = @(' +
+        (($DriveLetters | ForEach-Object { "'$_'" }) -join ',') +
+        ')'
+    } else {
+        @'
+$driveList = @(
+    Get-PSDrive -PSProvider FileSystem |
+        Select-Object -ExpandProperty Name
+)
+'@
+    }
+
+    return  $driveInit + @'
+# Task: Network Sharing
+
+
+try {
+    Enable-NetFirewallRule `
+        -DisplayGroup 'File and Printer Sharing' `
+        -ErrorAction Stop
+
+    $failedShares = @()
+
+    foreach ($d in $driveList) {
+        $path = "$d`:"
+
+        if (-not (Test-Path $path)) {
+            $failedShares += "$path does not exist"
+            continue
+        }
+
+        if (-not (Get-SmbShare -Name $d -ErrorAction SilentlyContinue)) {
+            try {
+                New-SmbShare `
+                    -Name $d `
+                    -Path $path `
+                    -FullAccess 'Authenticated Users','mobile-smb-access' `
+                    -ErrorAction Stop |
+                    Out-Null
+            }
+            catch {
+                $failedShares += "$d : $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if ($failedShares.Count -eq 0) {
+        record_action 'NetworkSharing' 'SMB' 'Success'
+    }
+    else {
+        record_action 'NetworkSharing' 'SMB' 'Failed'
+
+        foreach ($failure in $failedShares) {
+            record_failure "Network sharing: $failure"
+        }
+    }
+}
+catch {
+    record_action 'NetworkSharing' 'SMB' 'Failed'
+    record_failure "Network sharing failed: $($_.Exception.Message)"
+}
+'@
+}
+
+function New-WindowsPostTask-UserRights {
+    [CmdletBinding()]
+    param(
+        [switch]$Sharing,
+        [switch]$HasLinux
+    )
+
+    $sharingSetup = ''
+
+    if ($Sharing -and $HasLinux) {
+        $sharingSetup = @'
+$smbPass = ConvertTo-SecureString 'SupeSecretSMBP@ssw0rd99' -AsPlainText -Force
+
+if (-not (Get-LocalUser -Name 'mobile-smb-access' -ErrorAction SilentlyContinue)) {
+    New-LocalUser `
+        -Name 'mobile-smb-access' `
+        -Password $smbPass |
+        Out-Null
+}
+
+$sharingSid = (Get-LocalUser -Name 'mobile-smb-access').Sid.Value
+
+'@
+    }
+
+    return $sharingSetup + @'
+# Task: User Rights
+
+$tmpSec = Join-Path $env:TEMP 'sec_export.inf'
+$tmpDB  = Join-Path $env:TEMP 'sec_temp.sdb'
+
+secedit /export /cfg $tmpSec /quiet
+
+$objUser = New-Object System.Security.Principal.NTAccount('Authenticated Users')
+$objSid = $objUser.Translate(
+    [System.Security.Principal.SecurityIdentifier]
+).Value
+
+$secSid = "*$objSid"
+
+$rights = @(
+    'SeInteractiveLogonRight',
+    'SeRemoteInteractiveLogonRight',
+    'SeNetworkLogonRight'
+)
+
+$denyRights = @(
+    'SeDenyInteractiveLogonRight',
+    'SeDenyRemoteInteractiveLogonRight',
+    'SeDenyBatchLogonRight',
+    'SeDenyServiceLogonRight'
+)
+
+$cfg = Get-Content -Raw -Encoding Unicode $tmpSec
+
+foreach ($r in $rights) {
+    $pattern = "(?m)^\s*$([regex]::Escape($r))\s*=[^\r\n]*"
+
+    if ($cfg -notmatch $pattern) {
+        $cfg += "`r`n$r = $secSid"
+        continue
+    }
+
+    $line = [regex]::Match($cfg, $pattern).Value
+
+    if ($line -notmatch [regex]::Escape($objSid)) {
+        $cfg = $cfg -replace $pattern, "$0,$secSid"
+    }
+}
+
+if ($sharingSid) {
+    $shareSid = "*$sharingSid"
+
+    foreach ($r in $denyRights) {
+        $pattern = "(?m)^\s*$([regex]::Escape($r))\s*=[^\r\n]*"
+
+        if ($cfg -notmatch $pattern) {
+            $cfg += "`r`n$r = $shareSid"
+            continue
+        }
+
+        $line = [regex]::Match($cfg, $pattern).Value
+
+        if ($line -notmatch [regex]::Escape($sharingSid)) {
+            $cfg = $cfg -replace $pattern, "$0,$shareSid"
+        }
+    }
+}
+
+$cfg | Set-Content -Path $tmpSec -Encoding Unicode
+
+secedit /configure `
+    /db $tmpDB `
+    /cfg $tmpSec `
+    /areas USER_RIGHTS `
+    /quiet
+
+if ($LASTEXITCODE -eq 0) {
+    record_action 'UserRights' 'LocalSecurityPolicy' 'Success'
+}
+else {
+    record_action 'UserRights' 'LocalSecurityPolicy' 'Failed'
+    record_failure "User rights configuration failed: exit code $LASTEXITCODE"
+}
+
+Remove-Item $tmpSec, $tmpDB -Force -ErrorAction SilentlyContinue
+'@
+}
 
 function Get-PostDeployScript {
     [CmdletBinding()]
-    param (
-        [Parameter()]
-        [switch]$userRights,
+    param(
+        [switch]$UserRights,
         [switch]$Sharing,
-        [switch]$hasLinux,
+        [switch]$HasLinux,
 
-        [Parameter()]
-        [array]$driveLetters
+        [string[]]$DriveLetters
     )
 
-    $s = [System.Collections.Generic.List[string]]::new()
+    $tasks = [System.Collections.Generic.List[string]]::new()
 
-    $s.Add(@'
+    $tasks.Add(@'
 # ==================
 # Automated Post-Deployment
-# (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 # ==================
-'@)
-    if ($userRights) {
-        if ($sharing -and $hasLinux) {
-            $smbPass = "SupeSecretSMBP@ssw0rd99"
-            $s.Add(@"
-New-LocalUser -Name mobile-smb-access -Password (ConvertTo-SecureString -AsPlainText -Force '$smbPass')
-`$sharingSid = (Get-LocalUser -Name mobile-smb-access).Sid.Value
-"@)
-        }
-        $s.Add(@'
-$tmpSec = Join-Path $env:TEMP sec_export.inf
-$tmpDB  = Join-Path $env:TEMP sec_temp.sdb
 
-secedit /export /cfg $tmpSec /quiet
-$objUser = New-Object System.Security.Principal.NTAccount("Authenticated Users")
-$objSid = $objUser.Translate([System.Security.Principal.SecurityIdentifier]).Value
-$secSid = "*$objSid"
-$rights = @('SeInteractiveLogonRight', 'SeRemoteInteractiveLogonRight', 'SeNetworkLogonRight')
-$denyRights = @( 'SeDenyInteractiveLogonRight', 'SeDenyRemoteInteractiveLogonRight', 'SeDenyBatchLogonRight', 'SeDenyServiceLogonRight')
+$actions = [System.Collections.Generic.List[object]]::new()
+$failures = [System.Collections.Generic.List[string]]::new()
 
-$cfg = Get-Content -Raw -Encoding Unicode $tmpSec
-for ($r in $rights) {
-    if (-not ($cfg.Contains($r))) {
-        Add-Content -Path $tmpSec -Value "`n$r = $secSid"
-    } else {
-        $pattern = "(?m)^\s*$([regex]::Escape($r))\s*=[^\r\n]*"
-        $line = [regex]::Match($cfg,$pattern).Value
-        if ($line -match "$objSid") { continue }
-        $cfg = $cfg -replace $pattern, "`$0,$secSid"
-        
-    }
+function record_action {
+    param(
+        [string]$Category,
+        [string]$Name,
+        [string]$Status,
+        $Details = $null
+    )
 
-}
-if ($null -ne $sharingSid) {
-    $shareSid = "*${sharingSid}"
-    for ($r in $denyRights) {
-
-        if (-not ($cfg.Contains($r))) {
-            Add-Content -Path $tmpSec -Value "`n$r = $shareSid"
-        } else {
-            $pattern = "(?m)^\s*$([regex]::Escape($r))\s*=[^\r\n]*"
-            $line = [regex]::Match($cfg,$pattern).Value
-            if ($line -match "$sharingSid") { continue }
-            $cfg = $cfg -replace $pattern, "`$0,$shareSid"
-            
-        }
-
-    }
+    $actions.Add([PSCustomObject]@{
+        Category = $Category
+        Name     = $Name
+        Status   = $Status
+        Details  = $Details
+    })
 }
 
-$cfg | Set-Content -Path $tmpSec 
+function record_failure {
+    param([string]$Message)
 
-secedit /configure /db $tmpDB /cfg $tmpSec /areas USER_RIGHTS /quiet
-Remove-Item $tmpSec,$tmpDB -Force -ErrorAction SilentlyContinue
-'@)
-
-    }
-
-    if ($Sharing) {
-        if ($null -ne  $driveLetters) {
-            $driveList = ($driveLetters | ForEach-Object { "'$_'" }) -join ','
-            $s.Add(@"
-`$driveList = $driveList
-"@)
-        }
-        $s.Add(@'
-Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing" -ErrorAction SilentlyContinue
-if ($null -eq $driveList) { $driveList  = (Get-PSDrive -PSProvider Filesystem).Name} 
-foreach ($d in $driveList) {
-    if (Test-Path $d) {
-        if (-not (Get-SMBShare -Name $d -ErrorAction SilentlyContinue)) {
-            New-SMBShare -Name $d -Path $d -FullAccess 'Authenticated Users','mobile-smb-access' | Out-Null
-        }
-    }
+    $failures.Add($Message)
 }
-
-'@)
-    }
-
-    $s.Add(@'
-icacls.exe C:\Support /inheritance:r /T /Q
-icacls.exe C:\Support /grant Administrators:F ISSO:F /T /Q
-
 '@)
 
-    $s.Add('"[ Post Deployment Ran - $(Get-Date)]" | Out-File C:\Post-Deploy.info ')
-    return ($s -join "`n`n")
+    if ($UserRights) { $tasks.Add( (New-WindowsPostTask-UserRights  -Sharing:$Sharing  -HasLinux:$HasLinux)) }
+
+    if ($Sharing) { $tasks.Add( (New-WindowsPostTask-NetworkSharing  -DriveLetters $DriveLetters)) }
+
+    $tasks.Add( (New-WindowsPostTask-SupportAcl))
+
+    $tasks.Add(@'
+"[ Post Deployment Ran - $(Get-Date) ]" |
+    Out-File C:\Post-Deploy.info
+
+[PSCustomObject]@{
+    Platform = 'Windows'
+    Success  = ($failures.Count -eq 0)
+    Actions  = $actions.ToArray()
+    Failures = $failures.ToArray()
+}
+'@)
+
+    return ($tasks -join "`n`n")
 }
 
 
@@ -1308,60 +1685,25 @@ function Get-UserFullName {
 }
 
 
-
-function Get-LinuxDeployScript {
+function New-LinuxTask-CreateDirectory {
     [CmdletBinding()]
-    param (
-        [Parameter(Mandatory = $true)]
-        [array]$allUsers
-    )
-
-    $scriptArray = [System.Collections.Generic.List[string]]::new()
-
-    #
-    # Static header
-    #
-    $scriptArray.Add(@'
-#!/usr/bin/env bash
-
-mHome='/mobiles/home'
-
-declare -a created_users=()
-declare -a existing_users=()
-declare -a failed_users=()
-
-declare -a wheel_users=()
-declare -a failed_wheel_users=()
-
-declare -a expired_users=()
-declare -a failed_expiry_users=()
-
-declare -a luks_updated=()
-declare -a failed_luks=()
-
-declare -a systemd_timers=()
-declare -a failed_timers=()
-
-declare -a failures=()
-
-array_to_json() {
-    if [[ $# -eq 0 ]]; then
-        echo '[]'
-    else
-        printf '%s\n' "$@" | jq -R . | jq -s .
-    fi
+    param([string]$Path = '/mobiles/home')
+    return @"
+# Task: Create Directory: ($Path)
+if dzdo mkdir -p '$Path' &> /dev/null; then
+    record_action 'Directory' '$Path' 'Success'
+else
+    record_failure 'Directory: $Path failed to create'
+fi
+"@
 }
 
-#
-# Mobile home
-#
-if ! dzdo mkdir -p "$mHome" &>/dev/null; then
-    failures+=("Mobile home: failed to create $mHome")
-fi
+function New-LinuxTask-AddLogService {
+    [CmdletBinding()]
+    param([string]$ExecPath = '/path/to-rotate')
+    return @"
+#Log rotation Unit Files
 
-#
-# Logrotate timer/service
-#
 cat << 'EOF' | dzdo tee /etc/systemd/system/mobile-logrotate.timer >/dev/null
 [Unit]
 Description=Mobile Log Rotate Timer
@@ -1381,7 +1723,7 @@ Description=Mobile Log Rotate Service
 [Service]
 Restart=on-failure
 RemainAfterExit=no
-ExecStart=/path-to-logrotate
+ExecStart=$ExecPath
 
 [Install]
 WantedBy=multi-user.target
@@ -1390,261 +1732,187 @@ EOF
 dzdo systemctl daemon-reload &>/dev/null
 
 if dzdo systemctl enable --now mobile-logrotate.timer &>/dev/null; then
-    systemd_timers+=("mobile-logrotate.timer")
+    record_action 'ScheduledTask' 'mobile-logrotate.timer' 'Success'
 else
-    failed_timers+=("mobile-logrotate.timer")
-    failures+=("Scheduled task 'mobile-logrotate.timer': failed to enable")
+    record_action 'ScheduledTask' 'mobile-logrotate.timer' 'Failed'
+    record_failure "Scheduled task 'mobile-logrotate.timer': failed to enable"
 fi
+"@
+}
 
-#
-# Locate LUKS devices
-#
+function New-LinuxTask-Luks {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$CurrentPass,
+        [Parameter(Mandatory)] [string]$NewPin
+    )
+
+    return @"
+# Task: LUKS Enrollment
 mapfile -t luks_devices < <(
-    lsblk -rno NAME,FSTYPE 2>/dev/null |
-        awk '$2 == "crypto_LUKS" {print $1}'
+    lsblk -prno NAME,FSTYPE 2>/dev/null | awk '`$2 == "crypto_LUKS" {print `$1}'
 )
 
-for dev in "${luks_devices[@]}"; do
-'@)
-
-    #
-    # LUKS credentials
-    #
-    $scriptArray.Add(@"
-    if printf "%s\n%s\n"  "$($script:Config.curLuks)"  "$($script:Config.encryptionPin)" | dzdo cryptsetup luksAddKey  --force  --batch-mode  "$dev" &>/dev/null
-    then
-        luks_updated+=("`$dev")
+for dev in "`${luks_devices[@]}"; do
+    if printf "%s\n%s\n" '$CurrentPass' '$NewPin' | dzdo cryptsetup luksAddKey --force --batch-mode "`$dev" &>/dev/null; then
+        record_action 'DiskEncryption' "`$dev" 'Success'
     else
-        failed_luks+=("`$dev")
-        failures+=("Disk encryption '`$dev': failed to add LUKS key")
+        record_action 'DiskEncryption' "`$dev" 'Failed'
+        record_failure "Disk encryption `$dev: failed to add LUKS key"
     fi
 done
-"@)
+"@
+}
 
-    #
-    # Pick one Linux deployment representation per base user
-    #
-    $linuxUsers = foreach ($group in ($allUsers | Group-Object BaseName)) {
+
+function New-LinuxTask-AddUsers {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [array]$Users,
+        [string]$HomeBase = '/mobiles/home'
+    )
+
+    $userBlocks = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($u in $Users) {
+        $isWheel = $u.LinuxAccountType -eq [LinuxAccountType]::Wheel
+        $name = $u.LinuxName
+        $pwd  = $u.LinuxPassword
+        $desc = $u.Description
+
+        $block = @"
+# Provisioning: $name
+if id '$name' &>/dev/null; then
+    if dzdo usermod -p '$pwd' '$name' &>/dev/null; then
+        record_action 'User' '$name' 'Existed'
+    else
+        record_action 'User' '$name' 'Failed'
+        record_failure 'User "$name": failed to update account'
+    fi
+else
+    if dzdo useradd -m -b '$HomeBase' -c '$desc' -p '$pwd' '$name' &>/dev/null; then
+        record_action 'User' '$name' 'Success'
+    else
+        record_action 'User' '$name' 'Failed'
+        record_failure 'User "$name": failed to create account'
+    fi
+fi
+"@
+        if ($isWheel) {
+            $block += @"
+
+if id '$name' &>/dev/null; then
+    if dzdo usermod -aG wheel '$name' &>/dev/null; then
+        record_action 'Privilege' '${name}:wheel' 'Success'
+    else
+        record_action 'Privilege' '${name}:wheel' 'Failed'
+        record_failure 'Privilege "${name}:wheel": failed to assign wheel'
+    fi
+else
+    record_action 'Privilege' '${name}:wheel' 'Failed'
+    record_failure 'Privilege "${name}:wheel": user does not exist'
+fi
+"@
+        }
+
+        if ($u.MustChangePassword) {
+            $block += @"
+
+if id '$name' &>/dev/null; then
+    if dzdo chage -d 0 '$name' &>/dev/null; then
+        record_action 'PasswordExpiry' '$name' 'Success'
+    else
+        record_action 'PasswordExpiry' '$name' 'Failed'
+        record_failure 'Password expiry "$name": failed'
+    fi
+else
+    record_action 'PasswordExpiry' '$name' 'Failed'
+    record_failure 'Password expiry "$name": user does not exist'
+fi
+"@
+        }
+
+        $userBlocks.Add($block)
+    }
+
+    return ($userBlocks -join "`n`n")
+}
+
+
+
+
+function Get-LinuxDeployScript {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$AllUsers,
+
+        [Parameter()]
+        [switch]$SkipLuks,
+
+        [Parameter()]
+        [switch]$SkipLogrotate
+    )
+
+    # 1. Resolve users according to metadata priority
+    $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName)) {
         $group.Group |
             Where-Object { $null -ne $_.LinuxAccountType } |
-            Sort-Object {
-                $script:GroupMetadata[$_.GroupType].LinuxPriority
-            } -Descending |
+            Sort-Object { $script:GroupMetadata[$_.GroupType].LinuxPriority } -Descending |
             Select-Object -First 1
     }
 
-    #
-    # User provisioning
-    #
-    foreach ($u in $linuxUsers) {
-        $isWheel = $u.LinuxAccountType -eq [LinuxAccountType]::Wheel
+    # 2. Bash execution runtime + state logger
+    $header = @'
+#!/usr/bin/env bash
+set -o pipefail
 
-        $scriptArray.Add(@"
-#
-# User: $($u.LinuxName)
-#
-if id '$($u.LinuxName)' &>/dev/null; then
+declare -a actions_json=()
+declare -a failures=()
 
-    if dzdo usermod  -p '$($u.LinuxPassword)'  '$($u.LinuxName)' &>/dev/null
-    then
-        existing_users+=('$($u.LinuxName)')
+record_action() {
+    local category="$1"
+    local name="$2"
+    local status="$3"
+    local details="${4:-null}"
+
+    actions_json+=( "$(jq -n \
+        --arg cat "$category" \
+        --arg name "$name" \
+        --arg stat "$status" \
+        --argjson det "$details" \
+        '{
+            Category: $cat,
+             Name: $name,
+             Status: $stat,
+             Details: if ($det == "" then null else $det end)
+             
+        }'
+        )" )
+}
+
+record_failure() {
+    failures+=("$1")
+}
+array_to_json() {
+    if (( $# == 0 )); then
+        printf '[]'
     else
-        failed_users+=('$($u.LinuxName)')
-        failures+=('User "$($u.LinuxName)": failed to update account')
+        printf '%s\n' "$@" | jq -R . | jq -s .
     fi
+}
+'@
 
-else
-
-    if dzdo useradd  -m  -b "$mHome"  -c '$($u.Description)'  -p '$($u.LinuxPassword)'  '$($u.LinuxName)' &>/dev/null
-    then
-        created_users+=('$($u.LinuxName)')
-    else
-        failed_users+=('$($u.LinuxName)')
-        failures+=('User "$($u.LinuxName)": failed to create account')
-    fi
-
-fi
-"@)
-
-        #
-        # Wheel membership
-        #
-        if ($isWheel) {
-            $scriptArray.Add(@"
-if id '$($u.LinuxName)' &>/dev/null; then
-    if dzdo usermod -aG wheel '$($u.LinuxName)' &>/dev/null; then
-        wheel_users+=('$($u.LinuxName)')
-    else
-        failed_wheel_users+=('$($u.LinuxName)')
-        failures+=('Privilege "$($u.LinuxName):wheel": failed to assign wheel')
-    fi
-else
-    failed_wheel_users+=('$($u.LinuxName)')
-    failures+=('Privilege "$($u.LinuxName):wheel": user does not exist')
-fi
-"@)
-        }
-
-        #
-        # Password expiration
-        #
-        if ($u.MustChangePassword) {
-            $scriptArray.Add(@"
-if id '$($u.LinuxName)' &>/dev/null; then
-    if dzdo chage -d 0 '$($u.LinuxName)' &>/dev/null; then
-        expired_users+=('$($u.LinuxName)')
-    else
-        failed_expiry_users+=('$($u.LinuxName)')
-        failures+=('Password expiry "$($u.LinuxName)": failed')
-    fi
-else
-    failed_expiry_users+=('$($u.LinuxName)')
-    failures+=('Password expiry "$($u.LinuxName)": user does not exist')
-fi
-"@)
-        }
-    }
-
-    #
-    # JSON output
-    #
-    $scriptArray.Add(@'
-#
-# Build normalized action array.
-#
-actions="$(
-    jq -n \
-        --argjson created       "$(array_to_json "${created_users[@]}")" \
-        --argjson existing      "$(array_to_json "${existing_users[@]}")" \
-        --argjson failedUsers   "$(array_to_json "${failed_users[@]}")" \
-        --argjson wheel         "$(array_to_json "${wheel_users[@]}")" \
-        --argjson failedWheel   "$(array_to_json "${failed_wheel_users[@]}")" \
-        --argjson expired       "$(array_to_json "${expired_users[@]}")" \
-        --argjson failedExpiry  "$(array_to_json "${failed_expiry_users[@]}")" \
-        --argjson luks          "$(array_to_json "${luks_updated[@]}")" \
-        --argjson failedLuks    "$(array_to_json "${failed_luks[@]}")" \
-        --argjson timers        "$(array_to_json "${systemd_timers[@]}")" \
-        --argjson failedTimers  "$(array_to_json "${failed_timers[@]}")" \
-        '
-        [
-            (
-                $created[] |
-                {
-                    Category: "User",
-                    Name: .,
-                    Status: "Created",
-                    Details: null
-                }
-            ),
-
-            (
-                $existing[] |
-                {
-                    Category: "User",
-                    Name: .,
-                    Status: "Existed",
-                    Details: null
-                }
-            ),
-
-            (
-                $failedUsers[] |
-                {
-                    Category: "User",
-                    Name: .,
-                    Status: "Failed",
-                    Details: null
-                }
-            ),
-
-            (
-                $wheel[] |
-                {
-                    Category: "Privilege",
-                    Name: (. + ":wheel"),
-                    Status: "Success",
-                    Details: null
-                }
-            ),
-
-            (
-                $failedWheel[] |
-                {
-                    Category: "Privilege",
-                    Name: (. + ":wheel"),
-                    Status: "Failed",
-                    Details: null
-                }
-            ),
-
-            (
-                $expired[] |
-                {
-                    Category: "PasswordExpiry",
-                    Name: .,
-                    Status: "Success",
-                    Details: null
-                }
-            ),
-
-            (
-                $failedExpiry[] |
-                {
-                    Category: "PasswordExpiry",
-                    Name: .,
-                    Status: "Failed",
-                    Details: null
-                }
-            ),
-
-            (
-                $luks[] |
-                {
-                    Category: "DiskEncryption",
-                    Name: .,
-                    Status: "Success",
-                    Details: null
-                }
-            ),
-
-            (
-                $failedLuks[] |
-                {
-                    Category: "DiskEncryption",
-                    Name: .,
-                    Status: "Failed",
-                    Details: null
-                }
-            ),
-
-            (
-                $timers[] |
-                {
-                    Category: "ScheduledTask",
-                    Name: .,
-                    Status: "Success",
-                    Details: null
-                }
-            ),
-
-            (
-                $failedTimers[] |
-                {
-                    Category: "ScheduledTask",
-                    Name: .,
-                    Status: "Failed",
-                    Details: null
-                }
-            )
-        ]
-        '
-)"
+    $footer = @'
+# --- Result Serialization ---
+final_actions="[$(IFS=,; echo "${actions_json[*]}")]"
+final_failures="$(array_to_json "${failures[@]}" | jq -R . | jq -s .)"
 
 jq -n \
     --arg hostname "$(hostname -s)" \
     --argjson success "$([[ ${#failures[@]} -eq 0 ]] && echo true || echo false)" \
-    --argjson actions "$actions" \
-    --argjson failures "$(array_to_json "${failures[@]}")" \
+    --argjson actions "$final_actions" \
+    --argjson failures "$final_failures" \
     '{
         HostName: $hostname,
         Platform: "Linux",
@@ -1652,9 +1920,24 @@ jq -n \
         Actions: $actions,
         Failures: $failures
     }'
-'@)
+'@
 
-    return ($scriptArray -join "`n`n")
+    # 3. Assemble tasks pipeline dynamically
+    $tasks = [System.Collections.Generic.List[string]]::new()
+    $tasks.Add($header)
+
+    $tasks.Add((New-LinuxTask-CreateDirectory -Path '/mobiles/home'))
+
+    if (-not $SkipLogrotate) { $tasks.Add((New-LinuxTask-AddLogService )) }
+
+    if (-not $SkipLuks) { $tasks.Add((New-LinuxTask-Luks  -CurrentPass $script:Config.curLuks  -NewPin $script:Config.encryptionPin)) }
+
+    if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) }
+
+    # 4. Standardized JSON Output emitter
+    $tasks.Add($footer)
+
+    return ($tasks -join "`n`n")
 }
 
 ### END UTILS
@@ -1978,30 +2261,12 @@ function Format-HostCollector {
         $columns = @(
             @{ Header = 'HOST';    Getter = { param($r) $r.HostName.ToUpper() } }
             @{ Header = 'OS';      Getter = { param($r) $r.Platform } }
-            @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel 
-                    } else { '-' 
-                    } } 
-            }
-            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs 
-                    } else { '-' 
-                    } } 
-            }
-            @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion 
-                    } else { '-' 
-                    } } 
-            }
-            @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License 
-                    } else { '-' 
-                    } } 
-            }
-            @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion) { $r.Summary.AdminRotateVersion 
-                    } else { '-' 
-                    } } 
-            }
-            @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount) { $r.Summary.PackageCount 
-                    } else { '-' 
-                    } } 
-            }
+            @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
+            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
+            @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
+            @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
+            @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion) { $r.Summary.AdminRotateVersion } else { '-' } } }
+            @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount) { $r.Summary.PackageCount } else { '-' } } }
             # @{ Header = 'CPU';     Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.Cores) { $r.Summary.Cores } else { '-' } } }
         )
 
@@ -2152,12 +2417,8 @@ function Get-MobileOverview {
         $passPath    = Join-Path $mobileDumpPath $u.Username
         $hasPassword = Test-Path $passPath
 
-        $statusText  = if ($hasPassword) { "[+] SET" 
-        } else { "[-] PENDING" 
-        }
-        $statusColor = if ($hasPassword) { 'Green' 
-        } else { 'DarkRed' 
-        }
+        $statusText  = if ($hasPassword) { "[+] SET" } else { "[-] PENDING" }
+        $statusColor = if ($hasPassword) { 'Green' } else { 'DarkRed' }
         $groups      = $u.Groups -join ', '
 
         Write-Host ("  {0,-18} {1,-18} {2,-24} " -f $u.Username, $groups, $u.Name) -ForegroundColor Yellow -NoNewline
@@ -2195,10 +2456,7 @@ function Get-MobileOverview {
             Initialize-Ssh-Environment -keyPath $sshKeyPath -nfsHome $nfsHome 
         }
 
-        $computerData = Invoke-InformationCollector `
-            -winComputers $data.Windows `
-            -linComputers $data.Linux `
-            -sshKeyPath $sshKeyPath
+        $computerData = Invoke-InformationCollector  -winComputers $data.Windows  -linComputers $data.Linux  -sshKeyPath $sshKeyPath
 
         $computerData | Format-HostCollector
 
@@ -2472,7 +2730,6 @@ function Format-DeploymentResults {
 
     Write-Host ""
     Write-Host "[USERS]" -ForegroundColor Cyan
-    Write-Host ""
 
     $userRows |
         Sort-Object Host, User |
@@ -2488,17 +2745,12 @@ function Format-DeploymentResults {
         [PSCustomObject]@{
             Host = $host
 
-            Privileges = Get-AggregateStatus `
-                -Result $result `
-                -Category 'Privilege'
+            # Privileges = Get-AggregateStatus  -Result $result  -Category 'Privilege'
+            NetworkSharing = Get-AggregateStatus -Result $result -Category 'NetworkSharing'
 
-            ScheduledTasks = Get-AggregateStatus `
-                -Result $result `
-                -Category 'ScheduledTask'
+            ScheduledTasks = Get-AggregateStatus  -Result $result  -Category 'ScheduledTask'
 
-            Encryption = Get-AggregateStatus `
-                -Result $result `
-                -Category 'DiskEncryption'
+            Encryption = Get-AggregateStatus  -Result $result  -Category 'DiskEncryption'
 
             DomainDisjoin = if ($result.Platform -eq 'Windows') {
                 Get-AggregateStatus `
@@ -2520,13 +2772,12 @@ function Format-DeploymentResults {
 
     Write-Host ""
     Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
-    Write-Host ""
 
     $taskRows |
         Sort-Object Host |
         Format-Table `
             Host,
-        Privileges,
+        NetworkSharing,
         ScheduledTasks,
         Encryption,
         DomainDisjoin,
@@ -2549,10 +2800,8 @@ function Format-DeploymentResults {
     if ($failureRows) {
         Write-Host ""
         Write-Host "[FAILURES]" -ForegroundColor Red
-        Write-Host ""
 
-        $failureRows |
-            Format-Table Host, Failure -AutoSize
+        $failureRows | Format-Table Host, Failure -AutoSize
     }
 }
 
@@ -2575,7 +2824,8 @@ function Start-MobileDeployment {
     )
 
     # $cfg = Get-MobileConfig $Config
-    Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
+    # Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
+    Initialize-Environment
     $mobileData = Get-MobileData -MobileName $MobileName 
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
@@ -2589,7 +2839,6 @@ function Start-MobileDeployment {
         Bitlocker = $defaultPin
 
     }
-    Write-Host $windowsPayload
 
     $winErrors = [System.Collections.Generic.List[object]]::new()
     $rawWindows = Invoke-Command `
@@ -2599,7 +2848,6 @@ function Start-MobileDeployment {
         -ErrorVariable winErrors `
         -ErrorAction SilentlyContinue
 
-    Write-Host "[+] Windows Finished"
 
     $winResults = @(
         foreach ($r in $rawWindows) {
