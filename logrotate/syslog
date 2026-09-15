@@ -1,0 +1,37 @@
+/var/log/cron
+/var/log/maillog
+/var/log/messages
+/var/log/secure
+/var/log/spooler
+{
+    daily
+    rotate 7
+    compress
+    missingok
+    sharedscripts
+    prerotate
+        # Signal auditd to rotate so its new file is ready to be collected
+        /usr/sbin/service auditd rotate >/dev/null 2>&1 || true
+        sleep 2
+    endscript
+    postrotate
+        /usr/bin/systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
+    endscript
+    lastaction
+        if mountpoint -q /mnt/nfs_archive; then
+            DEST="/mnt/nfs_archive/$(hostname)"
+            mkdir -p "$DEST/syslog" "$DEST/audit"
+
+            # Rsync options:
+            # -a: preserve timestamps, permissions, ownership
+            # --remove-source-files: delete local copy ONLY after confirmed sync
+            # --timeout=30: fail fast if NFS hangs to prevent blocking logrotate
+
+            # 1. Safely sync rotated syslog archives
+            find /var/log/ -maxdepth 1 -name "*-[0-9]*.gz" -exec rsync -a --timeout=30 --remove-source-files {} "$DEST/syslog/" +
+
+            # 2. Safely sync rotated audit logs
+            find /var/log/audit/ -name "audit.log.[0-9]*" -exec rsync -a --timeout=30 --remove-source-files {} "$DEST/audit/" +
+        fi
+    endscript
+}
