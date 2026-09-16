@@ -324,7 +324,11 @@ $script:WindowsDeployBlock = {
 
 
 $script:WindowsUnregisterBlock = {
-    param([PsCustomObject]$payload)
+    param([PSCustomObject]$payload)
+
+    $archive  = [bool]$payload.Archive
+    $allUsers = @($payload.AllUsers)
+    $taskData = @($payload.TaskData)
 
     $timeStamp   = (Get-Date).ToString('yyyyMMdd')
     $monthYear   = (Get-Date).ToString('MM-yyyy')
@@ -333,193 +337,126 @@ $script:WindowsUnregisterBlock = {
     $actions  = [System.Collections.Generic.List[object]]::new()
     $failures = [System.Collections.Generic.List[string]]::new()
 
-    # Generic step wrapper ensuring uniform action logging and failure capture
     function Invoke-Step {
         [CmdletBinding()]
         param(
+            [Parameter(Mandatory)][string]$Category,
             [Parameter(Mandatory)][string]$Name,
-            [Parameter(Mandatory)][scriptblock]$ScriptBlock,
-            [string]$Context = ""
+            [Parameter(Mandatory)][scriptblock]$ScriptBlock
         )
 
         try {
-            $result = & $ScriptBlock
-            if ($null -ne $result) {
-                $actions.Add([PSCustomObject]@{
-                        Name    = $Name
-                        Status  = if ($result.Status)  { $result.Status 
-                        } else { 'Changed' 
-                        }
-                        Details = if ($result.Details) { @($result.Details) 
-                        } else { @($result) 
-                        }
-                    })
-            }
+            $details = & $ScriptBlock
+
+            $actions.Add([PSCustomObject]@{
+                    Category = $Category
+                    Name     = $Name
+                    Status   = 'Success'
+                    Details  = $details
+                })
+
             return $true
         } catch {
-            $label = if ($Context) { "$Name [$Context]" 
-            } else { $Name 
-            }
-            $failures.Add("${label}: $($_.Exception.Message)")
+            $actions.Add([PSCustomObject]@{
+                    Category = $Category
+                    Name     = $Name
+                    Status   = 'Failed'
+                    Details  = $null
+                })
+
+            $failures.Add("${Category} '$Name': $($_.Exception.Message)")
             return $false
         }
     }
 
-    # 1. Archive Directory Setup
-    if ($payload.archive) {
-        Invoke-Step -Name 'ArchiveDirectory' -Context $archivePath -ScriptBlock {
+    $archiveReady = $true
+
+    if ($archive) {
+        $archiveReady = Invoke-Step -Category 'ArchiveDirectory' -Name $archivePath -ScriptBlock {
             if (-not (Test-Path $archivePath)) {
                 New-Item -ItemType Directory -Force -Path $archivePath -ErrorAction Stop | Out-Null
-                return @{ Status = 'Changed'; Details = "Created archive directory '$archivePath'" }
             }
-            return @{ Status = 'Ok'; Details = "Archive directory exists '$archivePath'" }
-        } | Out-Null
-    }
-
-    # 2. User Cleanup Pipeline (Archive -> Profile Removal -> Account Removal)
-    $removedUsers  = [System.Collections.Generic.List[string]]::new()
-    $missingUsers  = [System.Collections.Generic.List[string]]::new()
-    $archivedFiles = [System.Collections.Generic.List[string]]::new()
-
-    foreach ($u in $payload.AllUsers) {
-        $profilePath = "C:\Users\$($u.Name)"
-        $localUser   = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
-        $sid         = if ($localUser) { $localUser.SID.Value 
-        } else { $null 
-        }
-
-        # Step 2a: Archive profile if enabled
-        if ($archive -and (Test-Path $profilePath)) {
-            $archiveFile = Join-Path $archivePath "$($u.Name)-$timeStamp.zip"
-            $archiveOk   = Invoke-Step -Name 'ArchiveProfile' -Context $u.Name -ScriptBlock {
-                Compress-Archive `
-                    -Path $profilePath `
-                    -DestinationPath $archiveFile `
-                    -CompressionLevel Optimal `
-                    -Force `
-                    -ErrorAction Stop
-
-                $archivedFiles.Add($archiveFile)
-                return $null # Aggregated at the end
-            }
-
-            # If archive failed, skip removal to avoid data loss
-            if (-not $archiveOk) { continue 
-            }
-        }
-
-        # Step 2b: Remove Profile (CIM + Directory)
-        $profileOk = Invoke-Step -Name 'ProfileRemoval' -Context $u.Name -ScriptBlock {
-            $profileObject = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
-                Where-Object {
-                    ($sid -and $_.SID -eq $sid) -or $_.LocalPath -ieq $profilePath
-                }
-
-            if ($profileObject) {
-                $profileObject | Remove-CimInstance -ErrorAction Stop
-            }
-
-            if (Test-Path $profilePath) {
-                Remove-Item -Path $profilePath -Force -Recurse -ErrorAction Stop
-            }
-            return $null
-        }
-
-        # Preserve local account if profile removal failed
-        if (-not $profileOk) { continue 
-        }
-
-        # Step 2c: Remove Local User Account
-        if ($localUser) {
-            Invoke-Step -Name 'UserRemoval' -Context $u.Name -ScriptBlock {
-                Remove-LocalUser -Name $u.Name -ErrorAction Stop
-                $removedUsers.Add($u.Name)
-                return $null
-            } | Out-Null
-        } else {
-            $missingUsers.Add($u.Name)
         }
     }
 
-    # Aggregate User Actions
-    if ($archivedFiles.Count) {
-        $actions.Add([PSCustomObject]@{
-                Name    = 'ProfilesArchived'
-                Status  = 'Changed'
-                Details = $archivedFiles.ToArray()
-            })
-    }
+    foreach ($u in $allUsers) {
+        $name = $u.Name
+        $profilePath = "C:\Users\$name"
+        $localUser = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+        $sid = if ($localUser) { $localUser.SID.Value } else { $null }
 
-    if ($removedUsers.Count) {
-        $actions.Add([PSCustomObject]@{
-                Name    = 'UsersRemoved'
-                Status  = 'Changed'
-                Details = $removedUsers.ToArray()
-            })
-    }
-
-    if ($missingUsers.Count) {
-        $actions.Add([PSCustomObject]@{
-                Name    = 'UsersAbsent'
-                Status  = 'Ok'
-                Details = $missingUsers.ToArray()
-            })
-    }
-
-    # 3. Scheduled Tasks Cleanup
-    $tasksRemoved = [System.Collections.Generic.List[string]]::new()
-    $tasksMissing = [System.Collections.Generic.List[string]]::new()
-
-    foreach ($t in $payload.TaskData) {
-        $existingTask = Get-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue
-
-        if (-not $existingTask) {
-            $tasksMissing.Add($t.TaskName)
+        if ($archive -and -not $archiveReady) {
             continue
         }
 
-        Invoke-Step -Name 'ScheduledTaskRemoval' -Context $t.TaskName -ScriptBlock {
-            Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false -ErrorAction Stop
-            $tasksRemoved.Add($t.TaskName)
-            return $null
-        } | Out-Null
-    }
+        if ($archive -and (Test-Path $profilePath)) {
+            $archiveFile = Join-Path $archivePath "$name-$timeStamp.zip"
 
-    if ($tasksRemoved.Count) {
-        $actions.Add([PSCustomObject]@{
-                Name    = 'ScheduledTasks'
-                Status  = 'Changed'
-                Details = $tasksRemoved.ToArray()
-            })
-    }
-
-    if ($tasksMissing.Count) {
-        $actions.Add([PSCustomObject]@{
-                Name    = 'TasksAbsent'
-                Status  = 'Ok'
-                Details = $tasksMissing.ToArray()
-            })
-    }
-
-    # 4. Re-enable BitLocker via TPM
-    Invoke-Step -Name 'BitLockerProtector' -ScriptBlock {
-        $tpm = Get-Tpm -ErrorAction Stop
-
-        if ($tpm.TpmPresent -and $tpm.TpmEnabled) {
-            Enable-BitLocker -MountPoint 'C:' -TpmProtector -ErrorAction Stop | Out-Null
-            return @{
-                Status  = 'Changed'
-                Details = @('Restored TPM-only unlock')
+            $archiveOk = Invoke-Step -Category 'ProfileArchive' -Name $name -ScriptBlock {
+                Compress-Archive -Path $profilePath -DestinationPath $archiveFile -CompressionLevel Optimal -Force -ErrorAction Stop
+                $archiveFile
             }
+
+            if (-not $archiveOk) { continue }
         }
 
-        return @{
-            Status  = 'Ok'
-            Details = @('TPM unavailable or disabled')
+        if (Test-Path $profilePath) {
+            $profileOk = Invoke-Step -Category 'ProfileRemoval' -Name $name -ScriptBlock {
+                $profileObject = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object { ($sid -and $_.SID -eq $sid) -or $_.LocalPath -ieq $profilePath }
+
+                if ($profileObject) { $profileObject | Remove-CimInstance -ErrorAction Stop }
+                if (Test-Path $profilePath) { Remove-Item -Path $profilePath -Recurse -Force -ErrorAction Stop }
+            }
+
+            if (-not $profileOk) { continue }
+        }
+
+        if ($localUser) {
+            Invoke-Step -Category 'UserRemoval' -Name $name -ScriptBlock {
+                Remove-LocalUser -Name $name -ErrorAction Stop
+            } | Out-Null
+        } else {
+            $actions.Add([PSCustomObject]@{
+                    Category = 'UserRemoval'
+                    Name     = $name
+                    Status   = 'Success'
+                    Details  = 'Already absent'
+                })
+        }
+    }
+
+    foreach ($t in $taskData) {
+        $existingTask = Get-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue
+
+        if ($existingTask) {
+            Invoke-Step -Category 'ScheduledTask' -Name $t.TaskName -ScriptBlock {
+                Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false -ErrorAction Stop
+            } | Out-Null
+        } else {
+            $actions.Add([PSCustomObject]@{
+                    Category = 'ScheduledTask'
+                    Name     = $t.TaskName
+                    Status   = 'Success'
+                    Details  = 'Already absent'
+                })
+        }
+    }
+
+    Invoke-Step -Category 'DiskEncryption' -Name 'C:' -ScriptBlock {
+        $tpm = Get-Tpm -ErrorAction Stop
+
+        if (-not ($tpm.TpmPresent -and $tpm.TpmEnabled)) {
+            throw 'TPM is unavailable or disabled'
+        }
+
+        $volume = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
+        $hasTpm = @($volume.KeyProtector | Where-Object KeyProtectorType -eq 'Tpm').Count -gt 0
+
+        if (-not $hasTpm) {
+            Add-BitLockerKeyProtector -MountPoint 'C:' -TpmProtector -ErrorAction Stop | Out-Null
         }
     } | Out-Null
 
-    # Result Contract
     [PSCustomObject]@{
         Platform = 'Windows'
         Success  = ($failures.Count -eq 0)
@@ -952,8 +889,232 @@ function ConvertTo-BashArgument {
     param([string]$v)
     "'" + $v.Replace("'","'\''") + "'"
 }
+function Repair-GpoPermissions {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$GpoID
+    )
 
+    $cleanGuid = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
 
+    $rootDSE = [ADSI]"LDAP://RootDSE"
+    $namingContext = $rootDSE.defaultNamingContext
+    $policyContainer = "CN=Policies,CN=System,$namingContext"
+    $gpoLdapUri = "LDAP://CN=$cleanGuid,$policyContainer"
+
+    if (-not [System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
+        throw "GPO $cleanGuid not found in AD."
+    }
+
+    $gpoEntry = [System.DirectoryServices.DirectoryEntry]::new($gpoLdapUri)
+    $sec = $gpoEntry.ObjectSecurity
+
+    # Convert common identities to SIDs
+    $sidAuthUsers    = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-11")      # Authenticated Users
+    $sidDomainAdmins = [System.Security.Principal.NTAccount]::new("Domain Admins").Translate([System.Security.Principal.SecurityIdentifier])
+    $sidSystem       = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-18")      # NT AUTHORITY\SYSTEM
+    $sidEnterprise   = [System.Security.Principal.NTAccount]::new("Enterprise Admins").Translate([System.Security.Principal.SecurityIdentifier])
+
+    $applyGpoGuid = [Guid]"edacfc86-b327-11d2-9701-00c04fd91ab0"
+
+    # 1. Grant Domain Admins & SYSTEM Full Control on AD Container
+    $ruleDomainAdmin = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidDomainAdmins,
+        [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $ruleSystem = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidSystem,
+        [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $ruleEnterprise = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidEnterprise,
+        [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+
+    # 2. Grant Authenticated Users: Read + Apply Group Policy
+    $ruleAuthRead = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidAuthUsers,
+        [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $ruleAuthApply = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidAuthUsers,
+        [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+        [System.Security.AccessControl.AccessControlType]::Allow,
+        $applyGpoGuid
+    )
+
+    $sec.AddAccessRule($ruleDomainAdmin)
+    $sec.AddAccessRule($ruleSystem)
+    $sec.AddAccessRule($ruleEnterprise)
+    $sec.AddAccessRule($ruleAuthRead)
+    $sec.AddAccessRule($ruleAuthApply)
+
+    $gpoEntry.CommitChanges()
+
+    # 3. Match SYSVOL ACLs
+    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
+    $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGuid"
+
+    if (Test-Path $gpoSysvolPath) {
+        icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
+        icacls.exe $gpoSysvolPath /grant "Domain Admins:(OI)(CI)(F)" "SYSTEM:(OI)(CI)(F)" /T /C /Q 2>$null | Out-Null
+        icacls.exe $gpoSysvolPath /grant "Authenticated Users:(OI)(CI)(RX)" /T /C /Q 2>$null | Out-Null
+    }
+
+    Write-Host "[+] Fixed AD Container and SYSVOL ACLs for $cleanGuid" -ForegroundColor Green
+}
+
+function New-ShortcutGPO {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$targetOUFriendlyName,
+
+        [Parameter()]
+        [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
+
+        [Parameter()]
+        [string]$ShortcutName = "Mobile - Local Accounts Maker",
+
+        [Parameter()]
+        [string]$TargetPath = "C:\Supportbin\console.exe",
+
+        [Parameter()]
+        [string]$Arguments = "",
+
+        [Parameter()]
+        [string]$IconPath = "%SystemRoot%\system32\shell32.dll",
+
+        [Parameter()]
+        [int]$IconIndex = 15
+    )
+
+    $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
+    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
+    $gpoName = "Mobile Logon"
+
+    $RootDSE = [ADSI]"LDAP://RootDSE"
+    $ctx = $RootDSE.DefaultNamingContext
+    $PolicyContainer = "CN=Policies,CN=System,$ctx"
+    $targetOU_DN = "OU=$targetOUFriendlyName,$ctx"
+    $gpoLdapPath = "[LDAP://CN=$cleanGpoID,$PolicyContainer;0]"
+    $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
+
+    #
+    # 1. Active Directory Container (GPC)
+    #
+    $policiesContainer = [ADSI]"LDAP://$PolicyContainer"
+    $gpoLdapUri = "LDAP://CN=$cleanGpoID,$PolicyContainer"
+
+    if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
+        $gpoEntry = [ADSI]$gpoLdapUri
+    } else {
+        $gpoEntry = $policiesContainer.Create("groupPolicyContainer", "CN=$cleanGpoID")
+        $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
+        
+        # Clone parent container's security descriptor to prevent GPMC "Access Denied"
+        $parentSec = $policiesContainer.Properties["ntSecurityDescriptor"].Value
+        if ($parentSec) {
+            $gpoEntry.Properties["ntSecurityDescriptor"].Value = $parentSec
+        }
+    }
+
+    # EXACT GPP Shortcuts Extension String:
+    # [{00000000-0000-0000-0000-000000000000}{CAB54552-DE80-4D57-8186-31E36B182F36}] = GPP Core MMC
+    # [{C418DD59-6137-4768-B4F9-82C3E4EED97F}{0E390D38-7EE3-4EC0-8752-CB4482DC8881}] = Shortcuts CSE + Snap-in
+    $gppExtension = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
+    $userVer = 1
+    $versionNumber = ($userVer -shl 16) # User = 1, Computer = 0
+    $gpoEntry.Put("gPCFunctionalityVersion", 2)
+    $gpoEntry.Put("displayName", $gpoName)
+    $gpoEntry.Put("flags", 2) # Computer segment disabled
+    $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
+    $gpoEntry.Put("gPCUserExtensionNames", $gppExtension)
+    $gpoEntry.Put("versionNumber", $versionNumber)
+
+    if ($gpoEntry.Properties.Contains("gPCMachineExtensionNames") -and $gpoEntry.Properties["gPCMachineExtensionNames"].Value) {
+        $gpoEntry.PutEx(1, "gPCMachineExtensionNames", $null)
+    }
+
+    $gpoEntry.SetInfo()
+
+    #
+    # 2. SYSVOL Directory Structure
+    #
+    $userPrefPath = Join-Path $gpoSysvolPath "User\Preferences\Shortcuts"
+    $machinePath  = Join-Path $gpoSysvolPath "Machine"
+
+    @($userPrefPath, $machinePath) | ForEach-Object {
+        if (-not (Test-Path $_)) {
+            New-Item -Path $_ -ItemType Directory -Force | Out-Null
+        }
+    }
+
+    # Clean SYSVOL inheritance
+    try {
+        icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
+    } catch { }
+
+    #
+    # 3. gpt.ini
+    #
+    $gptIni = @"
+[General]
+Version=$versionNumber
+displayName=$gpoName
+"@
+    Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIni -Encoding Ascii
+
+    #
+    # 4. Shortcuts.xml (User Context)
+    #
+    $timeNow       = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+    $desktopUid    = [Guid]::NewGuid().ToString("B").ToUpper()
+    $startMenuUid  = [Guid]::NewGuid().ToString("B").ToUpper()
+
+    $xmlContent = @"
+<?xml version="1.0" encoding="utf-8"?>
+<Shortcuts clsid="{872ECB34-7144-49f3-8CE0-492F266F3134}">
+  <Shortcut clsid="{0DCA7FFD-8C39-44be-9043-392D666E61E8}" name="$ShortcutName" status="$ShortcutName" image="0" changed="$timeNow" uid="$desktopUid">
+    <Properties action="U" comment="" disabled="0" hotkey="0" iconIndex="$IconIndex" iconPath="$IconPath" targetType="FILESYSTEM" targetPath="$TargetPath" arguments="$Arguments" workingDir="" run="NORMAL" lnkFilePath="%DesktopDir%\$ShortcutName.lnk" startIn="" windowStyle="NORMAL" />
+  </Shortcut>
+  <Shortcut clsid="{0DCA7FFD-8C39-44be-9043-392D666E61E8}" name="$ShortcutName" status="$ShortcutName" image="0" changed="$timeNow" uid="$startMenuUid">
+    <Properties action="U" comment="" disabled="0" hotkey="0" iconIndex="$IconIndex" iconPath="$IconPath" targetType="FILESYSTEM" targetPath="$TargetPath" arguments="$Arguments" workingDir="" run="NORMAL" lnkFilePath="%StartMenuDir%\$ShortcutName.lnk" startIn="" windowStyle="NORMAL" />
+  </Shortcut>
+</Shortcuts>
+"@
+
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText((Join-Path $userPrefPath "Shortcuts.xml"), $xmlContent.Trim(), $utf8NoBom)
+
+    #
+    # 5. Link GPO to target OU
+    #
+    if ([System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
+        $targetOU = [ADSI]"LDAP://$targetOU_DN"
+        $existingLinks = $targetOU.Properties['gPLink'].Value
+        if ($existingLinks) {
+            if ($existingLinks -notlike "*$cleanGpoID*") {
+                $targetOU.Properties['gPLink'].Value = "$gpoLdapPath$existingLinks"
+            }
+        } else {
+            $targetOU.Properties['gPLink'].Value = $gpoLdapPath
+        }
+
+        if (-not $targetOU.Properties['gPOptions'].Value) {
+            $targetOU.Properties['gPOptions'].Value = 0
+        }
+
+        $targetOU.SetInfo()
+    }
+
+    Write-Host "[+] Shortcut GPO configured and linked successfully: $cleanGpoID" -ForegroundColor Green
+}
 
 function New-CustomGPO {
     [CmdletBinding()]
@@ -1209,11 +1370,12 @@ function Initialize-Environment {
         [Parameter()][string]$AdminRoot    = $Script:Config.AdminRoot,
         [Parameter()][string]$MobileDump   = $Script:Config.MobileDump,
         [Parameter()][string]$MobileEntries= $Script:Config.MobileEntries,
-        [Parameter()][string]$CertName     = ($Script:Config.CertName ? $Script:Config.CertName : 'MobileDeployer'),
-        [Parameter()][switch]$HaltOnError
+        [Parameter()][string]$CertName      = $(if ($Script:Config.CertName) { $Script:Config.CertName } else { 'MobileDeployer' }),
+        [Parameter()][switch]$HaltOnError,
+        [Parameter()][switch]$Console
     )
 
-    Write-Host "`n[+] Executing System Pre-Flight & Provisioning..." -ForegroundColor Cyan
+    if ($console) { Write-Host "`n[+] Executing System Requirements & Provisioning..." -ForegroundColor Cyan }
     $results = [System.Collections.Generic.List[object]]::new()
 
     # 1. Directory Structure Mapping
@@ -1242,17 +1404,20 @@ function Initialize-Environment {
         'FAILED'   = 'Red'
     }
 
-    Write-Host ""
-    Write-Host ("  {0,-20} {1,-10} {2}" -f 'COMPONENT', 'STATUS', 'DETAILS') -ForegroundColor DarkGray
-    Write-Host ("  {0,-20} {1,-10} {2}" -f ('-' * 20), ('-' * 10), ('-' * 45)) -ForegroundColor DarkGray
+    if ($console) {
+        Write-Host ""
+        Write-Host ("  {0,-20} {1,-10} {2}" -f 'COMPONENT', 'STATUS', 'DETAILS') -ForegroundColor DarkGray
+        Write-Host ("  {0,-20} {1,-10} {2}" -f ('-' * 20), ('-' * 10), ('-' * 45)) -ForegroundColor DarkGray
 
-    foreach ($r in $results) {
-        $color = $colorMap[$r.Status]
-        Write-Host ("  {0,-20} " -f $r.Component) -NoNewline
-        Write-Host ("[{0,-8}]" -f $r.Status) -ForegroundColor $color -NoNewline
-        Write-Host (" {0}" -f $r.Details)
+
+        foreach ($r in $results) {
+            $color = $colorMap[$r.Status]
+            Write-Host ("  {0,-20} " -f $r.Component) -NoNewline
+            Write-Host ("[{0,-8}]" -f $r.Status) -ForegroundColor $color -NoNewline
+            Write-Host (" {0}" -f $r.Details)
+        }
+        Write-Host ""
     }
-    Write-Host ""
 
     #
     # Final Validation Guard
@@ -1267,7 +1432,7 @@ function Initialize-Environment {
         return $false
     }
 
-    Write-Host "[+] All dependencies satisfied. Environment ready for deployment." -ForegroundColor Green
+    if ($console) { Write-Host "[+] All dependencies satisfied. Environment ready for deployment." -ForegroundColor Green}
     return $true
 }
 
@@ -3783,49 +3948,164 @@ function Write-MobileFile {
 }
 
 
+function New-LinuxUnregisterTask-LogService {
+    [CmdletBinding()]
+    param()
+
+    return @'
+# Task: Remove Log Rotation Service
+
+mobile_units=(
+    'mobile-logrotate.timer'
+    'mobile-logrotate.service'
+)
+
+unitFailure=false
+
+for unit in "${mobile_units[@]}"; do
+
+    unitPath="/etc/systemd/system/$unit"
+
+    #
+    # Already absent satisfies desired state.
+    #
+    if [[ ! -e "$unitPath" ]]; then
+        continue
+    fi
+
+    dzdo systemctl disable --now "$unit" &>/dev/null
+
+    if dzdo rm -f "$unitPath" &>/dev/null; then
+        :
+    else
+        unitFailure=true
+        record_failure "Scheduled task '$unit': failed to remove unit file"
+    fi
+done
+
+if dzdo systemctl daemon-reload &>/dev/null; then
+    :
+else
+    unitFailure=true
+    record_failure 'Systemd: daemon-reload failed'
+fi
+
+if [[ "$unitFailure" == false ]]; then
+    record_action 'ScheduledTask' 'mobile-logrotate' 'Success'
+else
+    record_action 'ScheduledTask' 'mobile-logrotate' 'Failed'
+fi
+'@
+}
+
+function New-LinuxUnregisterTask-Users {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [array]$Users,
+
+        [bool]$Archive = $true,
+
+        [string]$HomeBase = '/mobiles/home',
+
+        [string]$ArchiveRoot = '/mobiles/archive'
+    )
+
+    $blocks = [System.Collections.Generic.List[string]]::new()
+
+    $archiveValue = $Archive.ToString().ToLowerInvariant()
+
+    $blocks.Add(@"
+archive=$archiveValue
+mobileHome='$HomeBase'
+archiveRoot='$ArchiveRoot'
+
+monthYear=`$(date '+%m-%Y')
+timeStamp=`$(date '+%Y%m%d')
+archivePath="`$archiveRoot/`$monthYear"
+
+if [[ "`$archive" == true ]]; then
+    if dzdo mkdir -p "`$archivePath" &>/dev/null; then
+        record_action 'ArchiveDirectory' "`$archivePath" 'Success'
+    else
+        record_action 'ArchiveDirectory' "`$archivePath" 'Failed'
+        record_failure "Archive directory '`$archivePath': failed to create"
+    fi
+fi
+"@)
+
+    foreach ($u in $Users) {
+        $name = $u.LinuxName
+
+        $blocks.Add(@"
+# Task: Remove User: $name
+
+username='$name'
+homePath="`$mobileHome/`$username"
+canRemove=true
+
+#
+# Archive the profile first, if requested.
+#
+if [[ "`$archive" == true && -d "`$homePath" ]]; then
+    archiveFile="`$archivePath/`$username-`$timeStamp.tar.gz"
+
+    if dzdo tar -czf "`$archiveFile" -C "`$(dirname "`$homePath")" "`$(basename "`$homePath")" &>/dev/null; then
+        record_action 'ProfileArchive' "`$username" 'Success'
+    else
+        record_action 'ProfileArchive' "`$username" 'Failed'
+        record_failure "Profile archive '`$username': failed"
+        canRemove=false
+    fi
+fi
+
+#
+# Remove the account.
+#
+if id "`$username" &>/dev/null; then
+    if [[ "`$canRemove" == true ]]; then
+        if dzdo userdel -r "`$username" &>/dev/null; then
+            record_action 'UserRemoval' "`$username" 'Success'
+        else
+            record_action 'UserRemoval' "`$username" 'Failed'
+            record_failure "User removal '`$username': failed"
+        fi
+    fi
+else
+    record_action 'UserRemoval' "`$username" 'Success'
+
+    #
+    # userdel can't clean an orphaned home.
+    #
+    if [[ -d "`$homePath" && "`$canRemove" == true ]]; then
+        if dzdo rm -rf -- "`$homePath" &>/dev/null; then
+            record_action 'ProfileRemoval' "`$username" 'Success'
+        else
+            record_action 'ProfileRemoval' "`$username" 'Failed'
+            record_failure "Profile removal '`$username': failed"
+        fi
+    fi
+fi
+"@)
+    }
+
+    return ($blocks -join "`n`n")
+}
+
 function Get-LinuxUnregisterScript {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [array]$AllUsers,
 
-        [Parameter()]
-        [bool]$Archive = $true
+        [bool]$Archive = $true,
+
+        [switch]$SkipLogrotate
     )
 
-    $scriptArray = [System.Collections.Generic.List[string]]::new()
-
-    $archiveValue = if ($Archive) { 'true' 
-    } else { 'false' 
-    }
-
-    $scriptArray.Add(@"
-#!/usr/bin/env bash
-
-archive=$archiveValue
-
-monthYear=`$(date '+%m-%Y')
-timeStamp=`$(date '+%Y%m%d')
-
-mobileHome='/mobiles/home'
-archiveRoot='/mobiles/archive'
-archivePath="`$archiveRoot/`$monthYear"
-
-declare -a removed_users=()
-declare -a missing_users=()
-declare -a archived_users=()
-declare -a removed_tasks=()
-declare -a missing_tasks=()
-declare -a failures=()
-
-if [[ "`$archive" == true ]]; then
-    if ! dzdo mkdir -p "`$archivePath"; then
-        failures+=("archive-directory:`$archivePath")
-    fi
-fi
-
-"@)
-
+    #
+    # Resolve canonical Linux account for each user.
+    #
     $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName)) {
         $group.Group |
             Where-Object { $null -ne $_.LinuxAccountType } |
@@ -3835,179 +4115,85 @@ fi
             Select-Object -First 1
     }
 
+    $header = @'
+#!/usr/bin/env bash
+set -o pipefail
 
-    foreach ($u in $linuxUsers) {
-        $scriptArray.Add(@"
-username='$($u.LinuxName)'
-homePath="`$mobileHome/`$username"
+declare -a actions_json=()
+declare -a failures=()
 
-if id "`$username" &>/dev/null; then
+record_action() {
+    local category="$1"
+    local name="$2"
+    local status="$3"
+    local details="${4:-}"
 
-    #
-    # Archive before destructive cleanup
-    #
-    if [[ "`$archive" == true && -d "`$homePath" ]]; then
-        archiveFile="`$archivePath/`$username-`$timeStamp.tar.gz"
+    actions_json+=( "$(jq -cn \
+        --arg cat "$category" \
+        --arg name "$name" \
+        --arg stat "$status" \
+        --arg det "$details" \
+        '{
+            Category: $cat,
+            Name: $name,
+            Status: $stat,
+            Details: (if $det == "" then null else $det end)
+        }')" )
+}
 
-        if dzdo tar -czf "`$archiveFile" -C "`$(dirname "`$homePath")" "`$(basename "`$homePath")"; then
-            archived_users+=("`$username")
-        else
-            failures+=("archive:`$username")
-            continue
-        fi
-    fi
+record_failure() {
+    failures+=("$1")
+}
 
-    #
-    # Remove account and home
-    #
-    if dzdo userdel -r "`$username"; then
-        removed_users+=("`$username")
-    else
-        failures+=("user:`$username")
-    fi
-
-else
-    missing_users+=("`$username")
-
-    #
-    # Account may already be gone while home remains.
-    # Preserve/archive it before cleanup.
-    #
-    if [[ -d "`$homePath" ]]; then
-
-        if [[ "`$archive" == true ]]; then
-            archiveFile="`$archivePath/`$username-`$timeStamp.tar.gz"
-
-            if dzdo tar -czf "`$archiveFile" -C "`$(dirname "`$homePath")" "`$(basename "`$homePath")"; then
-                archived_users+=("`$username")
-            else
-                failures+=("archive:`$username")
-                continue
-            fi
-        fi
-
-        if ! dzdo rm -rf -- "`$homePath"; then
-            failures+=("profile:`$username")
-        fi
-    fi
-fi
-
-"@)
-    }
-
-    $scriptArray.Add(@'
-#
-# Remove mobile-specific systemd units.
-#
-mobile_units=(
-    "mobile-logrotate.timer"
-    "mobile-logrotate.service"
-)
-
-for unit in "${mobile_units[@]}"; do
-    if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit"; then
-
-        if dzdo systemctl disable --now "$unit" >/dev/null 2>&1; then
-            if dzdo rm -f "/etc/systemd/system/$unit"; then
-                removed_tasks+=("$unit")
-            else
-                failures+=("unit-file:$unit")
-            fi
-        else
-            failures+=("unit:$unit")
-        fi
-
-    else
-        missing_tasks+=("$unit")
-    fi
-done
-
-dzdo systemctl daemon-reload >/dev/null 2>&1 || failures+=("systemd:daemon-reload")
-
-
-#
-# Emit structured result.
-#
-to_json_array()
-{
-    if (($# == 0)); then
+array_to_json() {
+    if (( $# == 0 )); then
         printf '[]'
     else
-        printf '%s\n' "$@" |
-            jq -Rsc 'split("\n")[:-1]'
+        printf '%s\n' "$@" | jq -R . | jq -s .
     fi
 }
+'@
 
-created_json=$(to_json_array "${removed_users[@]}")
-missing_json=$(to_json_array "${missing_users[@]}")
-archive_json=$(to_json_array "${archived_users[@]}")
-tasks_json=$(to_json_array "${removed_tasks[@]}")
-missing_tasks_json=$(to_json_array "${missing_tasks[@]}")
-failures_json=$(to_json_array "${failures[@]}")
+    $tasks = [System.Collections.Generic.List[string]]::new()
+    $tasks.Add($header)
+
+    if ($linuxUsers) {
+        $tasks.Add(
+            (New-LinuxUnregisterTask-Users `
+                -Users $linuxUsers `
+                -Archive $Archive)
+        )
+    }
+
+    if (-not $SkipLogrotate) {
+        $tasks.Add(
+            (New-LinuxUnregisterTask-LogService)
+        )
+    }
+
+    $footer = @'
+# --- Result Serialization ---
+
+final_actions="[$(IFS=,; echo "${actions_json[*]}")]"
+final_failures="$(array_to_json "${failures[@]}")"
 
 jq -n \
-    --arg hostname "$(hostname)" \
-    --argjson removed "$created_json" \
-    --argjson missing "$missing_json" \
-    --argjson archived "$archive_json" \
-    --argjson tasks "$tasks_json" \
-    --argjson missingTasks "$missing_tasks_json" \
-    --argjson failures "$failures_json" \
-'
-{
-    HostName: $hostname,
-    Platform: "Linux",
-    Success: (($failures | length) == 0),
+    --arg hostname "$(hostname -s)" \
+    --argjson success "$([[ ${#failures[@]} -eq 0 ]] && echo true || echo false)" \
+    --argjson actions "$final_actions" \
+    --argjson failures "$final_failures" \
+    '{
+        HostName: $hostname,
+        Platform: "Linux",
+        Success: $success,
+        Actions: $actions,
+        Failures: $failures
+    }'
+'@
 
-    Actions: [
-        {
-            Name: "ProfilesArchived",
-            Status: (
-                if ($archived | length) > 0
-                then "Changed"
-                else "Ok"
-                end
-            ),
-            Details: $archived
-        },
-        {
-            Name: "UsersRemoved",
-            Status: (
-                if ($removed | length) > 0
-                then "Changed"
-                else "Ok"
-                end
-            ),
-            Details: $removed
-        },
-        {
-            Name: "UsersAbsent",
-            Status: "Ok",
-            Details: $missing
-        },
-        {
-            Name: "SystemdUnits",
-            Status: (
-                if ($tasks | length) > 0
-                then "Changed"
-                else "Ok"
-                end
-            ),
-            Details: $tasks
-        },
-        {
-            Name: "UnitsAbsent",
-            Status: "Ok",
-            Details: $missingTasks
-        }
-    ],
+    $tasks.Add($footer)
 
-    Failures: $failures
-}
-'
-'@)
-
-    return $scriptArray -join "`n"
+    return ($tasks -join "`n`n")
 }
 
 function Unregister-Deployment {
@@ -4145,7 +4331,7 @@ function Unregister-Deployment {
         )
     }
 
-    Format-DeploymentResults (@($winResults) + @($linResults))
+    Format-DeploymentResults (@($winResults) + @($linResults)) -AllUsers $mobileData.AllUsers
 
 
 }

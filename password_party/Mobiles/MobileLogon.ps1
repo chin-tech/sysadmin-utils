@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
     Logon-triggered script. If the current user appears in the [users]
-    section of any mobile entry, prompts once for a password and writes a
-    CMS-encrypted credential file for later pickup by Get-UserCreds /
-    Unprotect-CmsMessage on the admin host. If the user isn't found
-    anywhere, exits silently.
+    section of any mobile entry, prompts once (or once per account) for
+    passwords and writes a CMS-encrypted credential file for later pickup
+    by Get-UserCreds / Unprotect-CmsMessage on the admin host. If the user
+    isn't found anywhere, exits silently.
 
 .DESCRIPTION
     This is the "client-side" half of the deployer credential flow:
@@ -19,10 +19,14 @@
     Every mobile entry under MobileEntriesPath is scanned for a [users]
     row whose username matches the current user. A user can appear in
     more than one mobile, or under a groups value that expands to more
-    than one local account (see Set-Groups). All matches are collected,
-    the password is entered ONCE, and every derived account-name variant
-    is written into a single encrypted file so Get-UserCreds can pick the
-    right line no matter which mobile it's provisioning.
+    than one local account (see Set-Groups). All matches are collected.
+
+    When more than one account variant is derived, the user is asked
+    whether to use a single shared password for all of them or set a
+    distinct password per account. Every prompt clearly states which
+    account(s) the password being entered applies to. All resulting
+    lines are written into a single encrypted file so Get-UserCreds can
+    pick the right line no matter which mobile it's provisioning.
 
     Because this script never has the private key, it can only overwrite a
     user's credential file, not append to it -- appending would require
@@ -50,17 +54,13 @@ param(
     [PSCustomObject]$Config,
 
     [Parameter()]
-    [string]$MobileEntriesPath = $(if ($Config)
-        { $Config.MobileEntries 
-        } else
-        { $null 
+    [string]$MobileEntriesPath = $(if ($Config) { $Config.MobileEntries
+        } else { $null
         }),
 
     [Parameter()]
-    [string]$MobileDumpPath = $(if ($Config)
-        { $Config.MobileDump 
-        } else
-        { $null 
+    [string]$MobileDumpPath = $(if ($Config) { $Config.MobileDump
+        } else { $null
         }),
 
     # Optional override: pass a base64 blob at call time instead of the embedded one below.
@@ -86,27 +86,23 @@ PASTE_YOUR_BASE64_CERT_BLOB_HERE
 '@
 
 # --- Preconditions ---
-if ([string]::IsNullOrWhiteSpace($MobileEntriesPath))
-{
+if ([string]::IsNullOrWhiteSpace($MobileEntriesPath)) {
     Write-Error "No MobileEntriesPath resolved. Pass -MobileEntriesPath explicitly or -Config with a .MobileEntries property."
     return
 }
 
-if ([string]::IsNullOrWhiteSpace($MobileDumpPath))
-{
+if ([string]::IsNullOrWhiteSpace($MobileDumpPath)) {
     Write-Error "No MobileDumpPath resolved. Pass -MobileDumpPath explicitly or -Config with a .MobileDump property."
     return
 }
 
-if (-not (Test-Path $MobileEntriesPath))
-{
+if (-not (Test-Path $MobileEntriesPath)) {
     # Nothing to scan -- fail quiet-ish since this runs unattended at every logon.
     Write-Verbose "MobileEntriesPath '$MobileEntriesPath' does not exist. Nothing to do."
     return
 }
 
-if (-not (Test-Path $MobileDumpPath))
-{
+if (-not (Test-Path $MobileDumpPath)) {
     New-Item -ItemType Directory -Path $MobileDumpPath -Force | Out-Null
 }
 
@@ -114,8 +110,7 @@ if (-not (Test-Path $MobileDumpPath))
 # NOTE: kept intentionally identical to the module's behavior, including the
 # early-return quirk on 'i*'/'t*' matches (they skip the default "local"
 # entry, unlike 'p*'/'d*rw'/'d*ro' which append to it).
-function Set-Groups
-{
+function Set-Groups {
     [CmdletBinding()]
     param(
         [Parameter(Position = 0)]
@@ -123,29 +118,21 @@ function Set-Groups
     )
 
     $grps = @("local")
-    if ($Groups.Length -eq 0)
-    {
+    if ($Groups.Length -eq 0) {
         return $grps
     }
 
-    foreach ($g in $Groups)
-    {
-        switch -WildCard ($g)
-        {
-            'i*'
-            { return @('isso') 
+    foreach ($g in $Groups) {
+        switch -WildCard ($g) {
+            'i*' { return @('isso')
             }
-            't*'
-            { return @('adm') 
+            't*' { return @('adm')
             }
-            'p*'
-            { $grps += @("priv") 
+            'p*' { $grps += @("priv")
             }
-            'd*rw'
-            { $grps += @("dtrw") 
+            'd*rw' { $grps += @("dtrw")
             }
-            'd*ro'
-            { $grps += @("dtro") 
+            'd*ro' { $grps += @("dtro")
             }
         }
     }
@@ -153,8 +140,7 @@ function Set-Groups
 }
 
 # --- Scan every mobile entry for a [users] row matching the current user ---
-function Find-UserMobileAssignments
-{
+function Find-UserMobileAssignments {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$MobileEntriesPath,
@@ -164,47 +150,36 @@ function Find-UserMobileAssignments
     $assignments = [System.Collections.Generic.List[object]]::new()
     $entryFiles = Get-ChildItem -Path $MobileEntriesPath -File -ErrorAction SilentlyContinue
 
-    foreach ($entryFile in $entryFiles)
-    {
+    foreach ($entryFile in $entryFiles) {
         $currentSection = $null
         $sections = @{}
 
-        foreach ($line in Get-Content $entryFile.FullName)
-        {
+        foreach ($line in Get-Content $entryFile.FullName) {
             $trimmed = $line.Trim()
-            if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#') -or $trimmed.StartsWith(';'))
-            {
+            if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#') -or $trimmed.StartsWith(';')) {
                 continue
             }
-            if ($trimmed -match '^\[(?<Header>.+)\]$')
-            {
+            if ($trimmed -match '^\[(?<Header>.+)\]$') {
                 $currentSection = $Matches.Header
-                if (-not $sections.ContainsKey($currentSection))
-                {
+                if (-not $sections.ContainsKey($currentSection)) {
                     $sections[$currentSection] = [System.Collections.Generic.List[string]]::new()
                 }
                 continue
             }
-            if ($null -ne $currentSection)
-            {
+            if ($null -ne $currentSection) {
                 $sections[$currentSection].Add($trimmed)
             }
         }
 
-        if (-not $sections.ContainsKey('users'))
-        {
+        if (-not $sections.ContainsKey('users')) {
             continue
         }
 
         $rows = $sections['users'] | ConvertFrom-Csv
-        foreach ($row in $rows)
-        {
-            if ($row.username -ieq $UserName)
-            {
-                $groups = if ($row.groups)
-                { $row.groups -split ';' 
-                } else
-                { @() 
+        foreach ($row in $rows) {
+            if ($row.username -ieq $UserName) {
+                $groups = if ($row.groups) { $row.groups -split ';'
+                } else { @()
                 }
                 $assignments.Add([PSCustomObject]@{
                         MobileName = $entryFile.BaseName
@@ -217,10 +192,282 @@ function Find-UserMobileAssignments
     return $assignments
 }
 
+# --- Shared "are you sure" prompt, reused by every dialog below ---
+function Confirm-CancelDeployment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$MobileList
+    )
+
+    $result = [System.Windows.Forms.MessageBox]::Show(
+        "You are assigned to a mobile ($MobileList) and a password is required to continue deployment. Cancel anyway?",
+        "Exit", "YesNo", "Warning"
+    )
+    return ($result -eq 'Yes')
+}
+
+# --- Shared visual style for the dialogs below ---
+$script:AccentColor  = [System.Drawing.Color]::FromArgb(0, 99, 177)
+$script:MutedColor   = [System.Drawing.Color]::FromArgb(110, 110, 110)
+$script:DividerColor = [System.Drawing.Color]::FromArgb(225, 225, 225)
+$script:BodyFont     = New-Object System.Drawing.Font("Segoe UI", 9.5)
+$script:BoldFont     = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
+$script:HeaderFont   = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
+$script:TargetFont   = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
+
+# Builds a form with a colored header banner already attached, so every
+# dialog shares the same look. Returns the form; caller adds their own
+# controls starting below the banner (banner is 56px tall).
+function New-StyledForm {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][int]$Width,
+        [Parameter(Mandatory = $true)][int]$Height,
+        [Parameter(Mandatory = $true)][string]$HeaderText
+    )
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $Title
+    $form.Size = New-Object System.Drawing.Size($Width, $Height)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.Topmost = $true
+    $form.BackColor = [System.Drawing.Color]::White
+    $form.Font = $script:BodyFont
+
+    $banner = New-Object System.Windows.Forms.Panel
+    $banner.BackColor = $script:AccentColor
+    $banner.Location = New-Object System.Drawing.Point(0, 0)
+    $banner.Size = New-Object System.Drawing.Size($Width, 56)
+    $form.Controls.Add($banner)
+
+    $bannerLabel = New-Object System.Windows.Forms.Label
+    $bannerLabel.ForeColor = [System.Drawing.Color]::White
+    $bannerLabel.Font = $script:HeaderFont
+    $bannerLabel.BackColor = [System.Drawing.Color]::Transparent
+    $bannerLabel.Location = New-Object System.Drawing.Point(20, 13)
+    $bannerLabel.Size = New-Object System.Drawing.Size(($Width - 40), 30)
+    $bannerLabel.Text = $HeaderText
+    $banner.Controls.Add($bannerLabel)
+
+    return $form
+}
+
+# Flat, colored button matching the banner style. Use -Primary for the
+# main call-to-action; omit it for a neutral gray button.
+function New-AccentButton {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][System.Drawing.Point]$Location,
+        [Parameter(Mandatory = $true)][System.Drawing.Size]$Size,
+        [switch]$Primary
+    )
+
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text = $Text
+    $btn.Location = $Location
+    $btn.Size = $Size
+    $btn.FlatStyle = 'Flat'
+    $btn.FlatAppearance.BorderSize = 0
+    $btn.Font = $script:BoldFont
+    $btn.Cursor = [System.Windows.Forms.Cursors]::Hand
+
+    if ($Primary) {
+        $btn.BackColor = $script:AccentColor
+        $btn.ForeColor = [System.Drawing.Color]::White
+    } else {
+        $btn.BackColor = [System.Drawing.Color]::FromArgb(230, 230, 230)
+        $btn.ForeColor = [System.Drawing.Color]::FromArgb(40, 40, 40)
+    }
+
+    return $btn
+}
+
+# --- Asks which password strategy to use. Only shown when there's more
+#     than one account variant -- with a single account there's nothing
+#     to choose between. Returns 'Same', 'Different', or $null on cancel. ---
+function Get-PasswordMode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$MobileList,
+        [Parameter(Mandatory = $true)][string[]]$AccountVariants
+    )
+
+    $form = New-StyledForm -Title "Password Mode" -Width 440 -Height 300 -HeaderText "Choose Password Mode"
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Location = New-Object System.Drawing.Point(24, 68)
+    $label.Size = New-Object System.Drawing.Size(390, 65)
+    $label.ForeColor = $script:MutedColor
+    $label.Text = "Assigned to: $MobileList`n`nThis covers $($AccountVariants.Count) accounts: $($AccountVariants -join ', ')"
+    $form.Controls.Add($label)
+
+    $radioSame = New-Object System.Windows.Forms.RadioButton
+    $radioSame.Text = "Use ONE password for all $($AccountVariants.Count) accounts"
+    $radioSame.Location = New-Object System.Drawing.Point(26, 148)
+    $radioSame.Size = New-Object System.Drawing.Size(390, 22)
+    $radioSame.Checked = $true
+    $form.Controls.Add($radioSame)
+
+    $radioDiff = New-Object System.Windows.Forms.RadioButton
+    $radioDiff.Text = "Set a DIFFERENT password for each account"
+    $radioDiff.Location = New-Object System.Drawing.Point(26, 176)
+    $radioDiff.Size = New-Object System.Drawing.Size(390, 22)
+    $form.Controls.Add($radioDiff)
+
+    $btnOk = New-AccentButton -Text 'Continue' -Primary `
+        -Location (New-Object System.Drawing.Point(254, 226)) `
+        -Size (New-Object System.Drawing.Size(150, 34))
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.AcceptButton = $btnOk
+    $form.Controls.Add($btnOk) | Out-Null
+
+    try {
+        while ($true) {
+            $dialogResult = $form.ShowDialog()
+            if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
+                return $(if ($radioDiff.Checked) { 'Different' } else { 'Same' })
+            } else {
+                if (Confirm-CancelDeployment -MobileList $MobileList) {
+                    return $null
+                }
+                # else: loop back and re-show the same choice dialog
+            }
+        }
+    } finally {
+        $form.Dispose()
+    }
+}
+
+# --- Prompts for one password/confirm pair. $TargetLabel is shown large
+#     and bold so it's unmistakable which account(s) this password is for.
+#     Returns the validated plaintext password, or $null if the user
+#     cancelled and confirmed they want to abort. ---
+function Show-PasswordPrompt {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetLabel,
+        [Parameter(Mandatory = $true)][string]$MobileList,
+        [Parameter(Mandatory = $true)][int]$MinLength,
+        [Parameter(Mandatory = $true)][string]$ComplexityRegex
+    )
+
+    while ($true) {
+        $form = New-StyledForm -Title "Set Secure Password" -Width 440 -Height 430 -HeaderText "Set Secure Password"
+
+        $introLabel = New-Object System.Windows.Forms.Label
+        $introLabel.Location = New-Object System.Drawing.Point(24, 66)
+        $introLabel.Size = New-Object System.Drawing.Size(390, 20)
+        $introLabel.ForeColor = $script:MutedColor
+        $introLabel.Text = "Assigned to: $MobileList"
+        $form.Controls.Add($introLabel)
+
+        # Bold, larger callout so it's unmistakable which account this
+        # particular password will be set for.
+        # NOTE: named $lblTarget (not $targetLabel) deliberately -- PowerShell
+        # variables are case-insensitive, so $targetLabel would be the same
+        # variable as the $TargetLabel string parameter above. Reassigning it
+        # to a Label control would silently coerce that control back to a
+        # string (since the variable stays bound to the parameter's [string]
+        # type), breaking every property access on it afterward.
+        $lblTarget = New-Object System.Windows.Forms.Label
+        $lblTarget.Location = New-Object System.Drawing.Point(24, 90)
+        $lblTarget.Size = New-Object System.Drawing.Size(390, 60)
+        $lblTarget.Font = $script:TargetFont
+        $lblTarget.ForeColor = $script:AccentColor
+        $lblTarget.Text = "Password for:`n$TargetLabel"
+        $form.Controls.Add($lblTarget)
+
+        $divider = New-Object System.Windows.Forms.Panel
+        $divider.BackColor = $script:DividerColor
+        $divider.Location = New-Object System.Drawing.Point(24, 156)
+        $divider.Size = New-Object System.Drawing.Size(390, 1)
+        $form.Controls.Add($divider)
+
+        $reqLabel = New-Object System.Windows.Forms.Label
+        $reqLabel.Location = New-Object System.Drawing.Point(24, 167)
+        $reqLabel.Size = New-Object System.Drawing.Size(390, 32)
+        $reqLabel.ForeColor = $script:MutedColor
+        $reqLabel.Text = "Minimum $MinLength characters, including upper, lower, number and symbol."
+        $form.Controls.Add($reqLabel)
+
+        $passLabel1 = New-Object System.Windows.Forms.Label
+        $passLabel1.Text = "Password"
+        $passLabel1.Font = $script:BoldFont
+        $passLabel1.Location = New-Object System.Drawing.Point(24, 207)
+        $passLabel1.Size = New-Object System.Drawing.Size(200, 18)
+        $form.Controls.Add($passLabel1)
+
+        $txtPass1 = New-Object System.Windows.Forms.TextBox
+        $txtPass1.Location = New-Object System.Drawing.Point(24, 228)
+        $txtPass1.Size = New-Object System.Drawing.Size(390, 24)
+        $txtPass1.PasswordChar = '*'
+        $txtPass1.BorderStyle = 'FixedSingle'
+        $form.Controls.Add($txtPass1)
+
+        $passLabel2 = New-Object System.Windows.Forms.Label
+        $passLabel2.Text = "Confirm Password"
+        $passLabel2.Font = $script:BoldFont
+        $passLabel2.Location = New-Object System.Drawing.Point(24, 262)
+        $passLabel2.Size = New-Object System.Drawing.Size(200, 18)
+        $form.Controls.Add($passLabel2)
+
+        $txtPass2 = New-Object System.Windows.Forms.TextBox
+        $txtPass2.Location = New-Object System.Drawing.Point(24, 283)
+        $txtPass2.Size = New-Object System.Drawing.Size(390, 24)
+        $txtPass2.PasswordChar = '*'
+        $txtPass2.BorderStyle = 'FixedSingle'
+        $form.Controls.Add($txtPass2)
+
+        $btnOk = New-AccentButton -Text 'Continue' -Primary `
+            -Location (New-Object System.Drawing.Point(264, 330)) `
+            -Size (New-Object System.Drawing.Size(150, 34))
+        $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.AcceptButton = $btnOk
+        $form.Controls.Add($btnOk) | Out-Null
+
+        $dialogResult = $form.ShowDialog()
+
+        if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
+            $P1 = $txtPass1.Text
+            $P2 = $txtPass2.Text
+
+            if ($P1 -ne $P2) {
+                [System.Windows.Forms.MessageBox]::Show("Passwords do not match!", "Error", "OK", "Error") | Out-Null
+                $P1 = $P2 = $null
+                $form.Dispose()
+                continue
+            }
+
+            if ($P1 -notmatch $ComplexityRegex) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Password does not meet complexity requirements (Min $MinLength chars, Upper, Lower, Digit, Special).",
+                    "Complexity Error", "OK", "Warning"
+                ) | Out-Null
+                $P1 = $P2 = $null
+                $form.Dispose()
+                continue
+            }
+
+            $form.Dispose()
+            return $P1
+        } else {
+            $form.Dispose()
+            if (Confirm-CancelDeployment -MobileList $MobileList) {
+                return $null
+            }
+            # else: loop back and re-show the prompt for this same account
+        }
+    }
+}
+
 $assignments = Find-UserMobileAssignments -MobileEntriesPath $MobileEntriesPath -UserName $UserName
 
-if ($assignments.Count -eq 0)
-{
+if ($assignments.Count -eq 0) {
     # Not assigned anywhere -- normal case for most logons. Exit quietly.
     Write-Verbose "User '$UserName' was not found in any mobile entry's [users] section."
     return
@@ -228,13 +475,10 @@ if ($assignments.Count -eq 0)
 
 # Union of every derived account-name variant across all matched mobiles.
 $accountVariants = [System.Collections.Generic.List[string]]::new()
-foreach ($a in $assignments)
-{
-    foreach ($grp in (Set-Groups $a.Groups))
-    {
+foreach ($a in $assignments) {
+    foreach ($grp in (Set-Groups $a.Groups)) {
         $variant = "$UserName.$grp"
-        if ($accountVariants -notcontains $variant)
-        {
+        if ($accountVariants -notcontains $variant) {
             $accountVariants.Add($variant)
         }
     }
@@ -246,29 +490,24 @@ Write-Host "[+] Account variants to be set: $($accountVariants -join ', ')" -For
 
 # Load the cert directly from bytes -- no store lookup, no file path needed.
 # Only the public key is required for Protect-CmsMessage.
-$b64ToUse = if ($CertB64Override)
-{ $CertB64Override 
-} else
-{ $CertB64 
+$b64ToUse = if ($CertB64Override) { $CertB64Override
+} else { $CertB64
 }
 $b64ToUse = ($b64ToUse -replace '\s', '')  # strip whitespace/newlines from wrapped blobs
 
-if ([string]::IsNullOrWhiteSpace($b64ToUse) -or $b64ToUse -eq 'PASTE_YOUR_BASE64_CERT_BLOB_HERE')
-{
+if ([string]::IsNullOrWhiteSpace($b64ToUse) -or $b64ToUse -eq 'PASTE_YOUR_BASE64_CERT_BLOB_HERE') {
     Write-Error "No certificate blob configured. Paste the base64 Deployer.cer content into `$CertB64 or pass -CertB64Override."
     return
 }
 
-try
-{
+try {
     $certBytes = [Convert]::FromBase64String($b64ToUse)
     # NOTE: New-Object (not ::new()) is required here -- the unary comma forces
     # PowerShell to pass $certBytes as a single byte[] argument rather than
     # unrolling it into per-byte constructor args. ::new() doesn't honor that
     # trick the same way and throws a "cannot find an overload" error.
     $deployerCert = New-Object -TypeName System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList (, $certBytes)
-} catch
-{
+} catch {
     [System.Windows.Forms.MessageBox]::Show(
         "Failed to load the embedded certificate blob: $($_.Exception.Message)",
         "Invalid Certificate", "OK", "Error"
@@ -276,128 +515,92 @@ try
     return
 }
 
-if ((Get-Date) -gt $deployerCert.NotAfter)
-{
+if ((Get-Date) -gt $deployerCert.NotAfter) {
     Write-Warning "The embedded certificate expired on $($deployerCert.NotAfter). Encryption will still work but the recipient may not be able to decrypt if their private key/cert pairing has also lapsed."
 }
 
-# --- Single prompt for this user, covering every derived account variant ---
-$ValidEntry = $false
-while (-not $ValidEntry)
-{
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Set Secure Password: $UserName"
-    $form.Size = New-Object System.Drawing.Size(420, 340)
-    $form.StartPosition = 'CenterScreen'
-    $form.FormBorderStyle = 'FixedDialog'
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $false
-    $form.Topmost = $true
+# --- Collect password(s), then encrypt and write. Retries the whole
+#     collection step if the encrypted write itself fails. ---
+$written = $false
+while (-not $written) {
+    $passwordMode = if ($accountVariants.Count -gt 1) {
+        Get-PasswordMode -MobileList $mobileList -AccountVariants $accountVariants
+    } else {
+        'Same'
+    }
 
-    $label = New-Object System.Windows.Forms.Label
-    $label.Location = New-Object System.Drawing.Point(20, 10)
-    $label.Size = New-Object System.Drawing.Size(370, 80)
-    $label.Text = "You are assigned to: $mobileList`nEnter a new password for [$UserName].`n[Requirements]`nMin $MinLength chars, must include: Upper, Lower, Number, and Symbol."
-    $form.Controls.Add($label)
+    if ($null -eq $passwordMode) {
+        Write-Host "Cancelled by user -- no credential written." -ForegroundColor Yellow
+        return
+    }
 
-    $passLabel1 = New-Object System.Windows.Forms.Label
-    $passLabel1.Text = "Password:"
-    $passLabel1.Location = New-Object System.Drawing.Point(20, 95)
-    $form.Controls.Add($passLabel1)
+    $passwordMap = [ordered]@{}
+    $cancelled = $false
 
-    $txtPass1 = New-Object System.Windows.Forms.TextBox
-    $txtPass1.Location = New-Object System.Drawing.Point(20, 115)
-    $txtPass1.Size = New-Object System.Drawing.Size(360, 20)
-    $txtPass1.PasswordChar = '*'
-    $form.Controls.Add($txtPass1)
-
-    $passLabel2 = New-Object System.Windows.Forms.Label
-    $passLabel2.Text = "Confirm Password:"
-    $passLabel2.Location = New-Object System.Drawing.Point(20, 155)
-    $form.Controls.Add($passLabel2)
-
-    $txtPass2 = New-Object System.Windows.Forms.TextBox
-    $txtPass2.Location = New-Object System.Drawing.Point(20, 175)
-    $txtPass2.Size = New-Object System.Drawing.Size(360, 20)
-    $txtPass2.PasswordChar = '*'
-    $form.Controls.Add($txtPass2)
-
-    $btnOk = New-Object System.Windows.Forms.Button
-    $btnOk.Text = 'Encrypt & Continue'
-    $btnOk.Location = New-Object System.Drawing.Point(230, 240)
-    $btnOk.Size = New-Object System.Drawing.Size(150, 30)
-    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $form.AcceptButton = $btnOk
-    $form.Controls.Add($btnOk) | Out-Null
-
-    $dialogResult = $form.ShowDialog()
-
-    if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK)
-    {
-        $P1 = $txtPass1.Text
-        $P2 = $txtPass2.Text
-
-        if ($P1 -ne $P2)
-        {
-            [System.Windows.Forms.MessageBox]::Show("Passwords do not match!", "Error", "OK", "Error") | Out-Null
-            $P1 = $P2 = $null
-            $form.Dispose()
-            continue
+    if ($passwordMode -eq 'Same') {
+        $allLabel = if ($accountVariants.Count -eq 1) {
+            $accountVariants[0]
+        } else {
+            "ALL of the following:`n - " + ($accountVariants -join "`n - ")
         }
 
-        if ($P1 -notmatch $ComplexityRegex)
-        {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Password does not meet complexity requirements (Min $MinLength chars, Upper, Lower, Digit, Special).",
-                "Complexity Error", "OK", "Warning"
-            ) | Out-Null
-            $P1 = $P2 = $null
-            $form.Dispose()
-            continue
+        $pwd = Show-PasswordPrompt -TargetLabel $allLabel -MobileList $mobileList -MinLength $MinLength -ComplexityRegex $ComplexityRegex
+        if ($null -eq $pwd) {
+            $cancelled = $true
+        } else {
+            foreach ($variant in $accountVariants) {
+                $passwordMap[$variant] = $pwd
+            }
+            $pwd = $null
         }
-
-        $ValidEntry = $true
-        $FinalPassword = $P1
-        $timestamp = Get-Date -Format 's'
-
-        # One line per derived account-name variant, all sharing this one password.
-        $plainLines = $accountVariants | ForEach-Object { "${timestamp}:${_}:${FinalPassword}" }
-        $plainBody = $plainLines -join "`n"
-
-        $destFile = Join-Path $MobileDumpPath $UserName
-
-        try
-        {
-            Protect-CmsMessage -To $deployerCert -Content $plainBody -OutFile $destFile -ErrorAction Stop
-            Write-Host "[+] Encrypted credential written for $UserName -> $destFile" -ForegroundColor Green
-            Write-Host "    Covers: $($accountVariants -join ', ')" -ForegroundColor Green
-        } catch
-        {
-            Write-Warning "Failed to encrypt/write credential for $($UserName): $($_.Exception.Message)"
-            $ValidEntry = $false
-        } finally
-        {
-            # Best-effort scrub of plaintext from memory
-            $plainBody = $null
-            $plainLines = $null
-            $FinalPassword = $null
-            $P1 = $null
-            $P2 = $null
-            [System.GC]::Collect()
+    } else {
+        foreach ($variant in $accountVariants) {
+            $pwd = Show-PasswordPrompt -TargetLabel $variant -MobileList $mobileList -MinLength $MinLength -ComplexityRegex $ComplexityRegex
+            if ($null -eq $pwd) {
+                $cancelled = $true
+                break
+            }
+            $passwordMap[$variant] = $pwd
+            $pwd = $null
         }
+    }
 
-        $form.Dispose()
-    } else
-    {
-        $exitCheck = [System.Windows.Forms.MessageBox]::Show(
-            "You are assigned to a mobile ($mobileList) and a password is required to continue deployment. Cancel anyway?",
-            "Exit", "YesNo", "Warning"
+    if ($cancelled) {
+        Write-Host "Cancelled by user -- no credential written." -ForegroundColor Yellow
+        return
+    }
+
+    $timestamp = Get-Date -Format 's'
+    $plainLines = foreach ($variant in $accountVariants) {
+        "${timestamp}:${variant}:$($passwordMap[$variant])"
+    }
+    $plainBody = $plainLines -join "`n"
+
+    $destFile = Join-Path $MobileDumpPath $UserName
+
+    try {
+        Protect-CmsMessage -To $deployerCert -Content $plainBody -OutFile $destFile -ErrorAction Stop
+        Write-Host "[+] Encrypted credential written for $UserName -> $destFile" -ForegroundColor Green
+        Write-Host "    Covers: $($accountVariants -join ', ')" -ForegroundColor Green
+        $written = $true
+    } catch {
+        Write-Warning "Failed to encrypt/write credential for $($UserName): $($_.Exception.Message)"
+        $retry = [System.Windows.Forms.MessageBox]::Show(
+            "Failed to write the credential file:`n$($_.Exception.Message)`n`nTry entering the password(s) again?",
+            "Write Failed", "YesNo", "Error"
         )
-        $form.Dispose()
-        if ($exitCheck -eq 'Yes')
-        {
-            Write-Host "Cancelled by user -- no credential written." -ForegroundColor Yellow
+        if ($retry -ne 'Yes') {
             return
         }
+        # else: loop back to password collection and try again
+    } finally {
+        # Best-effort scrub of plaintext from memory
+        $plainBody = $null
+        $plainLines = $null
+        if ($passwordMap) {
+            foreach ($k in @($passwordMap.Keys)) { $passwordMap[$k] = $null }
+        }
+        $passwordMap = $null
+        [System.GC]::Collect()
     }
 }
