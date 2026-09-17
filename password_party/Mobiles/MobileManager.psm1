@@ -994,7 +994,8 @@ function New-ShortcutGPO {
         [int]$IconIndex = 301,
 
         [Parameter()]
-        [string]$Comment = "LOCAL ACCOUNTS"
+        [string]$Comment = "LOCAL ACCOUNTS",
+        [switch]$Quiet
     )
 
     $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
@@ -1120,6 +1121,7 @@ displayName=$gpoName
         Write-Warning "Target OU '$TargetOUFriendlyName' not found. Link skipped."
     }
 
+    if ($quiet) { return }
     Write-Host "[+] Successfully created and populated Shortcut GPO ($cleanGpoID)" -ForegroundColor Green
 }
 
@@ -1403,7 +1405,7 @@ function Initialize-Environment {
     # 3. Document Encryption Cert
     $results.Add((Test-AndFixDeployerCert -CertName $CertName -PfxStoragePath $AdminRoot))
 
-    $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers"))
+    $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers" -quiet))
 
     #
     # Pretty-Print Provisioning Ledger
@@ -2640,7 +2642,10 @@ function Get-MobileOverview {
         if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyPath)) {
             $keyName = Split-Path $sshKeyPath -Leaf
             # Test-AndFixSshEnvironment -KeyPath $SshKeyPath -NfsHome $NfsHome -quiet
-            Initialize-Environment
+            if (-not (Initialize-Environment)) {
+                Write-Warning "[!] -- Fix Environment"
+                exit 1
+            }
         }
 
         $computerData = Invoke-InformationCollector `
