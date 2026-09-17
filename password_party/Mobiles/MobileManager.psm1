@@ -973,89 +973,91 @@ function New-ShortcutGPO {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$targetOUFriendlyName,
+        [string]$TargetOUFriendlyName,
 
         [Parameter()]
         [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
 
         [Parameter()]
-        [string]$ShortcutName = "Mobile - Local Accounts Maker",
+        [string]$ShortcutName = "LocalAccountCreator",
 
         [Parameter()]
-        [string]$TargetPath = "C:\Supportbin\console.exe",
+        [string]$TargetPath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
 
         [Parameter()]
-        [string]$Arguments = "",
+        [string]$Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File ""C:\Supportbin\script.ps1""",
 
         [Parameter()]
-        [string]$IconPath = "%SystemRoot%\system32\shell32.dll",
+        [string]$IconPath = "%SystemRoot%\System32\SHELL32.dll",
 
         [Parameter()]
-        [int]$IconIndex = 15
+        [int]$IconIndex = 301,
+
+        [Parameter()]
+        [string]$Comment = "LOCAL ACCOUNTS"
     )
 
     $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
     $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
     $gpoName = "Mobile Logon"
 
-    $RootDSE = [ADSI]"LDAP://RootDSE"
-    $ctx = $RootDSE.DefaultNamingContext
-    $PolicyContainer = "CN=Policies,CN=System,$ctx"
-    $targetOU_DN = "OU=$targetOUFriendlyName,$ctx"
-    $gpoLdapPath = "[LDAP://CN=$cleanGpoID,$PolicyContainer;0]"
+    $rootDSE = [ADSI]"LDAP://RootDSE"
+    $ctx = $rootDSE.DefaultNamingContext
+    $policyContainerPath = "CN=Policies,CN=System,$ctx"
+    $targetOU_DN = "OU=$TargetOUFriendlyName,$ctx"
+    $gpoLdapPath = "[LDAP://CN=$cleanGpoID,$policyContainerPath;0]"
     $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
 
     #
-    # 1. Active Directory Container (GPC)
+    # 1. Active Directory GPC Object
     #
-    $policiesContainer = [ADSI]"LDAP://$PolicyContainer"
-    $gpoLdapUri = "LDAP://CN=$cleanGpoID,$PolicyContainer"
+    $policiesContainer = [ADSI]"LDAP://$policyContainerPath"
+    $gpoLdapUri = "LDAP://CN=$cleanGpoID,$policyContainerPath"
 
+    $isNew = $false
     if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
         $gpoEntry = [ADSI]$gpoLdapUri
     } else {
         $gpoEntry = $policiesContainer.Create("groupPolicyContainer", "CN=$cleanGpoID")
-        $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
-        
-        # Clone parent container's security descriptor to prevent GPMC "Access Denied"
+        $isNew = $true
+    }
+
+    # Verified extension GUIDs from working GPO
+    $exactExtensionWithLogon = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
+    $exactExtension = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
+
+    $versionNumber = (1 -shl 16) # User version = 1, Computer version = 0
+
+    $gpoEntry.Put("displayName", $gpoName)
+    $gpoEntry.Put("flags", 0)
+    $gpoEntry.Put("gPCFunctionalityVersion", 2)
+    $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
+    $gpoEntry.Put("gPCUserExtensionNames", $exactExtension)
+    $gpoEntry.Put("versionNumber", $versionNumber)
+    $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
+
+    # Clone parent ACL to avoid Access Denied in GPMC
+    if ($isNew) {
         $parentSec = $policiesContainer.Properties["ntSecurityDescriptor"].Value
         if ($parentSec) {
             $gpoEntry.Properties["ntSecurityDescriptor"].Value = $parentSec
         }
     }
 
-    # EXACT GPP Shortcuts Extension String:
-    # [{00000000-0000-0000-0000-000000000000}{CAB54552-DE80-4D57-8186-31E36B182F36}] = GPP Core MMC
-    # [{C418DD59-6137-4768-B4F9-82C3E4EED97F}{0E390D38-7EE3-4EC0-8752-CB4482DC8881}] = Shortcuts CSE + Snap-in
-    $gppExtension = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
-    $userVer = 1
-    $versionNumber = ($userVer -shl 16) # User = 1, Computer = 0
-    $gpoEntry.Put("gPCFunctionalityVersion", 2)
-    $gpoEntry.Put("displayName", $gpoName)
-    $gpoEntry.Put("flags", 2) # Computer segment disabled
-    $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
-    $gpoEntry.Put("gPCUserExtensionNames", $gppExtension)
-    $gpoEntry.Put("versionNumber", $versionNumber)
-
-    if ($gpoEntry.Properties.Contains("gPCMachineExtensionNames") -and $gpoEntry.Properties["gPCMachineExtensionNames"].Value) {
-        $gpoEntry.PutEx(1, "gPCMachineExtensionNames", $null)
-    }
-
     $gpoEntry.SetInfo()
 
     #
-    # 2. SYSVOL Directory Structure
+    # 2. Build SYSVOL Directory Structure
     #
     $userPrefPath = Join-Path $gpoSysvolPath "User\Preferences\Shortcuts"
     $machinePath  = Join-Path $gpoSysvolPath "Machine"
 
-    @($userPrefPath, $machinePath) | ForEach-Object {
+    @($gpoSysvolPath, $userPrefPath, $machinePath) | ForEach-Object {
         if (-not (Test-Path $_)) {
             New-Item -Path $_ -ItemType Directory -Force | Out-Null
         }
     }
 
-    # Clean SYSVOL inheritance
     try {
         icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
     } catch { }
@@ -1071,20 +1073,23 @@ displayName=$gpoName
     Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIni -Encoding Ascii
 
     #
-    # 4. Shortcuts.xml (User Context)
+    # 4. Generate Working Shortcuts.xml
     #
-    $timeNow       = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-    $desktopUid    = [Guid]::NewGuid().ToString("B").ToUpper()
-    $startMenuUid  = [Guid]::NewGuid().ToString("B").ToUpper()
+    $timeNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+    $desktopUid = [Guid]::NewGuid().ToString("B").ToUpper()
+    $startMenuUid = [Guid]::NewGuid().ToString("B").ToUpper()
+
+    # Escape XML entities in arguments
+    $xmlEscapedArgs = [System.Security.SecurityElement]::Escape($Arguments)
 
     $xmlContent = @"
 <?xml version="1.0" encoding="utf-8"?>
-<Shortcuts clsid="{872ECB34-7144-49f3-8CE0-492F266F3134}">
-  <Shortcut clsid="{0DCA7FFD-8C39-44be-9043-392D666E61E8}" name="$ShortcutName" status="$ShortcutName" image="0" changed="$timeNow" uid="$desktopUid">
-    <Properties action="U" comment="" disabled="0" hotkey="0" iconIndex="$IconIndex" iconPath="$IconPath" targetType="FILESYSTEM" targetPath="$TargetPath" arguments="$Arguments" workingDir="" run="NORMAL" lnkFilePath="%DesktopDir%\$ShortcutName.lnk" startIn="" windowStyle="NORMAL" />
+<Shortcuts clsid="{872ECB34-B2EC-401b-A585-D32574AA90EE}">
+  <Shortcut clsid="{4F2F7C55-2790-433e-8127-0739D1CFA327}" name="$ShortcutName" status="$ShortcutName" image="1" changed="$timeNow" uid="$desktopUid" userContext="1" bypassErrors="1" removePolicy="1">
+    <Properties pidl="" targetType="FILESYSTEM" action="U" comment="$Comment" shortcutKey="0" startIn="" arguments="$xmlEscapedArgs" iconIndex="$IconIndex" targetPath="$TargetPath" iconPath="$IconPath" window="MIN" shortcutPath="%DesktopDir%\$ShortcutName" />
   </Shortcut>
-  <Shortcut clsid="{0DCA7FFD-8C39-44be-9043-392D666E61E8}" name="$ShortcutName" status="$ShortcutName" image="0" changed="$timeNow" uid="$startMenuUid">
-    <Properties action="U" comment="" disabled="0" hotkey="0" iconIndex="$IconIndex" iconPath="$IconPath" targetType="FILESYSTEM" targetPath="$TargetPath" arguments="$Arguments" workingDir="" run="NORMAL" lnkFilePath="%StartMenuDir%\$ShortcutName.lnk" startIn="" windowStyle="NORMAL" />
+  <Shortcut clsid="{4F2F7C55-2790-433e-8127-0739D1CFA327}" name="$ShortcutName" status="$ShortcutName" image="1" changed="$timeNow" uid="$startMenuUid" userContext="1" bypassErrors="1" removePolicy="1">
+    <Properties pidl="" targetType="FILESYSTEM" action="U" comment="$Comment" shortcutKey="0" startIn="" arguments="$xmlEscapedArgs" iconIndex="$IconIndex" targetPath="$TargetPath" iconPath="$IconPath" window="MIN" shortcutPath="%StartMenuDir%\$ShortcutName" />
   </Shortcut>
 </Shortcuts>
 "@
@@ -1093,7 +1098,7 @@ displayName=$gpoName
     [System.IO.File]::WriteAllText((Join-Path $userPrefPath "Shortcuts.xml"), $xmlContent.Trim(), $utf8NoBom)
 
     #
-    # 5. Link GPO to target OU
+    # 5. Link to OU
     #
     if ([System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
         $targetOU = [ADSI]"LDAP://$targetOU_DN"
@@ -1111,9 +1116,11 @@ displayName=$gpoName
         }
 
         $targetOU.SetInfo()
+    } else {
+        Write-Warning "Target OU '$TargetOUFriendlyName' not found. Link skipped."
     }
 
-    Write-Host "[+] Shortcut GPO configured and linked successfully: $cleanGpoID" -ForegroundColor Green
+    Write-Host "[+] Successfully created and populated Shortcut GPO ($cleanGpoID)" -ForegroundColor Green
 }
 
 function New-CustomGPO {
@@ -1392,6 +1399,8 @@ function Initialize-Environment {
 
     # 3. Document Encryption Cert
     $results.Add((Test-AndFixDeployerCert -CertName $CertName -PfxStoragePath $AdminRoot))
+
+    $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers"))
 
     #
     # Pretty-Print Provisioning Ledger
@@ -2799,18 +2808,11 @@ function Format-DeploymentResults {
             [string]$Category
         )
 
-        $actions = @(
-            $Result.Actions |
-                Where-Object Category -eq $Category
-        )
+        $actions = @( $Result.Actions | Where-Object Category -eq $Category)
 
-        if (-not $actions) {
-            return '-'
-        }
+        if (-not $actions) { return '-' }
 
-        if ($actions.Status -contains 'Failed') {
-            return 'FAILED'
-        }
+        if ($actions.Status -contains 'Failed') { return 'FAILED' }
 
         return 'OK'
     }
@@ -2824,44 +2826,24 @@ function Format-DeploymentResults {
 
         foreach ($baseName in ($AllUsers.BaseName | Sort-Object -Unique)) {
 
-            $userDefs = @(
-                $AllUsers |
-                    Where-Object BaseName -eq $baseName
-            )
+            $userDefs = @( $AllUsers | Where-Object BaseName -eq $baseName)
 
             #
             # Canonical roles come directly from the user model.
             #
-            $roles = @(
-                $userDefs |
-                    Select-Object -ExpandProperty GroupType -Unique |
-                    ForEach-Object { $_.ToString() }
-            )
+            $roles = @( $userDefs | Select-Object -ExpandProperty GroupType -Unique | ForEach-Object { $_.ToString() })
 
             #
             # Determine the account names actually deployed
             # on this platform.
             #
-            $accountNames = if ($result.Platform -eq 'Linux') {
-                @(
-                    $userDefs.LinuxName |
-                        Where-Object { $_ } |
-                        Sort-Object -Unique
-                )
+            $accountNames = if ($result.Platform -eq 'Linux') { 
+                @( $userDefs.LinuxName | Where-Object { $_ } | Sort-Object -Unique)
             } else {
-                @(
-                    $userDefs.Name |
-                        Where-Object { $_ } |
-                        Sort-Object -Unique
-                )
+                @( $userDefs.Name | Where-Object { $_ } | Sort-Object -Unique)
             }
 
-            $accountActions = @(
-                $result.Actions |
-                    Where-Object {
-                        $_.Category -eq 'User' -and
-                        $_.Name -in $accountNames
-                    }
+            $accountActions = @( $result.Actions | Where-Object { $_.Category -eq 'User' -and $_.Name -in $accountNames }
             )
 
             #
@@ -2871,17 +2853,9 @@ function Format-DeploymentResults {
             #
             $status = if (-not $accountActions) {
                 '-'
-            } elseif ($accountActions.Status -contains 'Failed') {
-                'FAILED'
-            } else {
-                'OK'
-            }
+            } elseif ($accountActions.Status -contains 'Failed') { 'FAILED' } else { 'OK' }
 
-            $password = if ($userDefs.MustChangePassword -contains $true) {
-                'Default'
-            } else {
-                'UserSet'
-            }
+            $password = if ($userDefs.MustChangePassword -contains $true) { 'Default' } else { 'UserSet' }
 
             [PSCustomObject]@{
                 Host     = $host
@@ -2896,9 +2870,7 @@ function Format-DeploymentResults {
     Write-Host ""
     Write-Host "[USERS]" -ForegroundColor Cyan
 
-    $userRows |
-        Sort-Object Host, User |
-        Format-Table Host, User, Groups, Status, Password -AutoSize
+    $userRows | Sort-Object Host, User | Format-Table Host, User, Groups, Status, Password -AutoSize
 
     #
     # DEPLOYMENT TASKS
@@ -2918,17 +2890,13 @@ function Format-DeploymentResults {
             Encryption = Get-AggregateStatus  -Result $result  -Category 'DiskEncryption'
 
             DomainDisjoin = if ($result.Platform -eq 'Windows') {
-                Get-AggregateStatus `
-                    -Result $result `
-                    -Category 'Domain'
+                Get-AggregateStatus -Result $result -Category 'Domain'
             } else {
                 'N/A'
             }
 
             PostDisjoin = if ($result.Platform -eq 'Windows') {
-                Get-AggregateStatus `
-                    -Result $result `
-                    -Category 'PostDisjoin'
+                Get-AggregateStatus  -Result $result  -Category 'PostDisjoin'
             } else {
                 'N/A'
             }
@@ -2938,16 +2906,14 @@ function Format-DeploymentResults {
     Write-Host ""
     Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
 
-    $taskRows |
-        Sort-Object Host |
-        Format-Table `
-            Host,
-        NetworkSharing,
-        ScheduledTasks,
-        Encryption,
-        DomainDisjoin,
-        PostDisjoin `
-            -AutoSize
+    $taskRows | Sort-Object Host | Format-Table `
+        Host,
+    NetworkSharing,
+    ScheduledTasks,
+    Encryption,
+    DomainDisjoin,
+    PostDisjoin `
+        -AutoSize
 
     #
     # FAILURES
@@ -3102,6 +3068,214 @@ function Start-MobileDeployment {
     }
     $results = @($winResults) + @($linResults)
     Format-DeploymentResults -results $results -allUsers $mobileData.AllUsers
+}
+
+function Get-WindowsCollector-DiskSpace {
+    [CmdletBinding()]
+    param()
+
+    return @'
+function Get-DiskSpace {
+    param([int]$MinimumFreeGB = 20, [int]$MinimumFreePercent = 10)
+
+    $volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' -ErrorAction Stop | ForEach-Object {
+        $freeGB = [math]::Round($_.FreeSpace / 1GB, 2)
+        $totalGB = [math]::Round($_.Size / 1GB, 2)
+        $freePercent = if ($_.Size -gt 0) { [math]::Round(100 * $_.FreeSpace / $_.Size, 1) } else { 0 }
+
+        [PSCustomObject]@{
+            Drive       = $_.DeviceID
+            TotalGB     = $totalGB
+            FreeGB      = $freeGB
+            FreePercent = $freePercent
+            LowSpace    = ($freeGB -lt $MinimumFreeGB -or $freePercent -lt $MinimumFreePercent)
+        }
+    })
+
+    return [PSCustomObject]@{
+        Volumes = $volumes
+        LowSpace = @($volumes | Where-Object LowSpace).Count -gt 0
+    }
+}
+'@
+
+}
+
+function Get-WindowsCollector-Ivanti {
+    [CmdletBinding()]
+    param()
+
+    return @'
+function Get-IvantiInformation {
+    $paths = @(
+        'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
+        'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
+        'HKLM:\SOFTWARE\Wow6432Node\LANDesk\Inventory'
+        'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
+    )
+
+    $registrations = @(foreach ($path in $paths) {
+        $item = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+        if ($item) {
+            [PSCustomObject]@{
+                Path    = $path
+                Version = $item.Version
+            }
+        }
+    })
+
+    $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
+        $_.Name -match '^(?:LANDesk|Ivanti)' -or $_.DisplayName -match 'Ivanti|LANDesk'
+    } | Select-Object Name, DisplayName, State, StartMode)
+
+    $version = @($registrations | Where-Object Version | Select-Object -First 1 -ExpandProperty Version)
+    $automatic = @($services | Where-Object StartMode -eq 'Auto')
+    $stopped = @($automatic | Where-Object State -ne 'Running')
+
+    [PSCustomObject]@{
+        Installed              = ($registrations.Count -gt 0 -or $services.Count -gt 0)
+        Version                = if ($version.Count) { $version[0] } else { $null }
+        Services               = $services
+        AutomaticServicesReady = if (-not $services.Count) { $null } else { $stopped.Count -eq 0 }
+        PolicyStatus           = $null
+        LastPolicySync         = $null
+        LastSecurityScan       = $null
+        Registrations          = $registrations
+    }
+}
+'@
+}
+
+function Get-WindowsCollector-SecurityUpdates {
+    [CmdletBinding()]
+    param()
+
+    return @'
+function Get-SecurityUpdateInformation {
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $searcher = $session.CreateUpdateSearcher()
+    $count = $searcher.GetTotalHistoryCount()
+
+    $history = if ($count -gt 0) {
+        @($searcher.QueryHistory(0, [math]::Min($count, 100)) |
+            Where-Object { $_.ResultCode -eq 2 -and $_.Title -match 'Security|Cumulative|KB\d+' } |
+            Select-Object Title, Date, ResultCode)
+    } else {
+        @()
+    }
+
+    $hotfixes = @(Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending |
+        Select-Object HotFixID, Description, InstalledOn)
+
+    [PSCustomObject]@{
+        LastRelevantUpdate = $history | Sort-Object Date -Descending | Select-Object -First 1
+        UpdateHistory = $history
+        InstalledHotfixes = $hotfixes
+        IvantiPatchCompliance = 'Unknown'
+    }
+}
+'@
+}
+
+
+function Get-WindowsInformationBlock {
+    [CmdletBinding()]
+    param()
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+
+    $parts.Add((Get-WindowsCollector-DiskSpace))
+    $parts.Add((Get-WindowsCollector-Ivanti))
+
+    $parts.Add(@'
+$disk = Get-DiskSpace
+$ivanti = Get-IvantiInformation
+
+$systemDrive = $env:SystemDrive
+$systemDisk = $disk.Volumes | Where-Object Drive -eq $systemDrive | Select-Object -First 1
+
+[PSCustomObject]@{
+    HostName = $env:COMPUTERNAME
+    Platform = 'Windows'
+
+    Summary = [PSCustomObject]@{
+        DiskFreeGB     = $systemDisk.FreeGB
+        DiskLow        = $disk.LowSpace
+        IvantiVersion  = $ivanti.Version
+        IvantiServices = $ivanti.AutomaticServicesReady
+        IvantiPolicy   = $ivanti.PolicyStatus
+    }
+
+    Details = [PSCustomObject]@{
+        Disks  = $disk.Volumes
+        Ivanti = $ivanti
+    }
+}
+'@)
+
+    return [scriptblock]::Create($parts -join "`n`n")
+}
+
+
+function Get-LinuxCollector-DiskSpace {
+    [CmdletBinding()]
+    param()
+
+    return @'
+# Task: Disk Space
+
+disk_paths=('/')
+
+if [[ -d /mobiles/home ]]; then
+    disk_paths+=('/mobiles/home')
+fi
+
+disk_json="$(
+    df -Pk "${disk_paths[@]}" 2>/dev/null |
+        awk 'NR > 1 && !seen[$1]++ {
+            printf "%s|%s|%s|%s\n", $1, $2, $4, $6
+        }' |
+        jq -R -s '
+            split("\n") |
+            map(select(length > 0) | split("|") | {
+                Device: .[0],
+                TotalGB: ((.[1] | tonumber) / 1048576 * 100 | round / 100),
+                FreeGB: ((.[2] | tonumber) / 1048576 * 100 | round / 100),
+                MountPoint: .[3],
+                FreePercent: (if (.[1] | tonumber) > 0 then
+                    ((.[2] | tonumber) / (.[1] | tonumber) * 1000 | round / 10)
+                else 0 end)
+            })
+        '
+)"
+'@
+}
+
+
+function Get-LinuxInformationScript {
+    [CmdletBinding()]
+    param()
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+
+    $parts.Add('#!/usr/bin/env bash')
+    $parts.Add((Get-LinuxCollector-DiskSpace))
+
+    $parts.Add(@'
+jq -n --arg hostname "$(hostname -s)" --argjson disks "$disk_json" '{
+    HostName: $hostname,
+    Platform: "Linux",
+    Summary: {
+        DiskFreeGB: ($disks | map(select(.MountPoint == "/")) | first | .FreeGB),
+        DiskLow: ($disks | any(.FreeGB < 20 or .FreePercent < 10))
+    },
+    Details: {
+        Disks: $disks
+    }
+}'
+'@)
+
+    return $parts -join "`n`n"
 }
 
 
@@ -3262,10 +3436,7 @@ jq -n \
         }
         $osString = "$(Get-WinVersion ([int]$osInfo.currentBuildNumber))"
 
-        $cores = (
-            Get-CimInstance Win32_Processor |
-                Measure-Object -Property NumberOfCores -Sum
-        ).Sum
+        $cores = ( Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum
 
         $packages = @(
             Get-ItemProperty @(
@@ -3273,10 +3444,7 @@ jq -n \
                 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
                 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
             ) -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.DisplayName -and
-                    -not $_.SystemComponent
-                } |
+                Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
                 Select-Object `
                     DisplayName,
                 DisplayVersion,
@@ -3295,25 +3463,16 @@ jq -n \
                 Select-Object -First 1 -ExpandProperty Version -ErrorAction SilentlyContinue
         )
 
-        $symantecAvDefs = (
-            Get-ItemProperty `
-                -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' `
-                -ErrorAction SilentlyContinue
-        ).DefSetVersion
+        $symantecAvDefs = ( Get-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' -ErrorAction SilentlyContinue).DefSetVersion
 
         $adminRotateScriptVersion = $null
 
-        $adminScriptExists = Get-ScheduledTask `
-            -TaskName 'ADMIN-LAPS' `
-            -ErrorAction SilentlyContinue
+        $adminScriptExists = Get-ScheduledTask  -TaskName 'ADMIN-LAPS'  -ErrorAction SilentlyContinue
 
         if ($adminScriptExists) {
             $xml = schtasks /query /tn ADMIN-LAPS /xml
 
-            $versionMatch = (
-                $xml |
-                    Select-String -Pattern '<Version>(.*?)</Version>'
-            ).Matches
+            $versionMatch = ( $xml | Select-String -Pattern '<Version>(.*?)</Version>').Matches
 
             if ($versionMatch.Count) {
                 $adminRotateScriptVersion =
@@ -3356,25 +3515,17 @@ jq -n \
                     Name = 'Status'
                     Expression = {
                         switch ($_.ResultCode) {
-                            2 { 'Succeeded' 
-                            }
-                            3 { 'Succeeded With Errors' 
-                            }
-                            4 { 'Failed' 
-                            }
-                            5 { 'Aborted' 
-                            }
-                            default { "Other: $($_.ResultCode)" 
-                            }
+                            2 { 'Succeeded' }
+                            3 { 'Succeeded With Errors' }
+                            4 { 'Failed' }
+                            5 { 'Aborted' }
+                            default { "Other: $($_.ResultCode)" }
                         }
                     }
                 }
         )
 
-        $lastUpdate = $latestUpdates |
-            Where-Object Status -like 'Succeeded*' |
-            Sort-Object Date -Descending |
-            Select-Object -First 1 -ExpandProperty Date
+        $lastUpdate = $latestUpdates | Where-Object Status -like 'Succeeded*' | Sort-Object Date -Descending | Select-Object -First 1 -ExpandProperty Date
 
         [PSCustomObject]@{
             HostName = $env:COMPUTERNAME
@@ -3427,12 +3578,7 @@ jq -n \
                 continue
             }
 
-            $hostErrors = @(
-                $winFails |
-                    Where-Object {
-                        $_.TargetObject -eq $computer -or
-                        $_.OriginInfo.PSComputerName -eq $computer
-                    }
+            $hostErrors = @( $winFails | Where-Object { $_.TargetObject -eq $computer -or $_.OriginInfo.PSComputerName -eq $computer }
             )
 
             $winResult += [PSCustomObject]@{
