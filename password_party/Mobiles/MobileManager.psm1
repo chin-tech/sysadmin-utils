@@ -1315,7 +1315,8 @@ function Test-AndFixSshEnvironment {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$KeyPath,
-        [Parameter(Mandatory)][string]$NfsHome
+        [Parameter(Mandatory)][string]$NfsHome,
+        [Parameter()][switch]$quiet
     )
 
     if ([string]::IsNullOrWhiteSpace($KeyPath) -or $KeyPath.EndsWith('\')) {
@@ -1362,8 +1363,10 @@ function Test-AndFixSshEnvironment {
         }
 
         $status = if ($keyCreated) { 'CREATED' } else { 'OK' }
+        if ($quiet) { return $true }
         return (New-InitResult -Component 'SSH:Environment' -Status $status -Details "Key at $KeyPath enrolled in $rAuthorized")
     } catch {
+        if ($quiet) { return $false }
         return (New-InitResult -Component 'SSH:Environment' -Status 'FAILED' -Details $_.Exception.Message -Fatal)
     }
 }
@@ -1459,87 +1462,87 @@ function New-DeployerCertificate {
 
 
 
-function Initialize-Ssh-Environment {
-    [CmdletBinding()]
-    param(
-        [string]$keyPath = $Script:Config.SSHKeyPath,
-        [string]$nfsHome = $Script:Config.NfsHome
-    )
-    # r = remote ; l = local
-    $nfsSSH = Join-Path  $nfsHome '.ssh'
-    $localSSh = Join-Path $env:UserProfile ".ssh"
-    $rAuthorized = Join-Path $nfsSSH 'authorized_keys'
-
-    @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_ ) } | ForEach-Object {
-        New-Item -ItemType Directory -Path $_ -Force | Out-Null
-    }
-
-    if ([string]::IsNullOrWhiteSpace($keyPath) -or $keyPath.EndsWith('\')) {
-        throw "SSH KEY PATH IS INVALID! -- '$sshKeyPath'  -- CHECK SSH KEY"
-    }
-
-    
-    icacls.exe $nfsSSH /inheritance:r /T |Out-Null
-    icacls.exe $nfsSSH /grant:r "$($env:USERNAME):(R)" /T |out-null
-
-
-    icacls.exe $localSSH /inheritance:r |Out-Null
-    icacls.exe $localSSH /grant:r "$($env:USERNAME):(R)" /T | Out-Null
-
-    if (-not (Test-Path $keyPath)) {
-        ssh-keygen -f "$keyPath" -C '""' -N '""' -t ecdsa -q
-
-    }
-
-    icacls.exe $keyPath /inheritance:r |Out-Null
-    icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
-    $pubKey = ssh-keygen -yf $keyPath
-    if (-not (Test-Path $rAuthorized)) { New-Item -Type File -Path $rAuthorized -Force | Out-Null
-    }
-    if (-not (Select-String -Pattern $pubKey -Path $rAuthorized -ErrorAction SIlentlyContinue)) {
-        $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
-        icacls.exe $rAuthorized /inheritance:r |Out-Null
-        icacls.exe $rAuthorized /grant:r "$($env:USERNAME):(R)"| Out-Null
-    }
-
-
-}
-
-
-
-function Initialize-Functionality {
-    [CmdletBinding()]
-    param(
-        [Parameter()]
-        [string]$sshKeyPath = $script:Config.SshKeyPath,
-        [string]$nfsHome = $script:Config.nfsHome,
-        [string]$adminRoot = $script:Config.AdminRoot,
-        [string]$certName = $script:Config.certName
-
-    )
-
-    Initialize-Ssh-Environment  -nfsHome $nfsHome -keyPath $sshKeyPath
-
-    # 2. Ensure Document Encryption Certificate Exists in CurrentUser\My
-    $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My | 
-        Where-Object { $_.Subject -like '*CN=MobileDeployer*' -or $_.Subject -like "*$($certName)*" }
-
-    if (-not $existingCert) {
-        $pfxFileName = "$($certName).pfx"
-        $pfxFullPath = Join-Path $cfg.AdminRoot $pfxFileName
-        # $securePass  = ConvertTo-SecureString -AsPlainText -Force $cfg.DefaultPass
-        $securePass = Read-Host -AsSecureString -Prompt "[!] The decryption certificate isn't in your cert store. Please enter the administrative password to import it "
-
-        if (Test-Path $pfxFullPath) {
-            Import-PfxCertificate -FilePath $pfxFullPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePass | Out-Null
-            Write-Host "[+] Imported existing deployer certificate from: $pfxFullPath" -ForegroundColor Green
-        } else {
-            # Generates PFX/CER in the target directory and automatically adds to Cert:\CurrentUser\My
-            New-DeployerCertificate -certPass $securePass -outPath $pfxFullPath
-            Write-Host "[+] Generated and installed new deployment certificate in: $($pfxFullPath)" -ForegroundColor Green
-        }
-    }
-}
+# function Initialize-Ssh-Environment {
+#     [CmdletBinding()]
+#     param(
+#         [string]$keyPath = $Script:Config.SSHKeyPath,
+#         [string]$nfsHome = $Script:Config.NfsHome
+#     )
+#     # r = remote ; l = local
+#     $nfsSSH = Join-Path  $nfsHome '.ssh'
+#     $localSSh = Join-Path $env:UserProfile ".ssh"
+#     $rAuthorized = Join-Path $nfsSSH 'authorized_keys'
+#
+#     @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_ ) } | ForEach-Object {
+#         New-Item -ItemType Directory -Path $_ -Force | Out-Null
+#     }
+#
+#     if ([string]::IsNullOrWhiteSpace($keyPath) -or $keyPath.EndsWith('\')) {
+#         throw "SSH KEY PATH IS INVALID! -- '$sshKeyPath'  -- CHECK SSH KEY"
+#     }
+#
+#
+#     icacls.exe $nfsSSH /inheritance:r /T |Out-Null
+#     icacls.exe $nfsSSH /grant:r "$($env:USERNAME):(R)" /T |out-null
+#
+#
+#     icacls.exe $localSSH /inheritance:r |Out-Null
+#     icacls.exe $localSSH /grant:r "$($env:USERNAME):(R)" /T | Out-Null
+#
+#     if (-not (Test-Path $keyPath)) {
+#         ssh-keygen -f "$keyPath" -C '""' -N '""' -t ecdsa -q
+#
+#     }
+#
+#     icacls.exe $keyPath /inheritance:r |Out-Null
+#     icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
+#     $pubKey = ssh-keygen -yf $keyPath
+#     if (-not (Test-Path $rAuthorized)) { New-Item -Type File -Path $rAuthorized -Force | Out-Null
+#     }
+#     if (-not (Select-String -Pattern $pubKey -Path $rAuthorized -ErrorAction SIlentlyContinue)) {
+#         $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
+#         icacls.exe $rAuthorized /inheritance:r |Out-Null
+#         icacls.exe $rAuthorized /grant:r "$($env:USERNAME):(R)"| Out-Null
+#     }
+#
+#
+# }
+#
+#
+#
+# function Initialize-Functionality {
+#     [CmdletBinding()]
+#     param(
+#         [Parameter()]
+#         [string]$sshKeyPath = $script:Config.SshKeyPath,
+#         [string]$nfsHome = $script:Config.nfsHome,
+#         [string]$adminRoot = $script:Config.AdminRoot,
+#         [string]$certName = $script:Config.certName
+#
+#     )
+#
+#     Initialize-Ssh-Environment  -nfsHome $nfsHome -keyPath $sshKeyPath
+#
+#     # 2. Ensure Document Encryption Certificate Exists in CurrentUser\My
+#     $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My | 
+#         Where-Object { $_.Subject -like '*CN=MobileDeployer*' -or $_.Subject -like "*$($certName)*" }
+#
+#     if (-not $existingCert) {
+#         $pfxFileName = "$($certName).pfx"
+#         $pfxFullPath = Join-Path $cfg.AdminRoot $pfxFileName
+#         # $securePass  = ConvertTo-SecureString -AsPlainText -Force $cfg.DefaultPass
+#         $securePass = Read-Host -AsSecureString -Prompt "[!] The decryption certificate isn't in your cert store. Please enter the administrative password to import it "
+#
+#         if (Test-Path $pfxFullPath) {
+#             Import-PfxCertificate -FilePath $pfxFullPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePass | Out-Null
+#             Write-Host "[+] Imported existing deployer certificate from: $pfxFullPath" -ForegroundColor Green
+#         } else {
+#             # Generates PFX/CER in the target directory and automatically adds to Cert:\CurrentUser\My
+#             New-DeployerCertificate -certPass $securePass -outPath $pfxFullPath
+#             Write-Host "[+] Generated and installed new deployment certificate in: $($pfxFullPath)" -ForegroundColor Green
+#         }
+#     }
+# }
 function New-WindowsPostTask-SupportAcl {
     [CmdletBinding()]
     param(
@@ -2636,7 +2639,8 @@ function Get-MobileOverview {
 
         if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyPath)) {
             $keyName = Split-Path $sshKeyPath -Leaf
-            Test-AndFixSshEnvironment -KeyPath $SshKeyPath -NfsHome $NfsHome
+            # Test-AndFixSshEnvironment -KeyPath $SshKeyPath -NfsHome $NfsHome -quiet
+            Initialize-Environment
         }
 
         $computerData = Invoke-InformationCollector `
