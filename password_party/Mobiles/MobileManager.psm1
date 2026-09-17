@@ -2406,8 +2406,9 @@ function Get-TaskData {
 
     $domainDisjoinTask = New-TaskXML -Description 'Runs once after domain disjoin' `
         -Author '[Mobile Administration]' -Execute 'powershell.exe' `
-        -Arguments "-NoProfile -ExecutionPolicyBypass -Encoded $disjoinB64" `
+        -ToEncode $disjoinB64 `
         -TriggerConfigs @($bootTrigger)
+    # -Arguments "-NoProfile -ExecutionPolicyBypass -Encoded $disjoinB64" `
 
 
     $logCollect = New-TaskXML -Description 'Mobile Auto Log Collecot' `
