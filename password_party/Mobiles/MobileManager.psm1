@@ -466,6 +466,10 @@ $script:WindowsUnregisterBlock = {
 }
 
 
+function ConvertFrom-Base64 {
+    param ([string]$text)
+    return [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($text))
+}
 
 function ConvertTo-Base64 {
     param (
@@ -2392,7 +2396,7 @@ function Get-TaskData {
 
     $taskData = @()
     $disjoinData = Get-PostDeployScript -userRights -Sharing -hasLinux:$hasLinux
-    $disjoinB64 = ConvertTo-Base64 $disjoinData
+    # $disjoinB64 = ConvertTo-Base64 $disjoinData
     $bootTrigger = @{
         Type = [TaskTriggerType]::Boot
         Delay = 'PT1M'
@@ -2406,7 +2410,7 @@ function Get-TaskData {
 
     $domainDisjoinTask = New-TaskXML -Description 'Runs once after domain disjoin' `
         -Author '[Mobile Administration]' -Execute 'powershell.exe' `
-        -ToEncode $disjoinB64 `
+        -ToEncode $disjoinData `
         -TriggerConfigs @($bootTrigger)
     # -Arguments "-NoProfile -ExecutionPolicyBypass -Encoded $disjoinB64" `
 
