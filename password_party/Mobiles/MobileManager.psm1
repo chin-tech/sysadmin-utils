@@ -2064,7 +2064,7 @@ record_action() {
             Category: $cat,
              Name: $name,
              Status: $stat,
-             Details: if ($det == "" then null else $det end)
+             Details: (if $det == "" then null else $det end)
              
         }'
         )" )
@@ -2085,7 +2085,11 @@ array_to_json() {
     $footer = @'
 # --- Result Serialization ---
 final_actions="[$(IFS=,; echo "${actions_json[*]}")]"
-final_failures="$(array_to_json "${failures[@]}" | jq -R . | jq -s .)"
+if [[ ${#failures[@]} -eq 0 ]]; then
+    final_failures="[]"
+else
+    final_failures="$(printf '%s\n' "${failures[@]}" | jq -R . | jq -s .)"
+fi
 
 jq -n \
     --arg hostname "$(hostname -s)" \
