@@ -1559,6 +1559,8 @@ function New-WindowsPostTask-SupportAcl {
 # Task: Support ACL
 
 try {
+    if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $path -Force}
+    if (-not (Get-LocalGroup ISSO -ErrorAction SilentlyContinue)) { Add-Localgroup ISSO }
     & icacls.exe '$Path' /inheritance:r /T /Q | Out-Null
 
     if (`$LASTEXITCODE -ne 0) {
@@ -1611,7 +1613,7 @@ try {
     $failedShares = @()
 
     foreach ($d in $driveList) {
-        $path = "$d`:"
+        $path = "${d}:\"
 
         if (-not (Test-Path $path)) {
             $failedShares += "$path does not exist"
@@ -1717,7 +1719,7 @@ foreach ($r in $rights) {
     $line = [regex]::Match($cfg, $pattern).Value
 
     if ($line -notmatch [regex]::Escape($objSid)) {
-        $cfg = $cfg -replace $pattern, "$0,$secSid"
+        $cfg = $cfg -replace $pattern, "${0},${secSid}"
     }
 }
 
