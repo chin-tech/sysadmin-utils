@@ -2512,42 +2512,47 @@ function Get-MobileOverview {
 
         [Parameter(ParameterSetName = 'Config')]
         [AllowNull()]
-        [PSCustomObject]$Config,
+        [object]$Config,
 
         [Parameter(ParameterSetName = 'ExplicitPaths')]
         [string]$defaultUsersPath = $Script:Config.mobileDefaultUsers,
 
         [Parameter(ParameterSetName = 'ExplicitPaths')]
-        [string]$mobileEntriesPath = $Script:Config.mobileEntries ,
+        [string]$mobileEntriesPath = $Script:Config.MobileEntries,
 
         [Parameter(ParameterSetName = 'ExplicitPaths')]
         [string]$fallBackPass = $Script:Config.fallbackPass,
 
         [Parameter(ParameterSetName = 'ExplicitPaths')]
-        [string]$nfsHome = $Script:Config.nfsHome,
-
-
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
-        [string]$mobileDumpPath = $Script:Config.mobileDump,
+        [string]$nfsHome = $Script:Config.NfsHome,
 
         [Parameter(ParameterSetName = 'ExplicitPaths')]
-        [string]$sshKeyPath = $Script:Config.sshKeyPath,
+        [string]$mobileDumpPath = $Script:Config.MobileDump,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$sshKeyPath = $Script:Config.SSHKeyPath,
 
         [Parameter()]
         [switch]$Full
     )
 
+    # 1. Resolve Active Paths Based on Parameter Set
     if ($PSCmdlet.ParameterSetName -eq 'Config') {
-        $cfg = Get-MobileConfig $config
+        $cfg = Get-MobileConfig $Config
         $defaultUsersPath  = $cfg.mobileDefaultUsers
         $mobileEntriesPath = $cfg.MobileEntries
         $fallBackPass      = $cfg.fallbackPass
         $nfsHome           = $cfg.NfsHome
-        $sshKeyPath        = $cfg.sshKeyPath
+        $sshKeyPath        = $cfg.SSHKeyPath
         $mobileDumpPath    = $cfg.MobileDump
-    }
 
-    $data = Get-MobileData -MobileName $MobileName -defaultUserpath $defaultUsersPath -mobileEntriesPath $mobileEntriesPath -fallbackPass $fallBackPass
+        $data = Get-MobileData -MobileName $MobileName -Config $cfg
+    } else {
+        $data = Get-MobileData -MobileName $MobileName `
+            -defaultUserpath $defaultUsersPath `
+            -mobileEntriesPath $mobileEntriesPath `
+            -fallbackPass $fallBackPass
+    }
 
     $width = 76
 
@@ -2588,8 +2593,11 @@ function Get-MobileOverview {
     Write-Host ("  {0,-18} {1,-18} {2,-24} {3}" -f 'USERNAME', 'GROUPS', 'FULL NAME', 'PASSWORD SET') -ForegroundColor DarkYellow
 
     foreach ($u in ($data.MobileUsers | Sort-Object Username)) {
-        $passPath    = Join-Path $mobileDumpPath $u.Username
-        $hasPassword = Test-Path $passPath
+        $hasPassword = $false
+        if (-not [string]::IsNullOrWhiteSpace($mobileDumpPath) -and (Test-Path $mobileDumpPath)) {
+            $passPath = Join-Path $mobileDumpPath $u.Username
+            $hasPassword = Test-Path $passPath
+        }
 
         $statusText  = if ($hasPassword) { "[+] SET" } else { "[-] PENDING" }
         $statusColor = if ($hasPassword) { 'Green' } else { 'DarkRed' }
@@ -2627,13 +2635,20 @@ function Get-MobileOverview {
         Write-Section -Text 'HOST TELEMETRY AUDIT' -Color Magenta
 
         if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyPath)) {
-            Initialize-Ssh-Environment -keyPath $sshKeyPath -nfsHome $nfsHome 
+            $keyName = Split-Path $sshKeyPath -Leaf
+            Initialize-Ssh-Environment -KeyName $keyName -nfsHome $nfsHome 
         }
 
-        $computerData = Invoke-InformationCollector  -winComputers $data.Windows  -linComputers $data.Linux  -sshKeyPath $sshKeyPath
+        $computerData = Invoke-InformationCollector `
+            -winComputers $data.Windows `
+            -linComputers $data.Linux `
+            -sshKeyPath $sshKeyPath
 
-        $computerData | Format-HostCollector
-
+        if (Get-Command Format-HostCollector -ErrorAction SilentlyContinue) {
+            $computerData | Format-HostCollector
+        } else {
+            $computerData | Format-Table -AutoSize
+        }
     }
 
     Write-Host "`n"
@@ -2943,15 +2958,15 @@ function Start-MobileDeployment {
         [Parameter(Mandatory = $true, Position = 0)]
         [string]$MobileName,
         [Parameter()]
-        [string]$sshKeyName = $Script:Config.sshKeyName,
-        [string]$sshKeyPath = $Script:Config.SSHKeyPath,
-        [string]$certName = $Script:Config.certName,
-        [string]$adminRoot = $Script:Config.adminRoot,
-        [string]$defaultPass = $Script:Config.defaultPass, 
-        [string]$defaultPin = $Script:Config.encryptionPin,
+        [string]$sshKeyName    = $Script:Config.sshKeyName,
+        [string]$sshKeyPath    = $Script:Config.SSHKeyPath,
+        [string]$certName      = $Script:Config.certName,
+        [string]$adminRoot     = $Script:Config.adminRoot,
+        [string]$defaultPass   = $Script:Config.defaultPass,
+        [string]$defaultPin    = $Script:Config.encryptionPin,
         [string]$oldEncryption = $Script:Config.curLuks,
-        [string]$mobileDump = $Script:Config.mobileDump,
-        [string]$nfsHome   = $Script:Config.NfsHome
+        [string]$mobileDump    = $Script:Config.mobileDump,
+        [string]$nfsHome       = $Script:Config.NfsHome
     )
 
     # $cfg = Get-MobileConfig $Config
@@ -3184,31 +3199,103 @@ function Get-WindowsInformationBlock {
 
     $parts = [System.Collections.Generic.List[string]]::new()
 
+    # 1. Inject Child Functions
     $parts.Add((Get-WindowsCollector-DiskSpace))
     $parts.Add((Get-WindowsCollector-Ivanti))
+    $parts.Add((Get-WindowsCollector-SecurityUpdates))
 
+    # 2. Add System Baseline & Aggregator Script
     $parts.Add(@'
-$disk = Get-DiskSpace
-$ivanti = Get-IvantiInformation
+# OS Build to Friendly Name Mapping
+$osInfo = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion'
+$kernelString = "$($osInfo.LCUVer)"
 
-$systemDrive = $env:SystemDrive
-$systemDisk = $disk.Volumes | Where-Object Drive -eq $systemDrive | Select-Object -First 1
+function Get-WinVersion {
+    param([int]$buildNumber)
+    $map = @{
+        2600  = "WINXP";    3790  = "WINXP64"; 6002  = "WINVISTA"; 7601  = "WIN7"
+        9200  = "WIN8";     9600  = "WIN8.1";  10240 = "WIN10-1507"; 10586 = "WIN10-1511"
+        14393 = "WIN10-1607"; 15063 = "WIN10-1703"; 16299 = "WIN10-1709"; 17134 = "WIN10-1803"
+        17763 = "WIN10-1809"; 18362 = "WIN10-1903"; 18363 = "WIN10-1909"; 19041 = "WIN10-2004"
+        19042 = "WIN10-20H2"; 19043 = "WIN10-21H1"; 19044 = "WIN10-21H2"; 19045 = "WIN10-22H2"
+        22000 = "WIN11-21H2"; 22621 = "WIN11-22H2"; 22631 = "WIN11-23H2"; 26100 = "WIN11-24H2"
+        26200 = "WIN11-25H2"; 28000 = "WIN11-26H1"; 26300 = "WIN11-26H2"
+    }
+    if ($map.ContainsKey($buildNumber)) { "$($map[$buildNumber])-$buildNumber" } else { "WIN-UNK-$buildNumber" }
+}
+
+$osString = Get-WinVersion ([int]$osInfo.CurrentBuildNumber)
+$cores = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property NumberOfCores -Sum).Sum
+
+# Software Inventory
+$packages = @(
+    Get-ItemProperty @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    ) -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
+        Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
+        Sort-Object DisplayName -Unique
+)
+
+# Symantec AV Definitions
+$symantecAvDefs = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' -ErrorAction SilentlyContinue).DefSetVersion
+
+# LAPS Scheduled Task Check
+$adminRotateScriptVersion = $null
+if (Get-ScheduledTask -TaskName 'ADMIN-LAPS' -ErrorAction SilentlyContinue) {
+    $xml = schtasks /query /tn ADMIN-LAPS /xml 2>$null
+    $versionMatch = ($xml | Select-String -Pattern '<Version>(.*?)</Version>').Matches
+    if ($versionMatch.Count) {
+        $adminRotateScriptVersion = $versionMatch[0].Groups[1].Value
+    } else {
+        $adminRotateScriptVersion = "Present"
+    }
+}
+
+# License Activation Check
+$activation = Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" -ErrorAction SilentlyContinue |
+    Where-Object PartialProductKey |
+    Select-Object -First 1 -ExpandProperty LicenseStatus
+
+$licenseStatusMap = @{
+    0 = 'Unlicensed'; 1 = 'Licensed'; 2 = 'OOB Grace'; 3 = 'OOT Grace'
+    4 = 'Non-Genuine Grace'; 5 = 'Notification'; 6 = 'Extended Grace'
+}
+$activationStatus = if ($null -ne $activation) { $licenseStatusMap[[int]$activation] } else { 'Unknown' }
+
+# Execute Modular Collectors
+$diskInfo    = Get-DiskSpace
+$ivantiInfo  = Get-IvantiInformation
+$updateInfo  = Get-SecurityUpdateInformation
+
+$systemDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+$systemDisk  = $diskInfo.Volumes | Where-Object Drive -eq $systemDrive | Select-Object -First 1
 
 [PSCustomObject]@{
     HostName = $env:COMPUTERNAME
-    Platform = 'Windows'
+    Platform = $osString
 
     Summary = [PSCustomObject]@{
-        DiskFreeGB     = $systemDisk.FreeGB
-        DiskLow        = $disk.LowSpace
-        IvantiVersion  = $ivanti.Version
-        IvantiServices = $ivanti.AutomaticServicesReady
-        IvantiPolicy   = $ivanti.PolicyStatus
+        Kernel              = $kernelString
+        Cores               = $cores
+        PackageCount        = $packages.Count
+        AdminRotateVersion  = $adminRotateScriptVersion
+        AVDefs              = $symantecAvDefs
+        IvantiVersion       = $ivantiInfo.Version
+        IvantiServicesReady = $ivantiInfo.AutomaticServicesReady
+        License             = $activationStatus
+        LastUpdate          = $updateInfo.LastUpdate
+        DiskFreeGB          = $systemDisk.FreeGB
+        DiskLow             = $diskInfo.LowSpace
     }
 
     Details = [PSCustomObject]@{
-        Disks  = $disk.Volumes
-        Ivanti = $ivanti
+        Packages = $packages
+        Updates  = $updateInfo.UpdateHistory
+        Disks    = $diskInfo.Volumes
+        Ivanti   = $ivantiInfo
     }
 }
 '@)
@@ -3257,29 +3344,195 @@ function Get-LinuxInformationScript {
     param()
 
     $parts = [System.Collections.Generic.List[string]]::new()
-
     $parts.Add('#!/usr/bin/env bash')
     $parts.Add((Get-LinuxCollector-DiskSpace))
 
     $parts.Add(@'
-jq -n --arg hostname "$(hostname -s)" --argjson disks "$disk_json" '{
+hostname_value="$(hostname -s)"
+cores_value="$(nproc)"
+os=$(. /etc/os-release && echo "${ID^^}-${VERSION_ID}")
+kernel_value="$(uname -r)"
+
+clamav_value="$(clamscan -V 2>/dev/null | awk -F'/' '{print $NF}' | xargs -I{} date -d "{}" +'%d/%m/%Y' 2>/dev/null)"
+
+last_update_value="$(
+    (yum history list 2>/dev/null || dnf history list 2>/dev/null) |
+        awk -F'|' '
+            tolower($0) ~ /(update|upgrade)/ {
+                gsub(/^[ \t]+|[ \t]+$/, "", $0)
+                print
+                exit
+            }
+        '
+)"
+
+laps_path="$(find /etc/systemd -iname '*laps*' -type f 2>/dev/null | head -n 1)"
+laps_version=$([[ -n "$laps_path" ]] && echo "Present" || echo "")
+
+# Filter RPM packages installed after system baseline cutoff
+base_epoch=$(rpm -q --qf '%{INSTALLTIME}' basesystem 2>/dev/null || rpm -q --qf '%{INSTALLTIME}' setup 2>/dev/null)
+cutoff=$(( ${base_epoch:-0} + 1800 ))
+
+packages_json="$(
+    rpm -qa --qf '%{INSTALLTIME}|%{NAME}|%{VERSION}-%{RELEASE}|%{ARCH}\n' 2>/dev/null |
+    awk -F'|' -v cutoff="$cutoff" '$1 > cutoff { print $2 "|" $3 "|" $4 }' |
+    jq -R -s '
+        split("\n") | map(select(length > 0)) | map(
+            split("|") | {Name: .[0], Version: .[1], Arch: .[2]}
+        )
+    '
+)"
+package_count="$(jq 'length' <<< "$packages_json")"
+
+jq -n \
+    --arg hostname "$hostname_value" \
+    --arg os "$os" \
+    --arg kernel "$kernel_value" \
+    --argjson cores "$cores_value" \
+    --argjson packageCount "$package_count" \
+    --arg laps "$laps_version" \
+    --arg avDefs "$clamav_value" \
+    --arg lastUpdate "$last_update_value" \
+    --argjson packages "$packages_json" \
+    --argjson disks "$disk_json" \
+'
+{
     HostName: $hostname,
-    Platform: "Linux",
+    Platform: $os,
+
     Summary: {
+        Kernel: $kernel,
+        Cores: $cores,
+        PackageCount: $packageCount,
+        AdminRotateVersion: $laps,
+        AVDefs: $avDefs,
+        IvantiVersion: null,
+        IvantiServicesReady: null,
+        License: null,
+        LastUpdate: $lastUpdate,
         DiskFreeGB: ($disks | map(select(.MountPoint == "/")) | first | .FreeGB),
-        DiskLow: ($disks | any(.FreeGB < 20 or .FreePercent < 10))
+        DiskLow: ($disks | any(.LowSpace == true))
     },
+
     Details: {
-        Disks: $disks
+        Packages: $packages,
+        Updates: [],
+        Disks: $disks,
+        Ivanti: null
     }
-}'
+}
+'
 '@)
 
     return $parts -join "`n`n"
 }
 
+# =====================================================================
+# Main Multi-Platform Remote Orchestrator
+# =====================================================================
 
 function Invoke-InformationCollector {
+    [CmdletBinding()]
+    param(
+        [Parameter()][array]$winComputers,
+        [Parameter()][array]$linComputers,
+        [Parameter()][string]$sshKeyPath
+    )
+
+    $winResult = @()
+    $linResult = @()
+
+    # --- Windows Node Processing ---
+    if (@($winComputers).Count -gt 0) {
+        $winFails = [System.Collections.Generic.List[object]]::new()
+        $winScriptBlock = Get-WindowsInformationBlock
+
+        $rawWindows = Invoke-Command `
+            -ComputerName $winComputers `
+            -ScriptBlock $winScriptBlock `
+            -ErrorAction SilentlyContinue `
+            -ErrorVariable winFails
+
+        $winResult = @(
+            foreach ($r in $rawWindows) {
+                [PSCustomObject]@{
+                    HostName = $r.HostName
+                    Platform = $r.Platform
+                    Success  = $true
+                    Summary  = $r.Summary
+                    Details  = $r.Details
+                    Failures = @()
+                }
+            }
+        )
+
+        foreach ($computer in $winComputers) {
+            if ($winResult.HostName -contains $computer) { continue }
+
+            $hostErrors = @($winFails | Where-Object { $_.TargetObject -eq $computer -or $_.OriginInfo.PSComputerName -eq $computer })
+            $winResult += [PSCustomObject]@{
+                HostName = $computer
+                Platform = 'Windows'
+                Success  = $false
+                Summary  = $null
+                Details  = $null
+                Failures = if ($hostErrors) { @($hostErrors.Exception.Message) } else { @('No result returned from remote host.') }
+            }
+        }
+    }
+
+    # --- Linux Node Processing ---
+    if (@($linComputers).Count -gt 0) {
+        $bashScript = Get-LinuxInformationScript
+
+        $rawLinux = Invoke-Linux `
+            -Computers $linComputers `
+            -Script $bashScript `
+            -KeyPath $sshKeyPath
+
+        $linResult = @(
+            foreach ($r in $rawLinux) {
+                if ($r.ExitCode -ne 0) {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Summary  = $null
+                        Details  = $null
+                        Failures = @(if ($r.StdErr) { $r.StdErr } else { "SSH exited with code $($r.ExitCode)" })
+                    }
+                    continue
+                }
+
+                try {
+                    $p = $r.StdOut | ConvertFrom-Json
+                    [PSCustomObject]@{
+                        HostName = $p.HostName
+                        Platform = $p.Platform
+                        Success  = $true
+                        Summary  = $p.Summary
+                        Details  = $p.Details
+                        Failures = @()
+                    }
+                } catch {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Summary  = $null
+                        Details  = $null
+                        Failures = @("Invalid JSON response: $($_.Exception.Message)")
+                    }
+                }
+            }
+        )
+    }
+
+    return @($winResult) + @($linResult)
+}
+
+
+function Invoke-InformationCollectorOld {
     [CmdletBinding()]
     param([Parameter()][array]$winComputers, [array]$linComputers, [string]$sshKeyPath)
 
