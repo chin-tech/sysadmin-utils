@@ -1818,7 +1818,7 @@ function record_failure {
     Success  = ($failures.Count -eq 0)
     Actions  = $actions.ToArray()
     Failures = $failures.ToArray()
-}
+} | Export-CLIXML C:\Post-Deployment.xml
 '@)
 
     return ($tasks -join "`n`n")
