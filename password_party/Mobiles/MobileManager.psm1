@@ -1284,7 +1284,7 @@ function Test-AndFixDeployerCert {
             Import-PfxCertificate -FilePath $pfxFile -CertStoreLocation Cert:\CurrentUser\My -Password $CertPassword -ErrorAction Stop | Out-Null
             return (New-InitResult -Component 'Cert:Store' -Status 'REPAIRED' -Details "Imported $pfxFile")
         } catch {
-            return (New-InitResult -Component 'Cert:Store' -Status 'FAILED' -Details "Failed to import $pfxFile: $($_.Exception.Message)" -Fatal)
+            return (New-InitResult -Component 'Cert:Store' -Status 'FAILED' -Details "Failed to import $pfxFile : $($_.Exception.Message)" -Fatal)
         }
     }
 
