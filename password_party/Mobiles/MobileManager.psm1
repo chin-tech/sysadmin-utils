@@ -2636,7 +2636,7 @@ function Get-MobileOverview {
 
         if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyPath)) {
             $keyName = Split-Path $sshKeyPath -Leaf
-            Initialize-Ssh-Environment -KeyName $keyName -nfsHome $nfsHome 
+            Test-AndFixSshEnvironment -KeyPath $SshKeyPath -NfsHome $NfsHome
         }
 
         $computerData = Invoke-InformationCollector `
