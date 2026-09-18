@@ -1991,14 +1991,22 @@ mapfile -t luks_devices < <(
     lsblk -prno NAME,FSTYPE 2>/dev/null | awk '`$2 == "crypto_LUKS" {print `$1}'
 )
 
-for dev in "`${luks_devices[@]}"; do
-    if printf "%s\n%s\n" '$CurrentPass' '$NewPin' | dzdo cryptsetup luksAddKey --force --batch-mode "`$dev" &>/dev/null; then
-        record_action 'DiskEncryption' "`$dev" 'Success'
-    else
-        record_action 'DiskEncryption' "`$dev" 'Failed'
-        record_failure "Disk encryption `$dev: failed to add LUKS key"
-    fi
-done
+if [[ "`${#luks_devices[@]}" -eq 0 ]]; then
+    record_action 'DiskEncryption' "ALL" 'Failed'
+    record_failure 'No encrypted partitions'
+else
+    for dev in "`${luks_devices[@]}"; do
+        if printf "%s\n%s\n" '$CurrentPass' '$NewPin' | dzdo cryptsetup luksAddKey --force --batch-mode "`$dev" &>/dev/null; then
+            record_action 'DiskEncryption' "`$dev" 'Success'
+        else
+            record_action 'DiskEncryption' "`$dev" 'Failed'
+            record_failure "Disk encryption `$dev: failed to add LUKS key"
+        fi
+    done
+
+fi
+
+
 "@
 }
 
