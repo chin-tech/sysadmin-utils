@@ -1560,7 +1560,7 @@ function New-WindowsPostTask-SupportAcl {
 
 try {
     if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $path -Force}
-    if (-not (Get-LocalGroup ISSO -ErrorAction SilentlyContinue)) { Add-Localgroup ISSO }
+    if (-not (Get-LocalGroup ISSO -ErrorAction SilentlyContinue)) { New-LocalGroup ISSO }
     & icacls.exe '$Path' /inheritance:r /T /Q | Out-Null
 
     if (`$LASTEXITCODE -ne 0) {
@@ -1681,17 +1681,17 @@ $sharingSid = (Get-LocalUser -Name 'mobile-smb-access').Sid.Value
     return $sharingSetup + @'
 # Task: User Rights
 
-$tmpSec = Join-Path $env:TEMP 'sec_export.inf'
-$tmpDB  = Join-Path $env:TEMP 'sec_temp.sdb'
 
-secedit /export /cfg $tmpSec /quiet
 
-$objUser = New-Object System.Security.Principal.NTAccount('Authenticated Users')
-$objSid = $objUser.Translate(
+$tmpSec = Join-Path -Path $env:TEMP -ChildPath 'sec_export.inf'
+$tmpDB  = Join-Path -Path $env:TEMP -ChildPath 'sec_temp.sdb'
+
+secedit /export /cfg $tmpSec /areas USER_RIGHTS /quiet
+
+$objUser = [System.Security.Principal.NTAccount]'Authenticated Users'
+$objSid  = $objUser.Translate(
     [System.Security.Principal.SecurityIdentifier]
 ).Value
-
-$secSid = "*$objSid"
 
 $rights = @(
     'SeInteractiveLogonRight',
@@ -1706,44 +1706,78 @@ $denyRights = @(
     'SeDenyServiceLogonRight'
 )
 
-$cfg = Get-Content -Raw -Encoding Unicode $tmpSec
+$cfg = Get-Content -Path $tmpSec -Raw -Encoding Unicode
 
+# Ensure the [Privilege Rights] header exists
+if ($cfg -notmatch '(?m)^\[Privilege Rights\]') {
+    $cfg += "`r`n[Privilege Rights]`r`n"
+}
+
+function Add-PrivilegeRight {
+    param(
+        [string]$ConfigText,
+        [string]$RightName,
+        [string]$RawSid
+    )
+
+    $secSid = "*$RawSid"
+    $pattern = "(?m)^(\s*$([regex]::Escape($RightName))\s*=\s*)([^\r\n]*)"
+
+    $matchResult = [regex]::Match($ConfigText, $pattern)
+
+    if ($matchResult.Success) {
+
+        $existingSids = @(
+            $matchResult.Groups[2].Value.Split(',') |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ }
+        )
+
+        if ($secSid -notin $existingSids) {
+
+            $newValues = @($existingSids + $secSid) -join ','
+
+            $ConfigText = [regex]::Replace(
+                $ConfigText,
+                $pattern,
+                {
+                    param($match)
+                    $match.Groups[1].Value + $newValues
+                }
+            )
+        }
+    }
+    else {
+        $ConfigText = $ConfigText -replace `
+            '(?m)^\[Privilege Rights\]', `
+            "[Privilege Rights]`r`n$RightName = $secSid"
+    }
+
+    return $ConfigText
+}
+
+# 1. Apply grant rights
 foreach ($r in $rights) {
-    $pattern = "(?m)^\s*$([regex]::Escape($r))\s*=[^\r\n]*"
-
-    if ($cfg -notmatch $pattern) {
-        $cfg += "`r`n$r = $secSid"
-        continue
-    }
-
-    $line = [regex]::Match($cfg, $pattern).Value
-
-    if ($line -notmatch [regex]::Escape($objSid)) {
-        $cfg = $cfg -replace $pattern, "${0},${secSid}"
-    }
+    $cfg = Add-PrivilegeRight `
+        -ConfigText $cfg `
+        -RightName $r `
+        -RawSid $objSid
 }
 
+# 2. Apply deny rights
 if ($sharingSid) {
-    $shareSid = "*$sharingSid"
-
     foreach ($r in $denyRights) {
-        $pattern = "(?m)^\s*$([regex]::Escape($r))\s*=[^\r\n]*"
-
-        if ($cfg -notmatch $pattern) {
-            $cfg += "`r`n$r = $shareSid"
-            continue
-        }
-
-        $line = [regex]::Match($cfg, $pattern).Value
-
-        if ($line -notmatch [regex]::Escape($sharingSid)) {
-            $cfg = $cfg -replace $pattern, "$0,$shareSid"
-        }
+        $cfg = Add-PrivilegeRight `
+            -ConfigText $cfg `
+            -RightName $r `
+            -RawSid $sharingSid
     }
 }
 
+# Write configuration
 $cfg | Set-Content -Path $tmpSec -Encoding Unicode
 
+# Apply configuration
 secedit /configure `
     /db $tmpDB `
     /cfg $tmpSec `
@@ -1758,7 +1792,8 @@ else {
     record_failure "User rights configuration failed: exit code $LASTEXITCODE"
 }
 
-Remove-Item $tmpSec, $tmpDB -Force -ErrorAction SilentlyContinue
+# Cleanup
+Remove-Item -Path $tmpSec, $tmpDB -Force -ErrorAction SilentlyContinue
 '@
 }
 
