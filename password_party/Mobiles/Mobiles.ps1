@@ -89,7 +89,7 @@ switch ($PSCmdlet.ParameterSetName) {
     }
 
     'RegisterDeployment' {
-        Register-Deployment -MobileName $Name @passThru
+        Register-MobileDeployment -MobileName $Name @passThru
     }
 
     'UnRegisterDeployment' {
