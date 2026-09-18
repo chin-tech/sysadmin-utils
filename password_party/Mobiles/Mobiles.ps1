@@ -23,7 +23,8 @@ param(
 
     # --- Target Name ---
     [Parameter(Mandatory = $false, ParameterSetName = 'Info', Position = 0)]
-    [Parameter(Mandatory = $true, ParameterSetName = 'Deploy', Position = 0)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'RegisterDeployment', Position = 0)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'UnRegisterDeployment', Position = 0)]
     [Parameter(Mandatory = $true, ParameterSetName = 'GPOAdd', Position = 0)]
     [Parameter(Mandatory = $true, ParameterSetName = 'GPORemove', Position = 0)]
     [string]$Name,
