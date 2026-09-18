@@ -2971,9 +2971,10 @@ function Format-DeploymentResults {
             Host = $host
 
             # Privileges = Get-AggregateStatus  -Result $result  -Category 'Privilege'
-            NetworkSharing = Get-AggregateStatus -Result $result -Category 'NetworkSharing'
+            # NetworkSharing = Get-AggregateStatus -Result $result -Category 'NetworkSharing'
 
-            ScheduledTasks = Get-AggregateStatus  -Result $result  -Category 'ScheduledTask'
+            LogArchiveTask = Get-AggregateStatus -Result $result -Category 'Task: LogArchive'
+            # ScheduledTasks = Get-AggregateStatus  -Result $result  -Category 'ScheduledTask'
 
             Encryption = Get-AggregateStatus  -Result $result  -Category 'DiskEncryption'
 
@@ -2984,7 +2985,7 @@ function Format-DeploymentResults {
             }
 
             PostDisjoin = if ($result.Platform -eq 'Windows') {
-                Get-AggregateStatus  -Result $result  -Category 'PostDisjoin'
+                Get-AggregateStatus  -Result $result  -Category 'Task: Disjoin'
             } else {
                 'N/A'
             }
@@ -2994,15 +2995,7 @@ function Format-DeploymentResults {
     Write-Host ""
     Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
 
-    $taskRows | Sort-Object Host | Format-Table `
-        Host,
-    NetworkSharing,
-    ScheduledTasks,
-    Encryption,
-    DomainDisjoin,
-    PostDisjoin `
-        -AutoSize
-
+    $taskRows | Sort-Object Host | Format-Table -AutoSize
     #
     # FAILURES
     #
