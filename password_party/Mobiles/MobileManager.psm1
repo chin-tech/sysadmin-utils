@@ -1560,14 +1560,14 @@ function New-WindowsPostTask-SupportAcl {
 
 try {
     if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $path -Force}
-    if (-not (Get-LocalGroup ISSO -ErrorAction SilentlyContinue)) { New-LocalGroup ISSO }
+    if (-not (Get-LocalGroup ISSO -ErrorAction SilentlyContinue)) { New-LocalGroup ISSO -Description "Mobile ISSO Group"}
     & icacls.exe '$Path' /inheritance:r /T /Q | Out-Null
 
     if (`$LASTEXITCODE -ne 0) {
         throw "inheritance command failed with `$LASTEXITCODE"
     }
 
-    & icacls.exe '$Path' /grant Administrators:F ISSO:F /T /Q | Out-Null
+    & icacls.exe '$Path' /grant Administrators:F ISSO:F System:F /T /Q | Out-Null
 
     if (`$LASTEXITCODE -ne 0) {
         throw "grant command failed with `$LASTEXITCODE"
@@ -1689,9 +1689,7 @@ $tmpDB  = Join-Path -Path $env:TEMP -ChildPath 'sec_temp.sdb'
 secedit /export /cfg $tmpSec /areas USER_RIGHTS /quiet
 
 $objUser = [System.Security.Principal.NTAccount]'Authenticated Users'
-$objSid  = $objUser.Translate(
-    [System.Security.Principal.SecurityIdentifier]
-).Value
+$objSid  = $objUser.Translate( [System.Security.Principal.SecurityIdentifier]).Value
 
 $rights = @(
     'SeInteractiveLogonRight',
@@ -1709,9 +1707,7 @@ $denyRights = @(
 $cfg = Get-Content -Path $tmpSec -Raw -Encoding Unicode
 
 # Ensure the [Privilege Rights] header exists
-if ($cfg -notmatch '(?m)^\[Privilege Rights\]') {
-    $cfg += "`r`n[Privilege Rights]`r`n"
-}
+if ($cfg -notmatch '(?m)^\[Privilege Rights\]') { $cfg += "`r`n[Privilege Rights]`r`n" }
 
 function Add-PrivilegeRight {
     param(
@@ -1727,11 +1723,7 @@ function Add-PrivilegeRight {
 
     if ($matchResult.Success) {
 
-        $existingSids = @(
-            $matchResult.Groups[2].Value.Split(',') |
-                ForEach-Object { $_.Trim() } |
-                Where-Object { $_ }
-        )
+        $existingSids = @( $matchResult.Groups[2].Value.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
         if ($secSid -notin $existingSids) {
 
