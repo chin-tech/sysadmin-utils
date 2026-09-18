@@ -266,10 +266,13 @@ $script:WindowsDeployBlock = {
     foreach ($t in $payload.TaskData) {
 
         $success = Invoke-Step  -Context "Scheduled task '$($t.TaskName)'"  -Action { Register-ScheduledTask  -TaskName $t.TaskName  -Xml $t.TaskXML  -User System  -Force  -ErrorAction Stop }
+        $cat = switch ($t.TaskName) {
+            "Mobile-LogArchiver" {"Task: Log Archive"}
+            "Mobile-DisjoinTask" {"Task: Disjoin"}
+        }
 
-        Add-Action  -Category 'ScheduledTask'  -Name $t.TaskName  -Status $(if ($success) { 'Changed' 
-            } else { 'Failed' 
-            })
+
+        Add-Action  -Category $cat  -Name $t.TaskName  -Status $(if ($success) { 'OK' } else { 'Failed' })
     }
 
     #
@@ -1967,9 +1970,9 @@ EOF
 dzdo systemctl daemon-reload &>/dev/null
 
 if dzdo systemctl enable --now mobile-logrotate.timer &>/dev/null; then
-    record_action 'ScheduledTask' 'mobile-logrotate.timer' 'Success'
+    record_action 'Task: LogArchive' 'mobile-logrotate.timer' 'Success'
 else
-    record_action 'ScheduledTask' 'mobile-logrotate.timer' 'Failed'
+    record_action 'Task: LogArchive' 'mobile-logrotate.timer' 'Failed'
     record_failure "Scheduled task 'mobile-logrotate.timer': failed to enable"
 fi
 "@
