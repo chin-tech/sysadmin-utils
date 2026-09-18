@@ -267,7 +267,7 @@ $script:WindowsDeployBlock = {
 
         $success = Invoke-Step  -Context "Scheduled task '$($t.TaskName)'"  -Action { Register-ScheduledTask  -TaskName $t.TaskName  -Xml $t.TaskXML  -User System  -Force  -ErrorAction Stop }
         $cat = switch ($t.TaskName) {
-            "Mobile-LogArchiver" {"Task: Log Archive"}
+            "Mobile-LogArchiver" {"Task: LogArchive"}
             "Mobile-DisjoinTask" {"Task: Disjoin"}
         }
 
