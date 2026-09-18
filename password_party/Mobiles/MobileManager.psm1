@@ -425,22 +425,6 @@ $script:WindowsUnregisterBlock = {
         }
     }
 
-    foreach ($t in $taskData) {
-        $existingTask = Get-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue
-
-        if ($existingTask) {
-            Invoke-Step -Category 'ScheduledTask' -Name $t.TaskName -ScriptBlock {
-                Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false -ErrorAction Stop
-            } | Out-Null
-        } else {
-            $actions.Add([PSCustomObject]@{
-                    Category = 'ScheduledTask'
-                    Name     = $t.TaskName
-                    Status   = 'Success'
-                    Details  = 'Already absent'
-                })
-        }
-    }
 
     Invoke-Step -Category 'DiskEncryption' -Name 'C:' -ScriptBlock {
         $tpm = Get-Tpm -ErrorAction Stop
@@ -1549,6 +1533,41 @@ function New-DeployerCertificate {
 #         }
 #     }
 # }
+#
+
+function Get-WindowsTask-LogArchiver {
+    return {
+        $system = Get-CimInstance -ClassName Win32_ComputerSystem
+        if (-not ($system.PartOfDomain)) { return }
+        $issoGroupParams = @{
+            Name = "ISSO"
+            Description = "[Mobile] - ISSO GROUP"
+        }
+        if (-not (Get-LocalGroup "ISSO" -ErrorAction SilentlyContinue)) { New-LocalGroup @issoGroupParams } else { Set-LocalGroup @issoGroupParams }
+        $archivePath = "C:\Support\Logs"
+        Start-Transcript -Path "C:\Support\Errata.log"
+        if (-not (Test-Path -Path $archivePath)) { New-Item -ItemType Directory -Path $archivePath -Force }
+        & icacls.exe $archivePath /inheritance:r /T /Q | Out-Null
+        & icacls.exe $archivePath /grant Administrators:F ISSO:F System:F /T /Q | Out-Null
+
+        $timeStamp = Get-Date -Format 'yyyy-MM-dd-HHmmss'
+        $logNames = @(
+            "Application"
+            "System"
+            "Security"
+        )
+        foreach ($ln in $logNames) {
+            $bkUp = Join-Path $archivePath "${ln}_${timeStamp}.evtx"
+            if (Test-Path $bkUp) { throw "Target $bkup exists!" }
+            wevtutil cl $ln "/bu:${bkUp}"
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "wevtutil failed with code: $LASTEXITCODE -- Log: $ln was left untouched "
+            }
+        }
+        Stop-Transcript
+        
+    }
+}
 function New-WindowsPostTask-SupportAcl {
     [CmdletBinding()]
     param(
@@ -1559,8 +1578,12 @@ function New-WindowsPostTask-SupportAcl {
 # Task: Support ACL
 
 try {
+    `$issoGroupParams = @{
+        Name = "ISSO"
+        Description = "Mobile ISSO Group"
+    }
     if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $path -Force}
-    if (-not (Get-LocalGroup ISSO -ErrorAction SilentlyContinue)) { New-LocalGroup ISSO -Description "Mobile ISSO Group"}
+    if (-not (Get-LocalGroup ISSO -ErrorAction SilentlyContinue)) { New-LocalGroup @issoGroupParams } else { Set-LocalGroup @issoGroupParams }
     & icacls.exe '$Path' /inheritance:r /T /Q | Out-Null
 
     if (`$LASTEXITCODE -ne 0) {
@@ -1836,7 +1859,7 @@ function record_failure {
 
     if ($Sharing) { $tasks.Add( (New-WindowsPostTask-NetworkSharing  -DriveLetters $DriveLetters)) }
 
-    $tasks.Add( (New-WindowsPostTask-SupportAcl))
+    # $tasks.Add( (New-WindowsPostTask-SupportAcl))
 
     $tasks.Add(@'
 "[ Post Deployment Ran - $(Get-Date) ]" |
@@ -2444,11 +2467,11 @@ function Get-TaskData {
     # -Arguments "-NoProfile -ExecutionPolicyBypass -Encoded $disjoinB64" `
 
 
-    $logCollect = New-TaskXML -Description 'Mobile Auto Log Collecot' `
-        -Author '[Mobile Administration]' -Execute 'C:\Supportbin\logcollect' `
-        -TriggerConfigs @($weeklyTrigger)
+    $logCollect = New-TaskXML -Description 'Mobile Auto Log Archiver' `
+        -Author '[Mobile Administration]' -Execute 'powershell.exe' `
+        -ToEncode (Get-WindowsTask-LogArchiver).ToString() -TriggerConfigs @($weeklyTrigger)
 
-    $taskData += @([PsCustomObject]@{Taskname = "Mobile-LogCollect"; TaskXml = $logCollect})
+    $taskData += @([PsCustomObject]@{Taskname = "Mobile-LogArchiver"; TaskXml = $logCollect})
     $taskData += @([PsCustomObject]@{Taskname = "Mobile-DisjoinTask"; TaskXml = $domainDisjoinTask})
     
     return $taskData
