@@ -4,8 +4,11 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'Info')]
     [switch]$Info,
 
-    [Parameter(Mandatory = $true, ParameterSetName = 'Deploy')]
-    [switch]$Deploy,
+    [Parameter(Mandatory = $true, ParameterSetName = 'RegisterDeployment')]
+    [switch]$RegisterDeployment,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'UnRegisterDeployment')]
+    [switch]$UnRegisterDeployment,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'GPOAdd')]
     [Parameter(Mandatory = $true, ParameterSetName = 'GPORemove')]
@@ -48,59 +51,50 @@ param(
 $modulePath = Join-Path $PSScriptRoot 'MobileManager.psd1'
 Import-Module $modulePath -Force
 $overrideFile = "cfg.psd1"
-$ConfigOverRide = if (Test-Path $overrideFile)
-{
+$ConfigOverRide = if (Test-Path $overrideFile) {
     Import-PowerShellDataFile -Path $overrideFile
-} else
-{
+} else {
     $null
 }
 
 
 $passThru = @{}
-if ($ConfigOverride)
-{
+if ($ConfigOverride) {
     $passThru['Config'] = $ConfigOverride
 }
-if ($PSBoundParameters.ContainsKey('Debug'))
-{
+if ($PSBoundParameters.ContainsKey('Debug')) {
     $passThru['Debug'] = $true
 }
 
-if ($PSBoundParameters.ContainsKey('Verbose'))
-{
+if ($PSBoundParameters.ContainsKey('Verbose')) {
     $passThru['Verbose'] = $true
 }
 
-switch ($PSCmdlet.ParameterSetName)
-{
-    'Info'
-    {
-        if ([string]::IsNullOrWhiteSpace($Name))
-        {
+switch ($PSCmdlet.ParameterSetName) {
+    'Info' {
+        if ([string]::IsNullOrWhiteSpace($Name)) {
             Get-MobileOverview @passThru
-        } else
-        {
+        } else {
             Get-MobileOverview -MobileName $Name -Full:$Full @passThru
         }
     }
 
-    'GPOAdd'
-    {
+    'GPOAdd' {
         Set-MobileGpoPermission -MobileName $Name -Add @passThru
     }
 
-    'GPORemove'
-    {
+    'GPORemove' {
         Set-MobileGpoPermission -MobileName $Name -Remove -Force:$Force @passThru
     }
 
-    'Deploy'
-    {
-        Start-MobileDeployment -MobileName $Name @passThru
+    'RegisterDeployment' {
+        Register-Deployment -MobileName $Name @passThru
     }
-    'NewMobile'
-    {
+
+    'UnRegisterDeployment' {
+        UnRegister-Deployment -MobileName $Name @passThru
+    }
+    'NewMobile' {
         New-MobileDeployment @passThru
 
     }

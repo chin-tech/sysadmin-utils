@@ -3022,7 +3022,7 @@ function Format-DeploymentResults {
 }
 
 
-function Start-MobileDeployment {
+function Register-MobileDeployment {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true, Position = 0)]
