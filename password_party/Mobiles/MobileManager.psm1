@@ -3052,8 +3052,20 @@ function Format-DeploymentResults {
 
     Write-Host ""
     Write-Host "[USERS]" -ForegroundColor Cyan
+    $curUser = ""
+    foreach ($uRow in $userRows | Sort-Object User) {
+        if ($curUser -eq $uRow.User)  {
+            if ($status -eq 'OK') {Write-Host "`t[+] $($u.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($u.Host)" -ForegroundColor Red}
+           
+        } else {
+            $curUser = $uRow.User
+            Write-Host "$($curUser)`t$(($roles -join '.'))`t$password" -ForegroundColor Yellow
+            if ($status -eq 'OK') {Write-Host "`t[+] $($u.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($u.Host)" -ForegroundColor Red}
+        }
 
-    $userRows | Sort-Object Host, User | Format-Table Host, User, Groups, Status, Password -AutoSize
+    }
+
+    # $userRows | Sort-Object Host, User | Format-Table Host, User, Groups, Status, Password -AutoSize
 
     #
     # DEPLOYMENT TASKS
