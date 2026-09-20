@@ -4845,7 +4845,7 @@ function Unregister-Deployment {
         $payload = [PSCustomObject]@{
             MobileName = $MobileName
             TaskData = $taskData
-            Archive =  $archive
+            Archive =  [bool]$archive.IsPresent
             AllUsers = $mobileData.AllUsers
             Bitlocker = $oldEncryption
         }
