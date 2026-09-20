@@ -323,9 +323,8 @@ $script:WindowsDeployBlock = {
 $script:WindowsUnregisterBlock = {
     param([PSCustomObject]$payload)
 
-    $archive  = [bool]$payload.Archive
-    $allUsers = @($payload.AllUsers)
-    # $taskData = @($payload.TaskData)
+    $archive   = [bool]$payload.Archive
+    $allUsers  = @($payload.AllUsers)
 
     $timeStamp   = (Get-Date).ToString('yyyyMMdd')
     $monthYear   = (Get-Date).ToString('MM-yyyy')
@@ -366,64 +365,91 @@ $script:WindowsUnregisterBlock = {
         }
     }
 
+    # Ensure archive directory exists if archiving is enabled
     $archiveReady = $true
-
     if ($archive) {
         $archiveReady = Invoke-Step -Category 'ArchiveDirectory' -Name $archivePath -ScriptBlock {
-            if (-not (Test-Path $archivePath)) {
+            if (-not (Test-Path -LiteralPath $archivePath)) {
                 New-Item -ItemType Directory -Force -Path $archivePath -ErrorAction Stop | Out-Null
             }
+            $archivePath
         }
     }
 
     foreach ($u in $allUsers) {
-        $name = $u.Name
+        $name        = $u.Name
         $profilePath = "C:\Users\$name"
-        $localUser = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
-        $sid = if ($localUser) { $localUser.SID.Value } else { $null }
+        $localUser   = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+        $sid         = if ($localUser) { $localUser.SID.Value } else { $null }
 
+        # -------------------------------------------------------------
+        # 1. LOG OFF USER SESSIONS FIRST (Free locked files & registry)
+        # -------------------------------------------------------------
+        Invoke-Step -Category 'UserLogoff' -Name $name -ScriptBlock {
+            $sessions = query session 2>&1
+            foreach ($line in $sessions) {
+                # Format: SESSIONNAME USERNAME ID STATE ...
+                if ($line -match "\b$([regex]::Escape($name))\b") {
+                    $parts = ($line.Trim() -replace '\s+', ' ').Split(' ')
+                    # If SESSIONNAME is blank (e.g. disconnected), username is index 0, ID is index 1
+                    # If SESSIONNAME exists, username is index 1, ID is index 2
+                    $targetId = if ($parts[0] -ieq $name) { $parts[1] } else { $parts[2] }
+
+                    if ($targetId -match '^\d+$') {
+                        Write-Host " --- Logging off user: $name (Session ID: $targetId)"
+                        logoff $targetId
+                    }
+                }
+            }
+            # Wait briefly for Explorer and NTUSER.DAT handles to unload
+            Start-Sleep -Seconds 2
+        } | Out-Null
+
+        # Skip archiving/removal if archive path failed to create
         if ($archive -and -not $archiveReady) {
             continue
         }
 
-        if ($archive -and (Test-Path $profilePath)) {
+        # -------------------------------------------------------------
+        # 2. ARCHIVE USER PROFILE
+        # -------------------------------------------------------------
+        if ($archive -and (Test-Path -LiteralPath $profilePath)) {
             $archiveFile = Join-Path $archivePath "$name-$timeStamp.zip"
 
             $archiveOk = Invoke-Step -Category 'ProfileArchive' -Name $name -ScriptBlock {
-                Compress-Archive -Path $profilePath -DestinationPath $archiveFile -CompressionLevel Optimal -Force -ErrorAction Stop
+                Compress-Archive -Path "$profilePath\*" -DestinationPath $archiveFile -CompressionLevel Optimal -Force -ErrorAction Stop
                 $archiveFile
             }
 
             if (-not $archiveOk) { continue }
         }
 
-        if (Test-Path $profilePath) {
+        # -------------------------------------------------------------
+        # 3. REMOVE PROFILE (WMI first to clean registry, then disk)
+        # -------------------------------------------------------------
+        if (Test-Path -LiteralPath $profilePath) {
             $profileOk = Invoke-Step -Category 'ProfileRemoval' -Name $name -ScriptBlock {
-                $profileObject = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object { ($sid -and $_.SID -eq $sid) -or $_.LocalPath -ieq $profilePath }
+                $profileObject = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
+                    Where-Object { ($sid -and $_.SID -eq $sid) -or $_.LocalPath -ieq $profilePath }
 
-                if ($profileObject) { $profileObject | Remove-CimInstance -ErrorAction Stop }
-                if (Test-Path $profilePath) { Remove-Item -Path $profilePath -Recurse -Force -ErrorAction Stop }
+                if ($profileObject) { 
+                    $profileObject | Remove-CimInstance -ErrorAction Stop 
+                }
+                if (Test-Path -LiteralPath $profilePath) { 
+                    Remove-Item -LiteralPath $profilePath -Recurse -Force -ErrorAction Stop 
+                }
             }
 
             if (-not $profileOk) { continue }
         }
 
+        # -------------------------------------------------------------
+        # 4. REMOVE LOCAL USER ACCOUNT
+        # -------------------------------------------------------------
         if ($localUser) {
-            $loggedON = (query session | Select-String $name) -match '\d+'
-            if ($loggedON) { 
-                Write-Host " --- Logging off user: $name before Proceeding"
-                foreach ($id in $MATCHES.values) { logoff $id ; sleep 1}
-            }
             Invoke-Step -Category 'UserRemoval' -Name $name -ScriptBlock {
                 Remove-LocalUser -Name $name -ErrorAction Stop
             } | Out-Null
-
-            $actions.Add([PSCustomObject]@{
-                    Category = 'UserRemoval'
-                    Name     = $name
-                    Status   = 'Success'
-                    Details  = 'Removed'
-                })
         } else {
             $actions.Add([PSCustomObject]@{
                     Category = 'UserRemoval'
@@ -434,7 +460,9 @@ $script:WindowsUnregisterBlock = {
         }
     }
 
-
+    # -----------------------------------------------------------------
+    # 5. BITLOCKER / TPM PROTECTOR CHECK
+    # -----------------------------------------------------------------
     Invoke-Step -Category 'DiskEncryption' -Name 'C:' -ScriptBlock {
         $tpm = Get-Tpm -ErrorAction Stop
 
