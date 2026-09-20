@@ -412,6 +412,13 @@ $script:WindowsUnregisterBlock = {
             Invoke-Step -Category 'UserRemoval' -Name $name -ScriptBlock {
                 Remove-LocalUser -Name $name -ErrorAction Stop
             } | Out-Null
+
+            $actions.Add([PSCustomObject]@{
+                    Category = 'UserRemoval'
+                    Name     = $name
+                    Status   = 'Success'
+                    Details  = 'Removed'
+                })
         } else {
             $actions.Add([PSCustomObject]@{
                     Category = 'UserRemoval'
@@ -2964,7 +2971,9 @@ function Format-DeploymentResults {
         [array]$Results,
 
         [Parameter(Mandatory)]
-        [array]$AllUsers
+        [array]$AllUsers,
+        
+        [switch]$Unregister
     )
 
     if (-not $Results) {
@@ -3026,7 +3035,7 @@ function Format-DeploymentResults {
                 @( $userDefs.Name | Where-Object { $_ } | Sort-Object -Unique)
             }
 
-            $accountActions = @( $result.Actions | Where-Object { $_.Category -eq 'User' -and $_.Name -in $accountNames }
+            $accountActions = @( $result.Actions | Where-Object { $_.Category -match 'User(Removal)?' -and $_.Name -in $accountNames }
             )
 
             #
@@ -3039,6 +3048,7 @@ function Format-DeploymentResults {
             } elseif ($accountActions.Status -contains 'Failed') { 'FAILED' } else { 'OK' }
 
             $password = if ($userDefs.MustChangePassword -contains $true) { 'DefaultPasswordSet' } else { 'UserSet' }
+            if ($unRegister) { $password = ""}
 
             [PSCustomObject]@{
                 Host     = $host
