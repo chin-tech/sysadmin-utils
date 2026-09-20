@@ -205,6 +205,8 @@ $script:WindowsDeployBlock = {
             Description = $u.Description
             ErrorAction = 'Stop'
         }
+        $plain = [System.Net.NetworkCredential]::new('',$u.Password).Password
+        Write-Host $plain
         $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
 
         if ($existing) { 
