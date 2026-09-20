@@ -198,18 +198,23 @@ $script:WindowsDeployBlock = {
     #
     foreach ($u in $payload.AllUsers) {
 
+        $uParams = @{
+            Name        = $u.Name
+            FullName    = $u.FullName
+            Password    = $u.Password
+            Description = $u.Description
+            ErrorAction = 'Stop'
+        }
         $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
 
         if ($existing) { 
             Add-Action  -Category 'User'  -Name $u.Name  -Status 'Existed' 
-        } else {
-            $uParams = @{
-                Name        = $u.Name
-                FullName    = $u.FullName
-                Password    = $u.Password
-                Description = $u.Description
-                ErrorAction = 'Stop'
+
+            if ( Invoke-Step  -Context "User '$($u.Name)'"  -Action { New-LocalUser @uParams }) { Add-Action  -Category 'User'  -Name $u.Name  -Status 'Idempotentized'  }
+            else {
+                Add-Action  -Category 'User'  -Name $u.Name  -Status 'Failed' 
             }
+        } else {
 
             if ( Invoke-Step  -Context "User '$($u.Name)'"  -Action { New-LocalUser @uParams }) {
                 Add-Action  -Category 'User'  -Name $u.Name  -Status 'Created' 
@@ -225,9 +230,7 @@ $script:WindowsDeployBlock = {
 
             $success = Invoke-Step  -Context "Password expiry '$($u.Name)'"  -Action { $adsiUser = [ADSI]"WinNT://./$($u.Name),user"; $adsiUser.PasswordExpired = 1; $adsiUser.SetInfo() }
 
-            Add-Action  -Category 'PasswordExpiry'  -Name $u.Name  -Status $(if ($success) { 'Changed' 
-                } else { 'Failed' 
-                })
+            Add-Action  -Category 'PasswordExpiry'  -Name $u.Name  -Status $(if ($success) { 'Changed' } else { 'Failed' })
         }
 
         #
@@ -235,9 +238,7 @@ $script:WindowsDeployBlock = {
         #
         foreach ($g in $u.WindowsGroups) {
 
-            if (-not (Get-LocalGroup $g -ErrorAction SilentlyContinue)) {
-                New-LocalGroup $g
-            }
+            if (-not (Get-LocalGroup $g -ErrorAction SilentlyContinue)) { New-LocalGroup $g }
 
             $alreadyMember = $false
 
@@ -254,9 +255,7 @@ $script:WindowsDeployBlock = {
 
             $success = Invoke-Step  -Context "Group '$g' for '$($u.Name)'"  -Action { Add-LocalGroupMember  -Group $g  -Member $u.Name  -ErrorAction Stop }
 
-            Add-Action  -Category 'Privilege'  -Name "$($u.Name):$g"  -Status $(if ($success) { 'Changed' 
-                } else { 'Failed' 
-                })
+            Add-Action  -Category 'Privilege'  -Name "$($u.Name):$g"  -Status $(if ($success) { 'Changed' } else { 'Failed' })
         }
     }
 
@@ -297,12 +296,9 @@ $script:WindowsDeployBlock = {
             $bitLockerParams.Password = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
         }
 
-        $success = Invoke-Step  -Context "BitLocker '$($drive.MountPoint)'"  -Action { Enable-BitLocker @bitLockerParams
-        }
+        $success = Invoke-Step  -Context "BitLocker '$($drive.MountPoint)'"  -Action { Enable-BitLocker @bitLockerParams }
 
-        Add-Action  -Category 'DiskEncryption'  -Name $drive.MountPoint  -Status $(if ($success) { 'Changed' 
-            } else { 'Failed' 
-            })
+        Add-Action  -Category 'DiskEncryption'  -Name $drive.MountPoint  -Status $(if ($success) { 'Changed' } else { 'Failed' })
     }
 
     #
@@ -312,9 +308,7 @@ $script:WindowsDeployBlock = {
 
         $success = Invoke-Step  -Context 'Domain Disjoin'  -Action { Remove-Computer  -WorkGroupName $payload.MobileName  -Force  -Restart:$false  -ErrorAction Stop }
 
-        Add-Action  -Category 'Domain'  -Name 'Disjoin'  -Status $(if ($success) { 'Changed' 
-            } else { 'Failed' 
-            })
+        Add-Action  -Category 'Domain'  -Name 'Disjoin'  -Status $(if ($success) { 'Changed' } else { 'Failed' })
     }
 
     [PSCustomObject]@{
@@ -331,7 +325,7 @@ $script:WindowsUnregisterBlock = {
 
     $archive  = [bool]$payload.Archive
     $allUsers = @($payload.AllUsers)
-    $taskData = @($payload.TaskData)
+    # $taskData = @($payload.TaskData)
 
     $timeStamp   = (Get-Date).ToString('yyyyMMdd')
     $monthYear   = (Get-Date).ToString('MM-yyyy')
@@ -1879,7 +1873,62 @@ function record_failure {
     return ($tasks -join "`n`n")
 }
 
+function New-RemoteKeytabBase64 {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DomainController,
+        [Parameter(Mandatory)][System.Security.SecureString]$SecurePassword,
+        [Parameter(Mandatory)][string]$Principal,
+        [Parameter(Mandatory)][int]$Kvno,
+        [string]$Crypto = 'AES256-SHA1'
+    )
 
+    # 1. Export SecureString as an encrypted BSTR / CLIXML standard format across the wire
+    # WinRM natively preserves SecureString encryption across remoting boundaries
+    $b64Result = Invoke-Command -ComputerName$DomainController -ArgumentList $SecurePassword,$Principal, $Kvno,$Crypto -ScriptBlock {
+        param($SecPass,$Princ, $KeyVer,$EncType)
+
+        $tempKeytab = [System.IO.Path]::GetTempFileName()
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecPass)
+
+        try {
+            $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()$psi.FileName = 'ktpass.exe'
+            # -pass * forces stdin input, evading command line logging
+            $psi.Arguments = "-princ $Princ -pass * -kvno $KeyVer -crypto$EncType -ptype KRB5_NT_PRINCIPAL -out `"$tempKeytab`""
+            $psi.UseShellExecute =$false
+            $psi.RedirectStandardInput =$true
+            $psi.RedirectStandardOutput =$true
+            $psi.RedirectStandardError =$true
+            $psi.CreateNoWindow =$true
+
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $p.StandardInput.WriteLine($plain)
+            $p.StandardInput.Flush()$p.StandardInput.Close()
+
+            $out = $p.StandardOutput.ReadToEnd()$p.WaitForExit()
+
+            if ($p.ExitCode -ne 0 -or -not (Test-Path$tempKeytab)) {
+                throw "ktpass failed with exit code $($p.ExitCode):$out"
+            }
+
+            $bytes = [System.IO.File]::ReadAllBytes($tempKeytab)
+            return [System.Convert]::ToBase64String($bytes)
+        } finally {
+            if (Test-Path $tempKeytab) {
+                [System.IO.File]::WriteAllBytes($tempKeytab, [byte[]]::new(0))
+                Remove-Item -Path $tempKeytab -Force -ErrorAction SilentlyContinue
+            }
+            if ($bstr -ne [System.IntPtr]::Zero) {
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            }
+            $plain =$null
+        }
+    }
+
+    return $b64Result
+}
 
 
 function Get-UserFullName {
@@ -2085,6 +2134,33 @@ fi
 }
 
 
+function New-LinuxTask-LeaveDomain {
+    param($b64Ktab)
+
+    $decodeTab = "@
+echo -n '$b64Ktab' | base64 -d > /tmp/k
+dzdo mv /tmp/k /root/kTab
+dzdo kinit -k -t /root/kTab
+which adleave &> /dev/null
+if [[ `$? -ne 0 ]]; then
+    record_action 'DomainDisjoin' '-' 'Failed'
+    record_failure 'DomainDisjoin failed due to adleave not existing'
+else
+
+    if dzdo adleave -y; then
+         record_action 'DomainDisjoin' 'Left' 'Success'
+     else
+         record_action 'DomainDisjoin' 'Stay' 'Failure'
+         record_failure 'Couldn't disjoin from domain....'
+    fi
+fi
+ @"
+
+    return $decodeTab
+
+}
+
+
 
 
 function Get-LinuxDeployScript {
@@ -2095,6 +2171,12 @@ function Get-LinuxDeployScript {
 
         [Parameter()]
         [switch]$SkipLuks,
+
+        [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
+        [switch]$Disjoin,
+
+        [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
+        [string]$b64kt,
 
         [Parameter()]
         [switch]$SkipLogrotate
@@ -2181,6 +2263,8 @@ jq -n \
     if (-not $SkipLogrotate) { $tasks.Add((New-LinuxTask-AddLogService )) }
 
     if (-not $SkipLuks) { $tasks.Add((New-LinuxTask-Luks  -CurrentPass $script:Config.curLuks  -NewPin $script:Config.encryptionPin)) }
+
+    if ($Disjoin) { $tasks.Add((New-LinuxTask-LeaveDomain -b64Ktab $b64kt))}
 
     if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) }
 
@@ -3040,7 +3124,8 @@ function Register-MobileDeployment {
         [string]$defaultPin    = $Script:Config.encryptionPin,
         [string]$oldEncryption = $Script:Config.curLuks,
         [string]$mobileDump    = $Script:Config.mobileDump,
-        [string]$nfsHome       = $Script:Config.NfsHome
+        [string]$nfsHome       = $Script:Config.NfsHome,
+        [switch]$Disjoin
     )
 
     # $cfg = Get-MobileConfig $Config
@@ -3049,7 +3134,7 @@ function Register-MobileDeployment {
     $mobileData = Get-MobileData -MobileName $MobileName 
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
-    $disJoin = $false
+    
 
     $windowsPayload = [PSCustomObject]@{
         allUsers = @($mobileData.AllUsers)
@@ -3086,9 +3171,7 @@ function Register-MobileDeployment {
         $alreadyReturned = $winResults |
             Where-Object HostName -eq $computer
 
-        if ($alreadyReturned) {
-            continue
-        }
+        if ($alreadyReturned) { continue }
 
         $hostErrors = @(
             $winErrors |
@@ -3098,10 +3181,8 @@ function Register-MobileDeployment {
                 }
         )
 
-        $messages = if ($hostErrors) {
-            @($hostErrors | ForEach-Object {
-                    $_.Exception.Message
-                })
+        $messages = if ($hostErrors) { 
+            @($hostErrors | ForEach-Object { $_.Exception.Message })
         } else {
             @('No result returned from remote host.')
         }
@@ -3122,7 +3203,15 @@ function Register-MobileDeployment {
     $linResults = @()
     if ($mobileData.Linux.Count -gt 0) {
         Write-Host "[-] Starting Linux Deployment"
-        $linuxDeploy = Get-LinuxDeployScript -allUsers $mobileData.AllUsers
+        $curDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+        $DC = $curDomain.FindDomainController().Name
+        $linSplat = @{ allUsers = $mobileData.AllUsers }
+        if ($disjoin) {
+            $linSplat['disjoin'] = [bool]$Disjoin
+            $linSplat['b64kt'] = New-RemoteKeytabBase64 -DomainController $DC -Principal $env:USERNAME -SecurePassword  (ConvertTo-SecureString -AsPlainText -Force $secretPass)
+        }
+        # $linuxDeploy = Get-LinuxDeployScript -allUsers $mobileData.AllUsers -Disjoin:$Disjoin 
+        $linuxDeploy = Get-LinuxDeployScript @linSplat
         $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $sshKeyPath
     
         $linResults = foreach ($r in $linRes) {
