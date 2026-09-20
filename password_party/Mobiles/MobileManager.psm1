@@ -205,8 +205,6 @@ $script:WindowsDeployBlock = {
             Description = $u.Description
             ErrorAction = 'Stop'
         }
-        $plain = [System.Net.NetworkCredential]::new('',$u.Password).Password
-        Write-Host $plain
         $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
 
         if ($existing) { 
@@ -3135,7 +3133,7 @@ function Register-MobileDeployment {
 
     # $cfg = Get-MobileConfig $Config
     # Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
-    Initialize-Environment
+    if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
     $mobileData = Get-MobileData -MobileName $MobileName 
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
@@ -3207,7 +3205,6 @@ function Register-MobileDeployment {
     $linRes = @()
     $linResults = @()
     if ($mobileData.Linux.Count -gt 0) {
-        Write-Host "[-] Starting Linux Deployment"
         $curDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
         $DC = $curDomain.FindDomainController().Name
         $linSplat = @{ allUsers = $mobileData.AllUsers }
