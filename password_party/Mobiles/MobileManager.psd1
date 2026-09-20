@@ -23,7 +23,7 @@
         'Get-MobileOverview',
         'Set-MobileGpoPermission',
         'Register-MobileDeployment',
-        'UnRegister-MobileDeployment',
+        'UnRegister-Deployment',
         'Initialize-Ssh-Environment'
         'New-MobileDeployment'
         'Write-MobileFile'
