@@ -3059,7 +3059,7 @@ function Format-DeploymentResults {
            
         } else {
             $curUser = $uRow.User
-            Write-Host "$($curUser)`t$(($roles -join '.'))`t$password" -ForegroundColor DarkYellow
+            Write-Host "$($curUser)`t[$($uRows.Groups)]`t$password" -ForegroundColor DarkYellow
             if ($status -eq 'OK') {Write-Host "`t[+] $($uRow.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($uRow.Host)" -ForegroundColor Red}
         }
 
