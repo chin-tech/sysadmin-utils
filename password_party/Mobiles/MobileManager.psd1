@@ -43,7 +43,7 @@
                 GpoId          = '00000000-0000-0000-0000-000000000000'
                 sshKeyName     = 'deployer'
                 certName       = 'deployer'
-                fallbackPass    = 'defaultPass123!@#'
+                fallbackPass    = 'MeowMeow123!@#'
                 curLuks         = 'defaultLuks123!@#'
                 encryptionPin     = 'defaultPin123!@#'
                 adminRoot = "C:\TEMP"
