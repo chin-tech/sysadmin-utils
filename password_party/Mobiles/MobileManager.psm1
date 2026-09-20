@@ -2175,10 +2175,10 @@ function Get-LinuxDeployScript {
         [Parameter()]
         [switch]$SkipLuks,
 
-        [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
+        # [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
         [switch]$Disjoin,
 
-        [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
+        # [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
         [string]$b64kt,
 
         [Parameter()]
