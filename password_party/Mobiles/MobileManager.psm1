@@ -3055,12 +3055,12 @@ function Format-DeploymentResults {
     $curUser = ""
     foreach ($uRow in $userRows | Sort-Object User) {
         if ($curUser -eq $uRow.User)  {
-            if ($status -eq 'OK') {Write-Host "`t[+] $($u.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($u.Host)" -ForegroundColor Red}
+            if ($status -eq 'OK') {Write-Host "`t[+] $($uRow.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($uRow.Host)" -ForegroundColor Red}
            
         } else {
             $curUser = $uRow.User
-            Write-Host "$($curUser)`t$(($roles -join '.'))`t$password" -ForegroundColor Yellow
-            if ($status -eq 'OK') {Write-Host "`t[+] $($u.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($u.Host)" -ForegroundColor Red}
+            Write-Host "$($curUser)`t$(($roles -join '.'))`t$password" -ForegroundColor DarkYellow
+            if ($status -eq 'OK') {Write-Host "`t[+] $($uRow.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($uRow.Host)" -ForegroundColor Red}
         }
 
     }
