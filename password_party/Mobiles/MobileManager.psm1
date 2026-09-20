@@ -210,7 +210,7 @@ $script:WindowsDeployBlock = {
         if ($existing) { 
             Add-Action  -Category 'User'  -Name $u.Name  -Status 'Existed' 
 
-            if ( Invoke-Step  -Context "User '$($u.Name)'"  -Action { New-LocalUser @uParams }) { Add-Action  -Category 'User'  -Name $u.Name  -Status 'Idempotentized'  }
+            if ( Invoke-Step  -Context "User '$($u.Name)'"  -Action { Set-LocalUser @uParams }) { Add-Action  -Category 'User'  -Name $u.Name  -Status 'Idempotentized'  }
             else {
                 Add-Action  -Category 'User'  -Name $u.Name  -Status 'Failed' 
             }
@@ -3210,7 +3210,7 @@ function Register-MobileDeployment {
         $DC = $curDomain.FindDomainController().Name
         $linSplat = @{ allUsers = $mobileData.AllUsers }
         if ($disjoin) {
-            $linSplat['disjoin'] = [bool]$Disjoin
+            $linSplat['disjoin'] = $Disjoin
             $linSplat['b64kt'] = New-RemoteKeytabBase64 -DomainController $DC -Principal $env:USERNAME -SecurePassword  (ConvertTo-SecureString -AsPlainText -Force $secretPass)
         }
         # $linuxDeploy = Get-LinuxDeployScript -allUsers $mobileData.AllUsers -Disjoin:$Disjoin 
