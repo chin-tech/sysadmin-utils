@@ -4774,7 +4774,6 @@ jq -n \
 
 function Unregister-Deployment {
     [CmdletBinding()]
-
     param(
         [Parameter(Mandatory = $true, Position = 0)]
         [string]$MobileName,
@@ -4787,6 +4786,7 @@ function Unregister-Deployment {
         [string]$defaultPin = $Script:Config.encryptionPin,
         [string]$oldEncryption = $Script:Config.curLuks,
         [string]$mobileDump = $Script:Config.mobileDump,
+        [Parameter()]
         [switch]$archive
     )
     $mobileData = Get-MobileData -MobileName $MobileName 
