@@ -409,6 +409,10 @@ $script:WindowsUnregisterBlock = {
         }
 
         if ($localUser) {
+            $loggedON = (query session | Select-String $localuser) -match '\d+'
+            if ($loggedON) { 
+                foreach ($m in $MATCHES.keys) { logoff $MATCHES[$m] }
+            }
             Invoke-Step -Category 'UserRemoval' -Name $name -ScriptBlock {
                 Remove-LocalUser -Name $name -ErrorAction Stop
             } | Out-Null
