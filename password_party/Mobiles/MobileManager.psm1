@@ -3038,7 +3038,7 @@ function Format-DeploymentResults {
                 '-'
             } elseif ($accountActions.Status -contains 'Failed') { 'FAILED' } else { 'OK' }
 
-            $password = if ($userDefs.MustChangePassword -contains $true) { 'Default' } else { 'UserSet' }
+            $password = if ($userDefs.MustChangePassword -contains $true) { 'DefaultPasswordSet' } else { 'UserSet' }
 
             [PSCustomObject]@{
                 Host     = $host
@@ -3059,7 +3059,7 @@ function Format-DeploymentResults {
            
         } else {
             $curUser = $uRow.User
-            Write-Host "$($curUser)`t[$($uRows.Groups)]`t$password" -ForegroundColor DarkYellow
+            Write-Host "$($curUser)`t[$($uRow.Groups)]`t$password" -ForegroundColor DarkYellow
             if ($status -eq 'OK') {Write-Host "`t[+] $($uRow.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($uRow.Host)" -ForegroundColor Red}
         }
 
@@ -4787,7 +4787,7 @@ function Unregister-Deployment {
         [string]$defaultPin = $Script:Config.encryptionPin,
         [string]$oldEncryption = $Script:Config.curLuks,
         [string]$mobileDump = $Script:Config.mobileDump,
-        [bool]$archive = $false
+        [switch]$archive
     )
     $mobileData = Get-MobileData -MobileName $MobileName 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
