@@ -21,6 +21,10 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'GPORemove')]
     [switch]$Remove,
 
+
+    [Parameter(Mandatory = $false, ParameterSetName = 'UnRegisterDeployment')]
+    [switch]$Archive,
+
     # --- Target Name ---
     [Parameter(Mandatory = $false, ParameterSetName = 'Info', Position = 0)]
     [Parameter(Mandatory = $true, ParameterSetName = 'RegisterDeployment', Position = 0)]

@@ -4917,7 +4917,7 @@ function Unregister-Deployment {
         )
     }
 
-    Format-DeploymentResults (@($winResults) + @($linResults)) -AllUsers $mobileData.AllUsers
+    Format-DeploymentResults (@($winResults) + @($linResults)) -AllUsers $mobileData.AllUsers -Unregister
 
 
 }
