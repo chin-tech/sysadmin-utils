@@ -1894,7 +1894,8 @@ function New-RemoteKeytabBase64 {
         try {
             $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
 
-            $psi = [System.Diagnostics.ProcessStartInfo]::new()$psi.FileName = 'ktpass.exe'
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = 'ktpass.exe'
             # -pass * forces stdin input, evading command line logging
             $psi.Arguments = "-princ $Princ -pass * -kvno $KeyVer -crypto$EncType -ptype KRB5_NT_PRINCIPAL -out `"$tempKeytab`""
             $psi.UseShellExecute =$false
@@ -1905,9 +1906,11 @@ function New-RemoteKeytabBase64 {
 
             $p = [System.Diagnostics.Process]::Start($psi)
             $p.StandardInput.WriteLine($plain)
-            $p.StandardInput.Flush()$p.StandardInput.Close()
+            $p.StandardInput.Flush()
+            $p.StandardInput.Close()
 
-            $out = $p.StandardOutput.ReadToEnd()$p.WaitForExit()
+            $out = $p.StandardOutput.ReadToEnd()
+            $p.WaitForExit()
 
             if ($p.ExitCode -ne 0 -or -not (Test-Path$tempKeytab)) {
                 throw "ktpass failed with exit code $($p.ExitCode):$out"
