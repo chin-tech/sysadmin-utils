@@ -54,10 +54,14 @@ param(
     [PSCustomObject]$Config,
 
     [Parameter()]
-    [string]$MobileEntriesPath = $(if ($Config) { $Config.MobileEntries } else { $null }),
+    [string]$MobileEntriesPath = $(if ($Config) { $Config.MobileEntries
+        } else { $null
+        }),
 
     [Parameter()]
-    [string]$MobileDumpPath = $(if ($Config) { $Config.MobileDump } else { $null }),
+    [string]$MobileDumpPath = $(if ($Config) { $Config.MobileDump
+        } else { $null
+        }),
 
     # Optional override: pass a base64 blob at call time instead of the embedded one below.
     [Parameter()]
@@ -353,7 +357,20 @@ function Show-PasswordPrompt {
     )
 
     while ($true) {
-        $form = New-StyledForm -Title "Set Secure Password" -Width 440 -Height 430 -HeaderText "Set Secure Password"
+        # $TargetLabel is either a single account name, or (in "same
+        # password for all" mode) several names joined with newlines.
+        # NOTE: named $targetAccounts, not $TargetAccounts/$targetLabel --
+        # avoid any case-insensitive collision with the $TargetLabel param
+        # (see the note further down about $lblTarget for why that matters).
+        $targetAccounts = $TargetLabel -split "`n"
+
+        # A multi-account list needs a scrollable box so it can never get
+        # visually clipped, however many accounts are in it. A single
+        # account keeps the original big bold callout -- it always fits
+        # on one line, so there's nothing to scroll.
+        $yOffset = if ($targetAccounts.Count -gt 1) { 46 } else { 0 }
+
+        $form = New-StyledForm -Title "Set Secure Password" -Width 440 -Height (430 + $yOffset) -HeaderText "Set Secure Password"
 
         $introLabel = New-Object System.Windows.Forms.Label
         $introLabel.Location = New-Object System.Drawing.Point(24, 66)
@@ -362,30 +379,58 @@ function Show-PasswordPrompt {
         $introLabel.Text = "Assigned to: $MobileList"
         $form.Controls.Add($introLabel)
 
-        # Bold, larger callout so it's unmistakable which account this
-        # particular password will be set for.
-        # NOTE: named $lblTarget (not $targetLabel) deliberately -- PowerShell
-        # variables are case-insensitive, so $targetLabel would be the same
-        # variable as the $TargetLabel string parameter above. Reassigning it
-        # to a Label control would silently coerce that control back to a
-        # string (since the variable stays bound to the parameter's [string]
-        # type), breaking every property access on it afterward.
-        $lblTarget = New-Object System.Windows.Forms.Label
-        $lblTarget.Location = New-Object System.Drawing.Point(24, 90)
-        $lblTarget.Size = New-Object System.Drawing.Size(390, 60)
-        $lblTarget.Font = $script:TargetFont
-        $lblTarget.ForeColor = $script:AccentColor
-        $lblTarget.Text = "Password for:`n$TargetLabel"
-        $form.Controls.Add($lblTarget)
+        $lblTargetHeader = New-Object System.Windows.Forms.Label
+        $lblTargetHeader.Location = New-Object System.Drawing.Point(24, 90)
+        $lblTargetHeader.Size = New-Object System.Drawing.Size(390, 24)
+        $lblTargetHeader.Font = $script:TargetFont
+        $lblTargetHeader.ForeColor = $script:AccentColor
+        $lblTargetHeader.Text = if ($targetAccounts.Count -gt 1) {
+            "Password for ALL $($targetAccounts.Count) accounts:"
+        } else {
+            "Password for:"
+        }
+        $form.Controls.Add($lblTargetHeader)
+
+        if ($targetAccounts.Count -gt 1) {
+            # Read-only, scrollable -- every account is reachable no matter
+            # how long the list gets, instead of silently clipping.
+            $lstTarget = New-Object System.Windows.Forms.TextBox
+            $lstTarget.Location = New-Object System.Drawing.Point(24, 118)
+            $lstTarget.Size = New-Object System.Drawing.Size(390, 70)
+            $lstTarget.Multiline = $true
+            $lstTarget.ReadOnly = $true
+            $lstTarget.ScrollBars = 'Vertical'
+            $lstTarget.BorderStyle = 'FixedSingle'
+            $lstTarget.BackColor = [System.Drawing.Color]::FromArgb(245, 248, 252)
+            $lstTarget.Font = $script:BodyFont
+            $lstTarget.Text = ($targetAccounts -join "`r`n")
+            $lstTarget.TabStop = $false
+            $form.Controls.Add($lstTarget)
+        } else {
+            # NOTE: named $lblTarget (not $targetLabel) deliberately --
+            # PowerShell variables are case-insensitive, so $targetLabel
+            # would be the same variable as the $TargetLabel string
+            # parameter above. Reassigning it to a Label control would
+            # silently coerce that control back to a string (since the
+            # variable stays bound to the parameter's [string] type),
+            # breaking every property access on it afterward.
+            $lblTarget = New-Object System.Windows.Forms.Label
+            $lblTarget.Location = New-Object System.Drawing.Point(24, 118)
+            $lblTarget.Size = New-Object System.Drawing.Size(390, 30)
+            $lblTarget.Font = $script:TargetFont
+            $lblTarget.ForeColor = $script:AccentColor
+            $lblTarget.Text = $targetAccounts[0]
+            $form.Controls.Add($lblTarget)
+        }
 
         $divider = New-Object System.Windows.Forms.Panel
         $divider.BackColor = $script:DividerColor
-        $divider.Location = New-Object System.Drawing.Point(24, 156)
+        $divider.Location = New-Object System.Drawing.Point(24, (156 + $yOffset))
         $divider.Size = New-Object System.Drawing.Size(390, 1)
         $form.Controls.Add($divider)
 
         $reqLabel = New-Object System.Windows.Forms.Label
-        $reqLabel.Location = New-Object System.Drawing.Point(24, 167)
+        $reqLabel.Location = New-Object System.Drawing.Point(24, (167 + $yOffset))
         $reqLabel.Size = New-Object System.Drawing.Size(390, 32)
         $reqLabel.ForeColor = $script:MutedColor
         $reqLabel.Text = "Minimum $MinLength characters, including upper, lower, number and symbol."
@@ -394,12 +439,12 @@ function Show-PasswordPrompt {
         $passLabel1 = New-Object System.Windows.Forms.Label
         $passLabel1.Text = "Password"
         $passLabel1.Font = $script:BoldFont
-        $passLabel1.Location = New-Object System.Drawing.Point(24, 207)
+        $passLabel1.Location = New-Object System.Drawing.Point(24, (207 + $yOffset))
         $passLabel1.Size = New-Object System.Drawing.Size(200, 18)
         $form.Controls.Add($passLabel1)
 
         $txtPass1 = New-Object System.Windows.Forms.TextBox
-        $txtPass1.Location = New-Object System.Drawing.Point(24, 228)
+        $txtPass1.Location = New-Object System.Drawing.Point(24, (228 + $yOffset))
         $txtPass1.Size = New-Object System.Drawing.Size(390, 24)
         $txtPass1.PasswordChar = '*'
         $txtPass1.BorderStyle = 'FixedSingle'
@@ -408,19 +453,19 @@ function Show-PasswordPrompt {
         $passLabel2 = New-Object System.Windows.Forms.Label
         $passLabel2.Text = "Confirm Password"
         $passLabel2.Font = $script:BoldFont
-        $passLabel2.Location = New-Object System.Drawing.Point(24, 262)
+        $passLabel2.Location = New-Object System.Drawing.Point(24, (262 + $yOffset))
         $passLabel2.Size = New-Object System.Drawing.Size(200, 18)
         $form.Controls.Add($passLabel2)
 
         $txtPass2 = New-Object System.Windows.Forms.TextBox
-        $txtPass2.Location = New-Object System.Drawing.Point(24, 283)
+        $txtPass2.Location = New-Object System.Drawing.Point(24, (283 + $yOffset))
         $txtPass2.Size = New-Object System.Drawing.Size(390, 24)
         $txtPass2.PasswordChar = '*'
         $txtPass2.BorderStyle = 'FixedSingle'
         $form.Controls.Add($txtPass2)
 
         $btnOk = New-AccentButton -Text 'Continue' -Primary `
-            -Location (New-Object System.Drawing.Point(264, 330)) `
+            -Location (New-Object System.Drawing.Point(264, (330 + $yOffset))) `
             -Size (New-Object System.Drawing.Size(150, 34))
         $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $form.AcceptButton = $btnOk
@@ -491,7 +536,7 @@ $b64ToUse = if ($CertB64Override) { $CertB64Override
 }
 $b64ToUse = ($b64ToUse -replace '\s', '')  # strip whitespace/newlines from wrapped blobs
 
-if ([string]::IsNullOrWhiteSpace($b64ToUse)) {
+if ([string]::IsNullOrWhiteSpace($b64ToUse) -or $b64ToUse -eq 'PASTE_YOUR_BASE64_CERT_BLOB_HERE') {
     Write-Error "No certificate blob configured. Paste the base64 Deployer.cer content into `$CertB64 or pass -CertB64Override."
     return
 }
@@ -534,11 +579,7 @@ while (-not $written) {
     $cancelled = $false
 
     if ($passwordMode -eq 'Same') {
-        $allLabel = if ($accountVariants.Count -eq 1) {
-            $accountVariants[0]
-        } else {
-            "ALL of the following: " + ($accountVariants -join " | ")
-        }
+        $allLabel = $accountVariants -join "`n"
 
         $pwd = Show-PasswordPrompt -TargetLabel $allLabel -MobileList $mobileList -MinLength $MinLength -ComplexityRegex $ComplexityRegex
         if ($null -eq $pwd) {
@@ -566,7 +607,7 @@ while (-not $written) {
         return
     }
 
-    $timestamp = Get-Date -Format 'yyyy-MM-dd-mm.ss.ffff'
+    $timestamp = Get-Date -Format 's'
     $plainLines = foreach ($variant in $accountVariants) {
         "${timestamp}:${variant}:$($passwordMap[$variant])"
     }
