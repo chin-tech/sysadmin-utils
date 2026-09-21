@@ -537,7 +537,7 @@ while (-not $written) {
         $allLabel = if ($accountVariants.Count -eq 1) {
             $accountVariants[0]
         } else {
-            "ALL of the following:`n - " + ($accountVariants -join "`n - ")
+            "ALL of the following: " + ($accountVariants -join " | ")
         }
 
         $pwd = Show-PasswordPrompt -TargetLabel $allLabel -MobileList $mobileList -MinLength $MinLength -ComplexityRegex $ComplexityRegex
@@ -566,7 +566,7 @@ while (-not $written) {
         return
     }
 
-    $timestamp = Get-Date -Format 's'
+    $timestamp = Get-Date -Format 'yyyy-MM-dd-mm.ss.ffff'
     $plainLines = foreach ($variant in $accountVariants) {
         "${timestamp}:${variant}:$($passwordMap[$variant])"
     }
