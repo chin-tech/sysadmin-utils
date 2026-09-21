@@ -3095,7 +3095,7 @@ function Format-DeploymentResults {
                 '-'
             } elseif ($accountActions.Status -contains 'Failed') { 'FAILED' } else { 'OK' }
 
-            $password = if ($userDefs.MustChangePassword -contains $true) { 'DefaultPasswordSet' } else { 'UserSet' }
+            $password = if ($userDefs.MustChangePassword) { 'DefaultPasswordSet' } else { 'UserSet' }
             if ($unRegister) { $password = ""}
 
             [PSCustomObject]@{
