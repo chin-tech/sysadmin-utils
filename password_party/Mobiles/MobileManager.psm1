@@ -3095,7 +3095,6 @@ function Format-DeploymentResults {
                 '-'
             } elseif ($accountActions.Status -contains 'Failed') { 'FAILED' } else { 'OK' }
 
-            Write-Host "$baseName - $($userDefs.MustChangePassword) | CONTAINS: $($userDefs.MustChangePassword -contains $true)"
             $password = if ($userDefs.MustChangePassword -contains $true) { 'DefaultPasswordSet' } else { 'UserSet' }
             if ($unRegister) { $password = ""}
 
@@ -3104,7 +3103,7 @@ function Format-DeploymentResults {
                 User     = $baseName
                 Groups   = $roles -join ', '
                 Status   = $status
-                Password = $password.ToString()
+                Password = $password
             }
         }
     }
@@ -3118,7 +3117,7 @@ function Format-DeploymentResults {
            
         } else {
             $curUser = $uRow.User
-            Write-Host "$($curUser)`t[$($uRow.Groups)]`t$password" -ForegroundColor DarkYellow
+            Write-Host "$($curUser)`t`t[$($uRow.Groups)]`t`t$($uRow.Password)" -ForegroundColor DarkYellow
             if ($status -eq 'OK') {Write-Host "`t[+] $($uRow.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($uRow.Host)" -ForegroundColor Red}
         }
 
