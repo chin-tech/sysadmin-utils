@@ -1434,9 +1434,9 @@ function Initialize-Environment {
     $cBytes = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($encCert))
     $LogOnScript = (Get-Content (Join-Path $MyInvocation.PSScriptRoot "MobileLogon.ps1") ) -replace 'PASTE_YOUR_BASE64_CERT_BLOB_HERE',$cBytes
 
+    $GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}"
     $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
     $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
-    $GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}"
     $rootDSE = [ADSI]"LDAP://RootDSE"
     $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
     $outPath = Join-Path $gpoSysvolPath "CreateLocalAccounts.ps1"
