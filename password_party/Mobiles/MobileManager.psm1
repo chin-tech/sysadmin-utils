@@ -3110,17 +3110,30 @@ function Format-DeploymentResults {
 
     Write-Host ""
     Write-Host "[USERS]" -ForegroundColor Cyan
+    # Optional header row to visually anchor the columns
+    Write-Host ("{0,-30} {1,-30} {2,-30}" -f "USER", "GROUPS", "PASSWORD") -ForegroundColor Gray
+
     $curUser = ""
     foreach ($uRow in $userRows | Sort-Object User) {
-        if ($curUser -eq $uRow.User)  {
-            if ($status -eq 'OK') {Write-Host "`t[+] $($uRow.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($uRow.Host)" -ForegroundColor Red}
-           
-        } else {
+        if ($curUser -ne $uRow.User) {
             $curUser = $uRow.User
-            Write-Host "$($curUser)`t`t[$($uRow.Groups)]`t`t$($uRow.Password)" -ForegroundColor DarkYellow
-            if ($status -eq 'OK') {Write-Host "`t[+] $($uRow.Host)" -ForegroundColor Green } else {Write-Host "`t[-] $($uRow.Host)" -ForegroundColor Red}
+        
+            # Safely truncate values exceeding 30 characters to prevent line wrapping/shifting
+            $userCol   = if ($curUser.Length -gt 30) { $curUser.Substring(0, 27) + '...' } else { $curUser }
+            $groupsCol = "[$($uRow.Groups)]"
+            $groupsCol = if ($groupsCol.Length -gt 30) { $groupsCol.Substring(0, 27) + '...]' } else { $groupsCol }
+            $passCol   = if ($uRow.Password.Length -gt 30) { $uRow.Password.Substring(0, 27) + '...' } else { $uRow.Password }
+
+            $line = "{0,-30} {1,-30} {2,-30}" -f $userCol, $groupsCol, $passCol
+            Write-Host $line -ForegroundColor DarkYellow
         }
 
+        # Indent host status under the active user row
+        if ($status -eq 'OK') {
+            Write-Host ("  [+] {0}" -f $uRow.Host) -ForegroundColor Green
+        } else {
+            Write-Host ("  [-] {0}" -f $uRow.Host) -ForegroundColor Red
+        }
     }
 
     # $userRows | Sort-Object Host, User | Format-Table Host, User, Groups, Status, Password -AutoSize
