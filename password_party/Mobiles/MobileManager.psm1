@@ -236,6 +236,7 @@ $script:WindowsDeployBlock = {
         #
         # Groups
         #
+        Write-Host "GROUPS: $($u.WindowsGroups)"
         foreach ($g in $u.WindowsGroups) {
             $actionName = "$($u.Name):$g"
             $groupStatus = 'Failed'
