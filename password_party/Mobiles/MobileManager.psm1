@@ -2383,11 +2383,13 @@ function Get-UserCreds {
     foreach ($bName in ($allUsers.BaseName | Sort-Object -Unique)) {
         $PwFile = Join-Path  $mobileDumpPath $bName
         if ( ! (Test-Path $PwFile )) {  continue }
+        Write-Host "Found: $pwFILE"
 
         $content = Unprotect-CmsMessage -Path  $PwFile
         foreach ($line in ( $content -split '\r?\n')) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
             $timestamp, $username, $pw = $line -split ':',3
+            write-host "Found Password"
             $uObject = $allUsers | Where-Object Name -eq $username | Select-Object -First 1
             if ($null -eq $uObject) { continue }
             $uObject.Password = ConvertTo-SecureString -AsPlainText -Force $pw
@@ -3205,7 +3207,10 @@ function Register-MobileDeployment {
     # Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
     if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
     $mobileData = Get-MobileData -MobileName $MobileName 
+    Write-Host "---------BEFORE-------------"
+    $mobileData.AllUsers
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
+    Write-Host "----------AFTER--------------"
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
     
 
