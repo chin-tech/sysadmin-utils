@@ -2377,12 +2377,9 @@ function Get-UserCreds {
     )
     foreach ($bName in ($allUsers.BaseName | Sort-Object -Unique)) {
         $PwFile = Join-Path  $mobileDumpPath $bName
-        Write-Host "Finding $PWfile"
         if ( ! (Test-Path $PwFile )) { Write-Host "NOT FOUND"; continue }
 
-        Write-Host "FOUND! $PWfile"
         $content = Unprotect-CmsMessage -Path  $PwFile
-        Write-Host "Decrypted! $PWfile"
         foreach ($line in ( $content -split '\r?\n')) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
             $timestamp, $username, $pw = $line -split ':',3
@@ -2390,6 +2387,7 @@ function Get-UserCreds {
             if ($null -eq $uObject) { continue }
             $uObject.Password = ConvertTo-SecureString -AsPlainText -Force $pw
             $uObject.LinuxPassword = [Sha512Crypt]::Crypt($pw)
+            $uObject.MustChangePassword = $false
         }
     }
     
