@@ -1431,7 +1431,7 @@ function Initialize-Environment {
     $results.Add((Test-AndFixDeployerCert -CertName $CertName -PfxStoragePath $AdminRoot))
 
     $encCert = Join-Path $AdminRoot "$CertName.cer"
-    $cBytes = [Convert]::ToBase64CharArray([System.IO.File]::ReadAllBytes($encCert))
+    $cBytes = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($encCert))
     $LogOnScript = (Get-Content (Join-Path $MyInvocation.PSScriptRoot "MobileLogon.ps1") ) -replace 'PASTE_YOUR_BASE64_CERT_BLOB_HERE',$cBytes
 
     $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
