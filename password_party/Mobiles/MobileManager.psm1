@@ -315,228 +315,229 @@ $script:WindowsDeployBlock = {
             Failures = $failures.ToArray()
         }
     }
+}
 
 
-    $script:WindowsUnregisterBlock = {
-        param([PSCustomObject]$payload)
+$script:WindowsUnregisterBlock = {
+    param([PSCustomObject]$payload)
 
-        $archive   = [bool]$payload.Archive
-        $allUsers  = @($payload.AllUsers)
+    $archive   = [bool]$payload.Archive
+    $allUsers  = @($payload.AllUsers)
 
-        $timeStamp   = (Get-Date).ToString('yyyyMMdd')
-        $monthYear   = (Get-Date).ToString('MM-yyyy')
-        $archivePath = "C:\Mobiles\Archive\$monthYear"
+    $timeStamp   = (Get-Date).ToString('yyyyMMdd')
+    $monthYear   = (Get-Date).ToString('MM-yyyy')
+    $archivePath = "C:\Mobiles\Archive\$monthYear"
 
-        $actions  = [System.Collections.Generic.List[object]]::new()
-        $failures = [System.Collections.Generic.List[string]]::new()
+    $actions  = [System.Collections.Generic.List[object]]::new()
+    $failures = [System.Collections.Generic.List[string]]::new()
 
-        function Invoke-Step {
-            [CmdletBinding()]
-            param(
-                [Parameter(Mandatory)][string]$Category,
-                [Parameter(Mandatory)][string]$Name,
-                [Parameter(Mandatory)][scriptblock]$ScriptBlock
-            )
-
-            try {
-                $details = & $ScriptBlock
-
-                $actions.Add([PSCustomObject]@{
-                        Category = $Category
-                        Name     = $Name
-                        Status   = 'Success'
-                        Details  = $details
-                    })
-
-                return $true
-            } catch {
-                $actions.Add([PSCustomObject]@{
-                        Category = $Category
-                        Name     = $Name
-                        Status   = 'Failed'
-                        Details  = $null
-                    })
-
-                $failures.Add("${Category} '$Name': $($_.Exception.Message)")
-                return $false
-            }
-        }
-
-        # Ensure archive directory exists if archiving is enabled
-        $archiveReady = $true
-        if ($archive) {
-            $archiveReady = Invoke-Step -Category 'ArchiveDirectory' -Name $archivePath -ScriptBlock {
-                if (-not (Test-Path -LiteralPath $archivePath)) {
-                    New-Item -ItemType Directory -Force -Path $archivePath -ErrorAction Stop | Out-Null
-                }
-                $archivePath
-            }
-        }
-
-        foreach ($u in $allUsers) {
-            $name        = $u.Name
-            $profilePath = "C:\Users\$name"
-            $localUser   = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
-            $sid         = if ($localUser) { $localUser.SID.Value } else { $null }
-
-            # -------------------------------------------------------------
-            # 1. LOG OFF USER SESSIONS FIRST (Free locked files & registry)
-            # -------------------------------------------------------------
-            Invoke-Step -Category 'UserLogoff' -Name $name -ScriptBlock {
-                $sessions = query session 2>&1
-                foreach ($line in $sessions) {
-                    # Format: SESSIONNAME USERNAME ID STATE ...
-                    if ($line -match "\b$([regex]::Escape($name))\b") {
-                        $parts = ($line.Trim() -replace '\s+', ' ').Split(' ')
-                        # If SESSIONNAME is blank (e.g. disconnected), username is index 0, ID is index 1
-                        # If SESSIONNAME exists, username is index 1, ID is index 2
-                        $targetId = if ($parts[0] -ieq $name) { $parts[1] } else { $parts[2] }
-
-                        if ($targetId -match '^\d+$') {
-                            Write-Host " --- Logging off user: $name (Session ID: $targetId)"
-                            logoff $targetId
-                        }
-                    }
-                }
-                # Wait briefly for Explorer and NTUSER.DAT handles to unload
-                Start-Sleep -Seconds 2
-            } | Out-Null
-
-            # Skip archiving/removal if archive path failed to create
-            if ($archive -and -not $archiveReady) {
-                continue
-            }
-
-            # -------------------------------------------------------------
-            # 2. ARCHIVE USER PROFILE
-            # -------------------------------------------------------------
-            if ($archive -and (Test-Path -LiteralPath $profilePath)) {
-                $archiveFile = Join-Path $archivePath "$name-$timeStamp.zip"
-
-                $archiveOk = Invoke-Step -Category 'ProfileArchive' -Name $name -ScriptBlock {
-                    Compress-Archive -Path "$profilePath\*" -DestinationPath $archiveFile -CompressionLevel Optimal -Force -ErrorAction Stop
-                    $archiveFile
-                }
-
-                if (-not $archiveOk) { continue }
-            }
-
-            # -------------------------------------------------------------
-            # 3. REMOVE PROFILE (WMI first to clean registry, then disk)
-            # -------------------------------------------------------------
-            if (Test-Path -LiteralPath $profilePath) {
-                $profileOk = Invoke-Step -Category 'ProfileRemoval' -Name $name -ScriptBlock {
-                    $profileObject = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
-                        Where-Object { ($sid -and $_.SID -eq $sid) -or $_.LocalPath -ieq $profilePath }
-
-                    if ($profileObject) { 
-                        $profileObject | Remove-CimInstance -ErrorAction Stop 
-                    }
-                    if (Test-Path -LiteralPath $profilePath) { 
-                        Remove-Item -LiteralPath $profilePath -Recurse -Force -ErrorAction Stop 
-                    }
-                }
-
-                if (-not $profileOk) { continue }
-            }
-
-            # -------------------------------------------------------------
-            # 4. REMOVE LOCAL USER ACCOUNT
-            # -------------------------------------------------------------
-            if ($localUser) {
-                Invoke-Step -Category 'UserRemoval' -Name $name -ScriptBlock {
-                    Remove-LocalUser -Name $name -ErrorAction Stop
-                } | Out-Null
-            } else {
-                $actions.Add([PSCustomObject]@{
-                        Category = 'UserRemoval'
-                        Name     = $name
-                        Status   = 'Success'
-                        Details  = 'Already absent'
-                    })
-            }
-        }
-
-        # -----------------------------------------------------------------
-        # 5. BITLOCKER / TPM PROTECTOR CHECK
-        # -----------------------------------------------------------------
-        Invoke-Step -Category 'DiskEncryption' -Name 'C:' -ScriptBlock {
-            $tpm = Get-Tpm -ErrorAction Stop
-
-            if (-not ($tpm.TpmPresent -and $tpm.TpmEnabled)) {
-                throw 'TPM is unavailable or disabled'
-            }
-
-            $volume = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
-            $hasTpm = @($volume.KeyProtector | Where-Object KeyProtectorType -eq 'Tpm').Count -gt 0
-
-            if (-not $hasTpm) {
-                Add-BitLockerKeyProtector -MountPoint 'C:' -TpmProtector -ErrorAction Stop | Out-Null
-            }
-        } | Out-Null
-
-        [PSCustomObject]@{
-            Platform = 'Windows'
-            Success  = ($failures.Count -eq 0)
-            Actions  = $actions.ToArray()
-            Failures = $failures.ToArray()
-        }
-    }
-
-
-    function ConvertFrom-Base64 {
-        param ([string]$text)
-        return [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($text))
-    }
-
-    function ConvertTo-Base64 {
-        param (
-            [string]$text
-        )
-
-        return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($text))
-    }
-
-
-
-    function Get-MobileConfig {
+    function Invoke-Step {
         [CmdletBinding()]
         param(
-            [Parameter()]
-            [object]$CustomConfig
+            [Parameter(Mandatory)][string]$Category,
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter(Mandatory)][scriptblock]$ScriptBlock
         )
 
-        $merged = @{}
+        try {
+            $details = & $ScriptBlock
 
-        # Copy defaults from the base script Config
-        if ($script:Config) {
-            foreach ($prop in $script:Config.PSObject.Properties) {
+            $actions.Add([PSCustomObject]@{
+                    Category = $Category
+                    Name     = $Name
+                    Status   = 'Success'
+                    Details  = $details
+                })
+
+            return $true
+        } catch {
+            $actions.Add([PSCustomObject]@{
+                    Category = $Category
+                    Name     = $Name
+                    Status   = 'Failed'
+                    Details  = $null
+                })
+
+            $failures.Add("${Category} '$Name': $($_.Exception.Message)")
+            return $false
+        }
+    }
+
+    # Ensure archive directory exists if archiving is enabled
+    $archiveReady = $true
+    if ($archive) {
+        $archiveReady = Invoke-Step -Category 'ArchiveDirectory' -Name $archivePath -ScriptBlock {
+            if (-not (Test-Path -LiteralPath $archivePath)) {
+                New-Item -ItemType Directory -Force -Path $archivePath -ErrorAction Stop | Out-Null
+            }
+            $archivePath
+        }
+    }
+
+    foreach ($u in $allUsers) {
+        $name        = $u.Name
+        $profilePath = "C:\Users\$name"
+        $localUser   = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+        $sid         = if ($localUser) { $localUser.SID.Value } else { $null }
+
+        # -------------------------------------------------------------
+        # 1. LOG OFF USER SESSIONS FIRST (Free locked files & registry)
+        # -------------------------------------------------------------
+        Invoke-Step -Category 'UserLogoff' -Name $name -ScriptBlock {
+            $sessions = query session 2>&1
+            foreach ($line in $sessions) {
+                # Format: SESSIONNAME USERNAME ID STATE ...
+                if ($line -match "\b$([regex]::Escape($name))\b") {
+                    $parts = ($line.Trim() -replace '\s+', ' ').Split(' ')
+                    # If SESSIONNAME is blank (e.g. disconnected), username is index 0, ID is index 1
+                    # If SESSIONNAME exists, username is index 1, ID is index 2
+                    $targetId = if ($parts[0] -ieq $name) { $parts[1] } else { $parts[2] }
+
+                    if ($targetId -match '^\d+$') {
+                        Write-Host " --- Logging off user: $name (Session ID: $targetId)"
+                        logoff $targetId
+                    }
+                }
+            }
+            # Wait briefly for Explorer and NTUSER.DAT handles to unload
+            Start-Sleep -Seconds 2
+        } | Out-Null
+
+        # Skip archiving/removal if archive path failed to create
+        if ($archive -and -not $archiveReady) {
+            continue
+        }
+
+        # -------------------------------------------------------------
+        # 2. ARCHIVE USER PROFILE
+        # -------------------------------------------------------------
+        if ($archive -and (Test-Path -LiteralPath $profilePath)) {
+            $archiveFile = Join-Path $archivePath "$name-$timeStamp.zip"
+
+            $archiveOk = Invoke-Step -Category 'ProfileArchive' -Name $name -ScriptBlock {
+                Compress-Archive -Path "$profilePath\*" -DestinationPath $archiveFile -CompressionLevel Optimal -Force -ErrorAction Stop
+                $archiveFile
+            }
+
+            if (-not $archiveOk) { continue }
+        }
+
+        # -------------------------------------------------------------
+        # 3. REMOVE PROFILE (WMI first to clean registry, then disk)
+        # -------------------------------------------------------------
+        if (Test-Path -LiteralPath $profilePath) {
+            $profileOk = Invoke-Step -Category 'ProfileRemoval' -Name $name -ScriptBlock {
+                $profileObject = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
+                    Where-Object { ($sid -and $_.SID -eq $sid) -or $_.LocalPath -ieq $profilePath }
+
+                if ($profileObject) { 
+                    $profileObject | Remove-CimInstance -ErrorAction Stop 
+                }
+                if (Test-Path -LiteralPath $profilePath) { 
+                    Remove-Item -LiteralPath $profilePath -Recurse -Force -ErrorAction Stop 
+                }
+            }
+
+            if (-not $profileOk) { continue }
+        }
+
+        # -------------------------------------------------------------
+        # 4. REMOVE LOCAL USER ACCOUNT
+        # -------------------------------------------------------------
+        if ($localUser) {
+            Invoke-Step -Category 'UserRemoval' -Name $name -ScriptBlock {
+                Remove-LocalUser -Name $name -ErrorAction Stop
+            } | Out-Null
+        } else {
+            $actions.Add([PSCustomObject]@{
+                    Category = 'UserRemoval'
+                    Name     = $name
+                    Status   = 'Success'
+                    Details  = 'Already absent'
+                })
+        }
+    }
+
+    # -----------------------------------------------------------------
+    # 5. BITLOCKER / TPM PROTECTOR CHECK
+    # -----------------------------------------------------------------
+    Invoke-Step -Category 'DiskEncryption' -Name 'C:' -ScriptBlock {
+        $tpm = Get-Tpm -ErrorAction Stop
+
+        if (-not ($tpm.TpmPresent -and $tpm.TpmEnabled)) {
+            throw 'TPM is unavailable or disabled'
+        }
+
+        $volume = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
+        $hasTpm = @($volume.KeyProtector | Where-Object KeyProtectorType -eq 'Tpm').Count -gt 0
+
+        if (-not $hasTpm) {
+            Add-BitLockerKeyProtector -MountPoint 'C:' -TpmProtector -ErrorAction Stop | Out-Null
+        }
+    } | Out-Null
+
+    [PSCustomObject]@{
+        Platform = 'Windows'
+        Success  = ($failures.Count -eq 0)
+        Actions  = $actions.ToArray()
+        Failures = $failures.ToArray()
+    }
+}
+
+
+function ConvertFrom-Base64 {
+    param ([string]$text)
+    return [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($text))
+}
+
+function ConvertTo-Base64 {
+    param (
+        [string]$text
+    )
+
+    return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($text))
+}
+
+
+
+function Get-MobileConfig {
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [object]$CustomConfig
+    )
+
+    $merged = @{}
+
+    # Copy defaults from the base script Config
+    if ($script:Config) {
+        foreach ($prop in $script:Config.PSObject.Properties) {
+            $merged[$prop.Name] = $prop.Value
+        }
+    }
+
+    # Overlay user-provided configs (supports Hashtable, PSCustomObject, or IDictionary)
+    if ($CustomConfig) {
+        if ($CustomConfig -is [System.Collections.IDictionary]) {
+            foreach ($k in $CustomConfig.Keys) {
+                $merged[$k] = $CustomConfig[$k]
+            }
+        } else {
+            foreach ($prop in $CustomConfig.PSObject.Properties) {
                 $merged[$prop.Name] = $prop.Value
             }
         }
-
-        # Overlay user-provided configs (supports Hashtable, PSCustomObject, or IDictionary)
-        if ($CustomConfig) {
-            if ($CustomConfig -is [System.Collections.IDictionary]) {
-                foreach ($k in $CustomConfig.Keys) {
-                    $merged[$k] = $CustomConfig[$k]
-                }
-            } else {
-                foreach ($prop in $CustomConfig.PSObject.Properties) {
-                    $merged[$prop.Name] = $prop.Value
-                }
-            }
-        }
-
-        return [PSCustomObject]$merged
     }
 
-    # --- Private Helper Functions (Not Exported) ---
-    #
+    return [PSCustomObject]$merged
+}
 
-    #### UTILS
+# --- Private Helper Functions (Not Exported) ---
+#
 
-    $Sha512CryptSource = @"
+#### UTILS
+
+$Sha512CryptSource = @"
 using System;
 using System.Text;
 using System.Security.Cryptography;
@@ -663,449 +664,449 @@ public class Sha512Crypt
 }
 "@
 
-    # Load the class into memory once per session
-    if (-not ([System.Management.Automation.PSTypeName]'Sha512Crypt').Type) {
-        Add-Type -TypeDefinition $Sha512CryptSource
+# Load the class into memory once per session
+if (-not ([System.Management.Automation.PSTypeName]'Sha512Crypt').Type) {
+    Add-Type -TypeDefinition $Sha512CryptSource
+}
+
+
+
+function Invoke-Linux {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [array]$Computers,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Script,
+
+        [Parameter(Mandatory=$true)]
+        [string]$KeyPath
+    )
+
+    # Clean the script once, up front — no point repeating this per-job
+    $cleanScript = ($Script -replace "`r","").TrimEnd() + "`n"
+
+    $jobs = foreach ($target in $Computers) {
+        Start-Job -ScriptBlock {
+            param($target, $payload, $key)
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "ssh"
+            $psi.Arguments = "-i `"$key`" -o UpdateHostKeys=no -o BatchMode=yes -o StrictHostKeyChecking=no $target `"bash -s --`""
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $proc.StandardInput.Write($payload)
+            $proc.StandardInput.Close()
+
+            $stdout = $proc.StandardOutput.ReadToEnd()
+            $stderr = $proc.StandardError.ReadToEnd()
+            $proc.WaitForExit()
+
+            return [PSCustomObject]@{
+                Target   = $target
+                ExitCode = $proc.ExitCode
+                StdOut   = $stdout
+                StdErr   = $stderr
+            }
+        } -ArgumentList $target, $cleanScript, $KeyPath
     }
 
-
-
-    function Invoke-Linux {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory=$true)]
-            [array]$Computers,
-
-            [Parameter(Mandatory=$true)]
-            [string]$Script,
-
-            [Parameter(Mandatory=$true)]
-            [string]$KeyPath
-        )
-
-        # Clean the script once, up front — no point repeating this per-job
-        $cleanScript = ($Script -replace "`r","").TrimEnd() + "`n"
-
-        $jobs = foreach ($target in $Computers) {
-            Start-Job -ScriptBlock {
-                param($target, $payload, $key)
-
-                $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.FileName = "ssh"
-                $psi.Arguments = "-i `"$key`" -o UpdateHostKeys=no -o BatchMode=yes -o StrictHostKeyChecking=no $target `"bash -s --`""
-                $psi.RedirectStandardInput = $true
-                $psi.RedirectStandardOutput = $true
-                $psi.RedirectStandardError = $true
-                $psi.UseShellExecute = $false
-
-                $proc = [System.Diagnostics.Process]::Start($psi)
-                $proc.StandardInput.Write($payload)
-                $proc.StandardInput.Close()
-
-                $stdout = $proc.StandardOutput.ReadToEnd()
-                $stderr = $proc.StandardError.ReadToEnd()
-                $proc.WaitForExit()
-
-                return [PSCustomObject]@{
-                    Target   = $target
-                    ExitCode = $proc.ExitCode
-                    StdOut   = $stdout
-                    StdErr   = $stderr
-                }
-            } -ArgumentList $target, $cleanScript, $KeyPath
-        }
-
-        $res = $jobs | Wait-Job | Receive-Job
-        $jobs | Remove-Job
-        return $res
-    }
+    $res = $jobs | Wait-Job | Receive-Job
+    $jobs | Remove-Job
+    return $res
+}
 
 
 
 
-    function Resolve-GroupType {
-        param(
-            [Parameter(Mandatory)]
-            [string]$Group
-        )
+function Resolve-GroupType {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Group
+    )
 
-        foreach ($groupType in $script:GroupMetadata.Keys) {
-            foreach ($pattern in $script:GroupMetadata[$groupType].Patterns) {
-                if ($Group -like $pattern) {
-                    return $groupType
-                }
+    foreach ($groupType in $script:GroupMetadata.Keys) {
+        foreach ($pattern in $script:GroupMetadata[$groupType].Patterns) {
+            if ($Group -like $pattern) {
+                return $groupType
             }
         }
-
-        return $null
     }
 
+    return $null
+}
 
-    function Set-Groups {
-        [CmdletBinding()]
-        param(
-            [Parameter(Position = 0)]
-            [array]$Groups
-        )
 
-        if (-not $groups) { return @([GroupType]::Local)
-        }
+function Set-Groups {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [array]$Groups
+    )
 
-        $resolved = foreach ($g in $groups) {
-            $type = Resolve-GroupType $g
-            if ($null -ne $type) {
-                $type
-            }
-        } 
-        $resolved = ($resolved | Sort-Object -Unique)
-
-        $exclusive = $resolved |
-            Where-Object {
-                $script:GroupMetadata[$_].Exclusive
-            } |
-            Sort-Object {
-                $script:GroupMetadata[$_].Priority
-            } -Descending |
-            Select-Object -First 1
-
-        if ($null -ne $exclusive) {
-            return @($exclusive)
-        }
-        return @(
-            [GroupType]::Local
-            $resolved
-        ) | Select-Object -unique
+    if (-not $groups) { return @([GroupType]::Local)
     }
 
+    $resolved = foreach ($g in $groups) {
+        $type = Resolve-GroupType $g
+        if ($null -ne $type) {
+            $type
+        }
+    } 
+    $resolved = ($resolved | Sort-Object -Unique)
 
-    enum TaskTriggerType {
-        Time         = 1
-        Daily        = 2
-        Weekly       = 3
-        Registration = 7
-        Boot         = 8
-        Logon        = 9
+    $exclusive = $resolved |
+        Where-Object {
+            $script:GroupMetadata[$_].Exclusive
+        } |
+        Sort-Object {
+            $script:GroupMetadata[$_].Priority
+        } -Descending |
+        Select-Object -First 1
+
+    if ($null -ne $exclusive) {
+        return @($exclusive)
     }
+    return @(
+        [GroupType]::Local
+        $resolved
+    ) | Select-Object -unique
+}
 
-    function New-TaskXML {
-        [CmdletBinding()]
-        param(
-            [Parameter()][string]$Description = "Automated Task",
-            [Parameter()][string]$Author = "SYSTEM",
-            [Parameter()][string]$Version = "1.0",
-        
-            [Parameter()]
-            [string]$Execute,
-            [string]$ToEncode,
-        
-            [Parameter()]
-            [string]$Arguments = "",
-        
-            # Pass a hashtable or array of hashtables describing triggers
-            [Parameter()]
-            [hashtable[]]$TriggerConfigs = @(@{ Type = [TaskTriggerType]::Registration }),
-        
-            [Parameter()][string]$UserId = "NT AUTHORITY\SYSTEM",
-            [Parameter()][int]$LogonType = 5, # 5 = TASK_LOGON_SERVICE / SYSTEM
-            [Parameter()][int]$RunLevel = 1,  # 1 = TASK_RUNLEVEL_HIGHEST
-        
-            [Parameter()][bool]$Hidden = $true,
-            [Parameter()][string]$ExecutionTimeLimit = "PT72H"
-        )
 
-        $defaultPSArgs = if ($Execute.ToLower().Contains('powershell')) { "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive "
-        }
-        $encoded = if (-not ([string]::IsNullOrWhiteSpace($toEncode))) { "-Encoded $(ConvertTo-Base64 $ToEncode)"
-        }
-        $arguments += ($defaultPSArgs + $encoded + $arguments)
+enum TaskTriggerType {
+    Time         = 1
+    Daily        = 2
+    Weekly       = 3
+    Registration = 7
+    Boot         = 8
+    Logon        = 9
+}
 
-        $ts = New-Object -ComObject "Schedule.Service"
-        $ts.Connect()
+function New-TaskXML {
+    [CmdletBinding()]
+    param(
+        [Parameter()][string]$Description = "Automated Task",
+        [Parameter()][string]$Author = "SYSTEM",
+        [Parameter()][string]$Version = "1.0",
+        
+        [Parameter()]
+        [string]$Execute,
+        [string]$ToEncode,
+        
+        [Parameter()]
+        [string]$Arguments = "",
+        
+        # Pass a hashtable or array of hashtables describing triggers
+        [Parameter()]
+        [hashtable[]]$TriggerConfigs = @(@{ Type = [TaskTriggerType]::Registration }),
+        
+        [Parameter()][string]$UserId = "NT AUTHORITY\SYSTEM",
+        [Parameter()][int]$LogonType = 5, # 5 = TASK_LOGON_SERVICE / SYSTEM
+        [Parameter()][int]$RunLevel = 1,  # 1 = TASK_RUNLEVEL_HIGHEST
+        
+        [Parameter()][bool]$Hidden = $true,
+        [Parameter()][string]$ExecutionTimeLimit = "PT72H"
+    )
 
-        # 0 = TASK_CREATE (Task Definition)
-        $taskDef = $ts.NewTask(0)
+    $defaultPSArgs = if ($Execute.ToLower().Contains('powershell')) { "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive "
+    }
+    $encoded = if (-not ([string]::IsNullOrWhiteSpace($toEncode))) { "-Encoded $(ConvertTo-Base64 $ToEncode)"
+    }
+    $arguments += ($defaultPSArgs + $encoded + $arguments)
+
+    $ts = New-Object -ComObject "Schedule.Service"
+    $ts.Connect()
+
+    # 0 = TASK_CREATE (Task Definition)
+    $taskDef = $ts.NewTask(0)
     
-        # 1. Registration Info
-        $taskDef.RegistrationInfo.Description = $Description
-        $taskDef.RegistrationInfo.Author = $Author
-        $taskDef.RegistrationInfo.Version = $Version
+    # 1. Registration Info
+    $taskDef.RegistrationInfo.Description = $Description
+    $taskDef.RegistrationInfo.Author = $Author
+    $taskDef.RegistrationInfo.Version = $Version
 
-        # 2. Task Settings
-        $taskDef.Settings.Enabled = $true
-        $taskDef.Settings.Hidden = $Hidden
-        $taskDef.Settings.StartWhenAvailable = $true
-        $taskDef.Settings.AllowDemandStart = $true
-        $taskDef.Settings.WakeToRun = $true
-        $taskDef.Settings.DisallowStartIfOnBatteries = $false
-        $taskDef.Settings.StopIfGoingOnBatteries = $false
-        $taskDef.Settings.ExecutionTimeLimit = $ExecutionTimeLimit
-        $hasEndBoundary = $TriggerConfigs | Where-Object { $_.ContainsKey("EndBoundary") }
-        if ($hasEndBoundary) {
-            $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
+    # 2. Task Settings
+    $taskDef.Settings.Enabled = $true
+    $taskDef.Settings.Hidden = $Hidden
+    $taskDef.Settings.StartWhenAvailable = $true
+    $taskDef.Settings.AllowDemandStart = $true
+    $taskDef.Settings.WakeToRun = $true
+    $taskDef.Settings.DisallowStartIfOnBatteries = $false
+    $taskDef.Settings.StopIfGoingOnBatteries = $false
+    $taskDef.Settings.ExecutionTimeLimit = $ExecutionTimeLimit
+    $hasEndBoundary = $TriggerConfigs | Where-Object { $_.ContainsKey("EndBoundary") }
+    if ($hasEndBoundary) {
+        $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
+    }
+
+    # 3. Principal Configuration
+    $taskDef.Principal.UserId = $UserId
+    $taskDef.Principal.LogonType = $LogonType
+    $taskDef.Principal.RunLevel = $RunLevel
+    function Get-ValOrFallBack {
+        param($map, $key, $default)
+        if ($map.ContainsKey($key)) { 
+            $map[$key]
+
+        } else { 
+            $default 
         }
+    }
 
-        # 3. Principal Configuration
-        $taskDef.Principal.UserId = $UserId
-        $taskDef.Principal.LogonType = $LogonType
-        $taskDef.Principal.RunLevel = $RunLevel
-        function Get-ValOrFallBack {
-            param($map, $key, $default)
-            if ($map.ContainsKey($key)) { 
-                $map[$key]
+    # 4. Triggers Configuration
+    foreach ($cfg in $TriggerConfigs) {
+        $tType = [TaskTriggerType]$cfg.Type
+        $trigger = $taskDef.Triggers.Create([int]$tType)
+        $trigger.Enabled = Get-ValOrFallBack $cfg "Enabled" $true        
 
-            } else { 
-                $default 
+        switch ($tType) {
+            ([TaskTriggerType]::Logon) {
+                # Specific user or $null / empty string for all users
+                $trigger.UserID  = Get-ValOrFallBack $cfg "UserId" $null
+                $trigger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
+            }
+            ([TaskTriggerType]::Boot) {
+                $trigger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
+                $trigger.EndBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddMinutes(30).ToString('s')
+                $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
+            }
+            ([TaskTriggerType]::Daily) {
+
+                $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
+                $trigger.DaysInterval = Get-ValOrFallBack $cfg "DaysInterval" 1 
+            }
+            ([TaskTriggerType]::Weekly) {
+                $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
+                $trigger.WeeksInterval = Get-ValOrFallBack $cfg 'WeeksInterval' 1
+                # DaysOfWeek bitmask: 1=Sun, 2=Mon, 4=Tue, 8=Wed, 16=Thu, 32=Fri, 64=Sat
+                $trigger.DaysOfWeek = Get-ValOrFallBack $cfg 'DaysOfWeek' 1
+            }
+            ([TaskTriggerType]::Time) {
+                ## StartBoundary set earlier
+                $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
+            }
+            ([TaskTriggerType]::Registration) {
+                $trigger.Delay = Get-ValOrFallBack $cfg 'Delay' 'PT0S'
+                $trigger.EndBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddSeconds(15).ToString('s')
+                $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
             }
         }
-
-        # 4. Triggers Configuration
-        foreach ($cfg in $TriggerConfigs) {
-            $tType = [TaskTriggerType]$cfg.Type
-            $trigger = $taskDef.Triggers.Create([int]$tType)
-            $trigger.Enabled = Get-ValOrFallBack $cfg "Enabled" $true        
-
-            switch ($tType) {
-                ([TaskTriggerType]::Logon) {
-                    # Specific user or $null / empty string for all users
-                    $trigger.UserID  = Get-ValOrFallBack $cfg "UserId" $null
-                    $trigger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
-                }
-                ([TaskTriggerType]::Boot) {
-                    $trigger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
-                    $trigger.EndBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddMinutes(30).ToString('s')
-                    $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
-                }
-                ([TaskTriggerType]::Daily) {
-
-                    $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
-                    $trigger.DaysInterval = Get-ValOrFallBack $cfg "DaysInterval" 1 
-                }
-                ([TaskTriggerType]::Weekly) {
-                    $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
-                    $trigger.WeeksInterval = Get-ValOrFallBack $cfg 'WeeksInterval' 1
-                    # DaysOfWeek bitmask: 1=Sun, 2=Mon, 4=Tue, 8=Wed, 16=Thu, 32=Fri, 64=Sat
-                    $trigger.DaysOfWeek = Get-ValOrFallBack $cfg 'DaysOfWeek' 1
-                }
-                ([TaskTriggerType]::Time) {
-                    ## StartBoundary set earlier
-                    $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
-                }
-                ([TaskTriggerType]::Registration) {
-                    $trigger.Delay = Get-ValOrFallBack $cfg 'Delay' 'PT0S'
-                    $trigger.EndBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddSeconds(15).ToString('s')
-                    $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
-                }
-            }
-        }
+    }
     
 
-        # 5. Action Configuration (0 = ExecAction)
-        $action = $taskDef.Actions.Create(0)
-        $action.Path = $Execute
-        $action.Arguments = $Arguments
+    # 5. Action Configuration (0 = ExecAction)
+    $action = $taskDef.Actions.Create(0)
+    $action.Path = $Execute
+    $action.Arguments = $Arguments
 
-        return $taskDef.XmlText
+    return $taskDef.XmlText
+}
+
+function ConvertTo-BashArgument {
+    param([string]$v)
+    "'" + $v.Replace("'","'\''") + "'"
+}
+function Repair-GpoPermissions {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$GpoID
+    )
+
+    $cleanGuid = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
+
+    $rootDSE = [ADSI]"LDAP://RootDSE"
+    $namingContext = $rootDSE.defaultNamingContext
+    $policyContainer = "CN=Policies,CN=System,$namingContext"
+    $gpoLdapUri = "LDAP://CN=$cleanGuid,$policyContainer"
+
+    if (-not [System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
+        throw "GPO $cleanGuid not found in AD."
     }
 
-    function ConvertTo-BashArgument {
-        param([string]$v)
-        "'" + $v.Replace("'","'\''") + "'"
-    }
-    function Repair-GpoPermissions {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)]
-            [string]$GpoID
-        )
+    $gpoEntry = [System.DirectoryServices.DirectoryEntry]::new($gpoLdapUri)
+    $sec = $gpoEntry.ObjectSecurity
 
-        $cleanGuid = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
+    # Convert common identities to SIDs
+    $sidAuthUsers    = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-11")      # Authenticated Users
+    $sidDomainAdmins = [System.Security.Principal.NTAccount]::new("Domain Admins").Translate([System.Security.Principal.SecurityIdentifier])
+    $sidSystem       = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-18")      # NT AUTHORITY\SYSTEM
+    $sidEnterprise   = [System.Security.Principal.NTAccount]::new("Enterprise Admins").Translate([System.Security.Principal.SecurityIdentifier])
 
-        $rootDSE = [ADSI]"LDAP://RootDSE"
-        $namingContext = $rootDSE.defaultNamingContext
-        $policyContainer = "CN=Policies,CN=System,$namingContext"
-        $gpoLdapUri = "LDAP://CN=$cleanGuid,$policyContainer"
+    $applyGpoGuid = [Guid]"edacfc86-b327-11d2-9701-00c04fd91ab0"
 
-        if (-not [System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
-            throw "GPO $cleanGuid not found in AD."
-        }
+    # 1. Grant Domain Admins & SYSTEM Full Control on AD Container
+    $ruleDomainAdmin = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidDomainAdmins,
+        [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $ruleSystem = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidSystem,
+        [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $ruleEnterprise = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidEnterprise,
+        [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
 
-        $gpoEntry = [System.DirectoryServices.DirectoryEntry]::new($gpoLdapUri)
-        $sec = $gpoEntry.ObjectSecurity
+    # 2. Grant Authenticated Users: Read + Apply Group Policy
+    $ruleAuthRead = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidAuthUsers,
+        [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $ruleAuthApply = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+        $sidAuthUsers,
+        [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+        [System.Security.AccessControl.AccessControlType]::Allow,
+        $applyGpoGuid
+    )
 
-        # Convert common identities to SIDs
-        $sidAuthUsers    = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-11")      # Authenticated Users
-        $sidDomainAdmins = [System.Security.Principal.NTAccount]::new("Domain Admins").Translate([System.Security.Principal.SecurityIdentifier])
-        $sidSystem       = [System.Security.Principal.SecurityIdentifier]::new("S-1-5-18")      # NT AUTHORITY\SYSTEM
-        $sidEnterprise   = [System.Security.Principal.NTAccount]::new("Enterprise Admins").Translate([System.Security.Principal.SecurityIdentifier])
+    $sec.AddAccessRule($ruleDomainAdmin)
+    $sec.AddAccessRule($ruleSystem)
+    $sec.AddAccessRule($ruleEnterprise)
+    $sec.AddAccessRule($ruleAuthRead)
+    $sec.AddAccessRule($ruleAuthApply)
 
-        $applyGpoGuid = [Guid]"edacfc86-b327-11d2-9701-00c04fd91ab0"
+    $gpoEntry.CommitChanges()
 
-        # 1. Grant Domain Admins & SYSTEM Full Control on AD Container
-        $ruleDomainAdmin = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
-            $sidDomainAdmins,
-            [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        $ruleSystem = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
-            $sidSystem,
-            [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        $ruleEnterprise = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
-            $sidEnterprise,
-            [System.DirectoryServices.ActiveDirectoryRights]::GenericAll,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
+    # 3. Match SYSVOL ACLs
+    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
+    $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGuid"
 
-        # 2. Grant Authenticated Users: Read + Apply Group Policy
-        $ruleAuthRead = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
-            $sidAuthUsers,
-            [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        $ruleAuthApply = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
-            $sidAuthUsers,
-            [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
-            [System.Security.AccessControl.AccessControlType]::Allow,
-            $applyGpoGuid
-        )
-
-        $sec.AddAccessRule($ruleDomainAdmin)
-        $sec.AddAccessRule($ruleSystem)
-        $sec.AddAccessRule($ruleEnterprise)
-        $sec.AddAccessRule($ruleAuthRead)
-        $sec.AddAccessRule($ruleAuthApply)
-
-        $gpoEntry.CommitChanges()
-
-        # 3. Match SYSVOL ACLs
-        $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
-        $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGuid"
-
-        if (Test-Path $gpoSysvolPath) {
-            icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
-            icacls.exe $gpoSysvolPath /grant "Domain Admins:(OI)(CI)(F)" "SYSTEM:(OI)(CI)(F)" /T /C /Q 2>$null | Out-Null
-            icacls.exe $gpoSysvolPath /grant "Authenticated Users:(OI)(CI)(RX)" /T /C /Q 2>$null | Out-Null
-        }
-
-        Write-Host "[+] Fixed AD Container and SYSVOL ACLs for $cleanGuid" -ForegroundColor Green
+    if (Test-Path $gpoSysvolPath) {
+        icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
+        icacls.exe $gpoSysvolPath /grant "Domain Admins:(OI)(CI)(F)" "SYSTEM:(OI)(CI)(F)" /T /C /Q 2>$null | Out-Null
+        icacls.exe $gpoSysvolPath /grant "Authenticated Users:(OI)(CI)(RX)" /T /C /Q 2>$null | Out-Null
     }
 
-    function New-ShortcutGPO {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)]
-            [string]$TargetOUFriendlyName,
+    Write-Host "[+] Fixed AD Container and SYSVOL ACLs for $cleanGuid" -ForegroundColor Green
+}
 
-            [Parameter()]
-            [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
+function New-ShortcutGPO {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetOUFriendlyName,
 
-            [Parameter()]
-            [string]$ShortcutName = "LocalAccountCreator",
+        [Parameter()]
+        [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
 
-            [Parameter()]
-            [string]$TargetPath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        [Parameter()]
+        [string]$ShortcutName = "LocalAccountCreator",
 
-            [Parameter()]
-            [string]$Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File ""C:\Supportbin\script.ps1""",
+        [Parameter()]
+        [string]$TargetPath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
 
-            [Parameter()]
-            [string]$IconPath = "%SystemRoot%\System32\SHELL32.dll",
+        [Parameter()]
+        [string]$Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File ""C:\Supportbin\script.ps1""",
 
-            [Parameter()]
-            [int]$IconIndex = 301,
+        [Parameter()]
+        [string]$IconPath = "%SystemRoot%\System32\SHELL32.dll",
 
-            [Parameter()]
-            [string]$Comment = "LOCAL ACCOUNTS",
-            [switch]$Quiet
-        )
+        [Parameter()]
+        [int]$IconIndex = 301,
 
-        $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
-        $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
-        $gpoName = "Mobile Logon"
+        [Parameter()]
+        [string]$Comment = "LOCAL ACCOUNTS",
+        [switch]$Quiet
+    )
 
-        $rootDSE = [ADSI]"LDAP://RootDSE"
-        $ctx = $rootDSE.DefaultNamingContext
-        $policyContainerPath = "CN=Policies,CN=System,$ctx"
-        $targetOU_DN = "OU=$TargetOUFriendlyName,$ctx"
-        $gpoLdapPath = "[LDAP://CN=$cleanGpoID,$policyContainerPath;0]"
-        $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
+    $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
+    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
+    $gpoName = "Mobile Logon"
 
-        #
-        # 1. Active Directory GPC Object
-        #
-        $policiesContainer = [ADSI]"LDAP://$policyContainerPath"
-        $gpoLdapUri = "LDAP://CN=$cleanGpoID,$policyContainerPath"
+    $rootDSE = [ADSI]"LDAP://RootDSE"
+    $ctx = $rootDSE.DefaultNamingContext
+    $policyContainerPath = "CN=Policies,CN=System,$ctx"
+    $targetOU_DN = "OU=$TargetOUFriendlyName,$ctx"
+    $gpoLdapPath = "[LDAP://CN=$cleanGpoID,$policyContainerPath;0]"
+    $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
 
-        $isNew = $false
-        if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
-            $gpoEntry = [ADSI]$gpoLdapUri
-        } else {
-            $gpoEntry = $policiesContainer.Create("groupPolicyContainer", "CN=$cleanGpoID")
-            $isNew = $true
+    #
+    # 1. Active Directory GPC Object
+    #
+    $policiesContainer = [ADSI]"LDAP://$policyContainerPath"
+    $gpoLdapUri = "LDAP://CN=$cleanGpoID,$policyContainerPath"
+
+    $isNew = $false
+    if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
+        $gpoEntry = [ADSI]$gpoLdapUri
+    } else {
+        $gpoEntry = $policiesContainer.Create("groupPolicyContainer", "CN=$cleanGpoID")
+        $isNew = $true
+    }
+
+    # Verified extension GUIDs from working GPO
+    $exactExtensionWithLogon = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
+    $exactExtension = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
+
+    $versionNumber = (1 -shl 16) # User version = 1, Computer version = 0
+
+    $gpoEntry.Put("displayName", $gpoName)
+    $gpoEntry.Put("flags", 0)
+    $gpoEntry.Put("gPCFunctionalityVersion", 2)
+    $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
+    $gpoEntry.Put("gPCUserExtensionNames", $exactExtension)
+    $gpoEntry.Put("versionNumber", $versionNumber)
+    $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
+
+    # Clone parent ACL to avoid Access Denied in GPMC
+    if ($isNew) {
+        $parentSec = $policiesContainer.Properties["ntSecurityDescriptor"].Value
+        if ($parentSec) {
+            $gpoEntry.Properties["ntSecurityDescriptor"].Value = $parentSec
         }
+    }
 
-        # Verified extension GUIDs from working GPO
-        $exactExtensionWithLogon = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
-        $exactExtension = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
+    $gpoEntry.SetInfo()
 
-        $versionNumber = (1 -shl 16) # User version = 1, Computer version = 0
+    #
+    # 2. Build SYSVOL Directory Structure
+    #
+    $userPrefPath = Join-Path $gpoSysvolPath "User\Preferences\Shortcuts"
+    $machinePath  = Join-Path $gpoSysvolPath "Machine"
 
-        $gpoEntry.Put("displayName", $gpoName)
-        $gpoEntry.Put("flags", 0)
-        $gpoEntry.Put("gPCFunctionalityVersion", 2)
-        $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
-        $gpoEntry.Put("gPCUserExtensionNames", $exactExtension)
-        $gpoEntry.Put("versionNumber", $versionNumber)
-        $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
-
-        # Clone parent ACL to avoid Access Denied in GPMC
-        if ($isNew) {
-            $parentSec = $policiesContainer.Properties["ntSecurityDescriptor"].Value
-            if ($parentSec) {
-                $gpoEntry.Properties["ntSecurityDescriptor"].Value = $parentSec
-            }
+    @($gpoSysvolPath, $userPrefPath, $machinePath) | ForEach-Object {
+        if (-not (Test-Path $_)) {
+            New-Item -Path $_ -ItemType Directory -Force | Out-Null
         }
+    }
 
-        $gpoEntry.SetInfo()
+    try {
+        icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
+    } catch { }
 
-        #
-        # 2. Build SYSVOL Directory Structure
-        #
-        $userPrefPath = Join-Path $gpoSysvolPath "User\Preferences\Shortcuts"
-        $machinePath  = Join-Path $gpoSysvolPath "Machine"
-
-        @($gpoSysvolPath, $userPrefPath, $machinePath) | ForEach-Object {
-            if (-not (Test-Path $_)) {
-                New-Item -Path $_ -ItemType Directory -Force | Out-Null
-            }
-        }
-
-        try {
-            icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
-        } catch { }
-
-        #
-        # 3. gpt.ini
-        #
-        $gptIni = @"
+    #
+    # 3. gpt.ini
+    #
+    $gptIni = @"
 [General]
 Version=$versionNumber
 displayName=$gpoName
 "@
-        Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIni -Encoding Ascii
+    Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIni -Encoding Ascii
 
-        #
-        # 4. Generate Working Shortcuts.xml
-        #
-        $timeNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-        $desktopUid = [Guid]::NewGuid().ToString("B").ToUpper()
-        $startMenuUid = [Guid]::NewGuid().ToString("B").ToUpper()
+    #
+    # 4. Generate Working Shortcuts.xml
+    #
+    $timeNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+    $desktopUid = [Guid]::NewGuid().ToString("B").ToUpper()
+    $startMenuUid = [Guid]::NewGuid().ToString("B").ToUpper()
 
-        # Escape XML entities in arguments
-        $xmlEscapedArgs = [System.Security.SecurityElement]::Escape($Arguments)
+    # Escape XML entities in arguments
+    $xmlEscapedArgs = [System.Security.SecurityElement]::Escape($Arguments)
 
-        $xmlContent = @"
+    $xmlContent = @"
 <?xml version="1.0" encoding="utf-8"?>
 <Shortcuts clsid="{872ECB34-B2EC-401b-A585-D32574AA90EE}">
   <Shortcut clsid="{4F2F7C55-2790-433e-8127-0739D1CFA327}" name="$ShortcutName" status="$ShortcutName" image="1" changed="$timeNow" uid="$desktopUid" userContext="1" bypassErrors="1" removePolicy="1">
@@ -1117,106 +1118,17 @@ displayName=$gpoName
 </Shortcuts>
 "@
 
-        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-        [System.IO.File]::WriteAllText((Join-Path $userPrefPath "Shortcuts.xml"), $xmlContent.Trim(), $utf8NoBom)
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText((Join-Path $userPrefPath "Shortcuts.xml"), $xmlContent.Trim(), $utf8NoBom)
 
-        #
-        # 5. Link to OU
-        #
-        if ([System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
-            $targetOU = [ADSI]"LDAP://$targetOU_DN"
-            $existingLinks = $targetOU.Properties['gPLink'].Value
-            if ($existingLinks) {
-                if ($existingLinks -notlike "*$cleanGpoID*") {
-                    $targetOU.Properties['gPLink'].Value = "$gpoLdapPath$existingLinks"
-                }
-            } else {
-                $targetOU.Properties['gPLink'].Value = $gpoLdapPath
-            }
-
-            if (-not $targetOU.Properties['gPOptions'].Value) {
-                $targetOU.Properties['gPOptions'].Value = 0
-            }
-
-            $targetOU.SetInfo()
-        } else {
-            Write-Warning "Target OU '$TargetOUFriendlyName' not found. Link skipped."
-        }
-
-        if ($quiet) { return }
-        Write-Host "[+] Successfully created and populated Shortcut GPO ($cleanGpoID)" -ForegroundColor Green
-    }
-
-    function New-CustomGPO {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)]
-            [string]$TargetOUFriendlyName,
-
-            [Parameter()]
-            [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
-
-            [Parameter()]
-            [string]$GpoDisplayName = "Mobile Logon"
-        )
-
-        $cleanGuid = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
-
-        $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
-        $rootDSE = [ADSI]"LDAP://RootDSE"
-        $namingContext = $rootDSE.defaultNamingContext
-        $policyContainer = "CN=Policies,CN=System,$namingContext"
-        $targetOU_DN = "OU=$TargetOUFriendlyName,$namingContext"
-
-        $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGuid"
-        $gpoLdapPath   = "[LDAP://CN=$cleanGuid,$policyContainer;0]"
-
-        # 1. Create or bind to the AD Group Policy Container (GPC)
-        $gpoLdapUri = "LDAP://CN=$cleanGuid,$policyContainer"
-        if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
-            $gpoEntry = [ADSI]$gpoLdapUri
-            Write-Host "[-] GPC object already exists in AD: $cleanGuid" -ForegroundColor Yellow
-        } else {
-            $policiesDir = [ADSI]"LDAP://$policyContainer"
-            $gpoEntry = $policiesDir.Create("groupPolicyContainer", "CN=$cleanGuid")
-        }
-
-        $gpoEntry.Put("displayName", $GpoDisplayName)
-        $gpoEntry.Put("flags", 0)                 # 0 = Both User & Computer enabled
-        $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
-        $gpoEntry.Put("versionNumber", 0)          # 0 = Brand new / clean version
-        $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
-        $gpoEntry.SetInfo()
-
-        # 2. Build standard SYSVOL folder structure
-        $machinePath = Join-Path $gpoSysvolPath "Machine"
-        $userPath    = Join-Path $gpoSysvolPath "User"
-
-        @($gpoSysvolPath, $machinePath, $userPath) | ForEach-Object {
-            if (-not (Test-Path $_)) {
-                New-Item -Path $_ -ItemType Directory -Force | Out-Null
-            }
-        }
-
-        # 3. Create minimal gpt.ini
-        $gptIniContent = @"
-[General]
-Version=0
-displayName=$GpoDisplayName
-"@
-        Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIniContent -Encoding Ascii
-
-        # 4. Link GPO to target OU
-        if (-not [System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
-            Write-Warning "Target OU '$targetOU_DN' does not exist. GPO created, but link was skipped."
-            return
-        }
-
+    #
+    # 5. Link to OU
+    #
+    if ([System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
         $targetOU = [ADSI]"LDAP://$targetOU_DN"
         $existingLinks = $targetOU.Properties['gPLink'].Value
-
         if ($existingLinks) {
-            if ($existingLinks -notlike "*$cleanGuid*") {
+            if ($existingLinks -notlike "*$cleanGpoID*") {
                 $targetOU.Properties['gPLink'].Value = "$gpoLdapPath$existingLinks"
             }
         } else {
@@ -1228,405 +1140,494 @@ displayName=$GpoDisplayName
         }
 
         $targetOU.SetInfo()
-        Write-Host "[+] Created clean GPO '$GpoDisplayName' ($cleanGuid) and linked to '$TargetOUFriendlyName'." -ForegroundColor Green
-        Write-Host "[+] Ready for editing via GPMC." -ForegroundColor DarkGray
+    } else {
+        Write-Warning "Target OU '$TargetOUFriendlyName' not found. Link skipped."
     }
 
+    if ($quiet) { return }
+    Write-Host "[+] Successfully created and populated Shortcut GPO ($cleanGpoID)" -ForegroundColor Green
+}
 
-    ### INITIALIZE
+function New-CustomGPO {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetOUFriendlyName,
 
-    function New-InitResult {
-        param(
-            [Parameter(Mandatory)][string]$Component,
-            [Parameter(Mandatory)][ValidateSet('OK', 'CREATED', 'REPAIRED', 'FAILED', 'SKIPPED')][string]$Status,
-            [Parameter(Mandatory)][string]$Details,
-            [switch]$Fatal
-        )
-        [PSCustomObject]@{
-            Component = $Component
-            Status    = $Status
-            Details   = $Details
-            Fatal     = [bool]$Fatal
+        [Parameter()]
+        [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
+
+        [Parameter()]
+        [string]$GpoDisplayName = "Mobile Logon"
+    )
+
+    $cleanGuid = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
+
+    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
+    $rootDSE = [ADSI]"LDAP://RootDSE"
+    $namingContext = $rootDSE.defaultNamingContext
+    $policyContainer = "CN=Policies,CN=System,$namingContext"
+    $targetOU_DN = "OU=$TargetOUFriendlyName,$namingContext"
+
+    $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGuid"
+    $gpoLdapPath   = "[LDAP://CN=$cleanGuid,$policyContainer;0]"
+
+    # 1. Create or bind to the AD Group Policy Container (GPC)
+    $gpoLdapUri = "LDAP://CN=$cleanGuid,$policyContainer"
+    if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
+        $gpoEntry = [ADSI]$gpoLdapUri
+        Write-Host "[-] GPC object already exists in AD: $cleanGuid" -ForegroundColor Yellow
+    } else {
+        $policiesDir = [ADSI]"LDAP://$policyContainer"
+        $gpoEntry = $policiesDir.Create("groupPolicyContainer", "CN=$cleanGuid")
+    }
+
+    $gpoEntry.Put("displayName", $GpoDisplayName)
+    $gpoEntry.Put("flags", 0)                 # 0 = Both User & Computer enabled
+    $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
+    $gpoEntry.Put("versionNumber", 0)          # 0 = Brand new / clean version
+    $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
+    $gpoEntry.SetInfo()
+
+    # 2. Build standard SYSVOL folder structure
+    $machinePath = Join-Path $gpoSysvolPath "Machine"
+    $userPath    = Join-Path $gpoSysvolPath "User"
+
+    @($gpoSysvolPath, $machinePath, $userPath) | ForEach-Object {
+        if (-not (Test-Path $_)) {
+            New-Item -Path $_ -ItemType Directory -Force | Out-Null
         }
     }
 
-    function Test-AndFixDirectories {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)][hashtable]$PathMap
-        )
-        $results = [System.Collections.Generic.List[object]]::new()
+    # 3. Create minimal gpt.ini
+    $gptIniContent = @"
+[General]
+Version=0
+displayName=$GpoDisplayName
+"@
+    Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIniContent -Encoding Ascii
 
-        foreach ($name in $PathMap.Keys) {
-            $path = $PathMap[$name]
-
-            if ([string]::IsNullOrWhiteSpace($path)) {
-                $results.Add((New-InitResult -Component "Dir:$name" -Status 'FAILED' -Details "Path configuration is blank" -Fatal))
-                continue
-            }
-
-            if (Test-Path -Path $path) {
-                $results.Add((New-InitResult -Component "Dir:$name" -Status 'OK' -Details $path))
-            } else {
-                try {
-                    New-Item -ItemType Directory -Path $path -Force -ErrorAction Stop | Out-Null
-                    $results.Add((New-InitResult -Component "Dir:$name" -Status 'CREATED' -Details $path))
-                } catch {
-                    $results.Add((New-InitResult -Component "Dir:$name" -Status 'FAILED' -Details "Failed to create '$path': $($_.Exception.Message)" -Fatal))
-                }
-            }
-        }
-        return $results
+    # 4. Link GPO to target OU
+    if (-not [System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
+        Write-Warning "Target OU '$targetOU_DN' does not exist. GPO created, but link was skipped."
+        return
     }
 
+    $targetOU = [ADSI]"LDAP://$targetOU_DN"
+    $existingLinks = $targetOU.Properties['gPLink'].Value
 
-    function Test-AndFixDeployerCert {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)][string]$CertName,
-            [Parameter(Mandatory)][string]$PfxStoragePath,
-            [securestring]$CertPassword
-        )
+    if ($existingLinks) {
+        if ($existingLinks -notlike "*$cleanGuid*") {
+            $targetOU.Properties['gPLink'].Value = "$gpoLdapPath$existingLinks"
+        }
+    } else {
+        $targetOU.Properties['gPLink'].Value = $gpoLdapPath
+    }
 
-        $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My |
-            Where-Object { $_.Subject -like "*$CertName*" } |
-            Select-Object -First 1
+    if (-not $targetOU.Properties['gPOptions'].Value) {
+        $targetOU.Properties['gPOptions'].Value = 0
+    }
 
-        if ($existingCert) {
-            return (New-InitResult -Component 'Cert:Store' -Status 'OK' -Details "Thumbprint: $($existingCert.Thumbprint)")
+    $targetOU.SetInfo()
+    Write-Host "[+] Created clean GPO '$GpoDisplayName' ($cleanGuid) and linked to '$TargetOUFriendlyName'." -ForegroundColor Green
+    Write-Host "[+] Ready for editing via GPMC." -ForegroundColor DarkGray
+}
+
+
+### INITIALIZE
+
+function New-InitResult {
+    param(
+        [Parameter(Mandatory)][string]$Component,
+        [Parameter(Mandatory)][ValidateSet('OK', 'CREATED', 'REPAIRED', 'FAILED', 'SKIPPED')][string]$Status,
+        [Parameter(Mandatory)][string]$Details,
+        [switch]$Fatal
+    )
+    [PSCustomObject]@{
+        Component = $Component
+        Status    = $Status
+        Details   = $Details
+        Fatal     = [bool]$Fatal
+    }
+}
+
+function Test-AndFixDirectories {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$PathMap
+    )
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($name in $PathMap.Keys) {
+        $path = $PathMap[$name]
+
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            $results.Add((New-InitResult -Component "Dir:$name" -Status 'FAILED' -Details "Path configuration is blank" -Fatal))
+            continue
         }
 
-        $pfxFile = Join-Path $PfxStoragePath "$CertName.pfx"
-        $cerFile = Join-Path $PfxStoragePath "$CertName.cer"
-
-        # Case A: Import existing PFX from centralized share
-        if (Test-Path $pfxFile) {
-            if (-not $CertPassword) {
-                $CertPassword = Read-Host -AsSecureString -Prompt "[!] Certificate password required to import '$pfxFile'"
-            }
+        if (Test-Path -Path $path) {
+            $results.Add((New-InitResult -Component "Dir:$name" -Status 'OK' -Details $path))
+        } else {
             try {
-                Import-PfxCertificate -FilePath $pfxFile -CertStoreLocation Cert:\CurrentUser\My -Password $CertPassword -ErrorAction Stop | Out-Null
-                return (New-InitResult -Component 'Cert:Store' -Status 'REPAIRED' -Details "Imported $pfxFile")
+                New-Item -ItemType Directory -Path $path -Force -ErrorAction Stop | Out-Null
+                $results.Add((New-InitResult -Component "Dir:$name" -Status 'CREATED' -Details $path))
             } catch {
-                return (New-InitResult -Component 'Cert:Store' -Status 'FAILED' -Details "Failed to import $pfxFile : $($_.Exception.Message)" -Fatal)
+                $results.Add((New-InitResult -Component "Dir:$name" -Status 'FAILED' -Details "Failed to create '$path': $($_.Exception.Message)" -Fatal))
             }
         }
+    }
+    return $results
+}
 
-        # Case B: Mint new certificate, export to share, install locally
+
+function Test-AndFixDeployerCert {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CertName,
+        [Parameter(Mandatory)][string]$PfxStoragePath,
+        [securestring]$CertPassword
+    )
+
+    $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My |
+        Where-Object { $_.Subject -like "*$CertName*" } |
+        Select-Object -First 1
+
+    if ($existingCert) {
+        return (New-InitResult -Component 'Cert:Store' -Status 'OK' -Details "Thumbprint: $($existingCert.Thumbprint)")
+    }
+
+    $pfxFile = Join-Path $PfxStoragePath "$CertName.pfx"
+    $cerFile = Join-Path $PfxStoragePath "$CertName.cer"
+
+    # Case A: Import existing PFX from centralized share
+    if (Test-Path $pfxFile) {
+        if (-not $CertPassword) {
+            $CertPassword = Read-Host -AsSecureString -Prompt "[!] Certificate password required to import '$pfxFile'"
+        }
         try {
-            if (-not $CertPassword) {
-                $CertPassword = ConvertTo-SecureString -AsPlainText -Force 'deployer'
-            }
-
-            $c = New-SelfSignedCertificate `
-                -Subject "CN=$CertName" `
-                -Type DocumentEncryptionCert `
-                -CertStoreLocation "Cert:\CurrentUser\My" `
-                -KeyExportPolicy Exportable `
-                -NotAfter (Get-Date).AddYears(5) `
-                -ErrorAction Stop
-
-            Export-PfxCertificate -Cert $c -FilePath $pfxFile -Password $CertPassword -ErrorAction Stop | Out-Null
-            Export-Certificate -Cert $c -FilePath $cerFile -ErrorAction Stop | Out-Null
-
-            return (New-InitResult -Component 'Cert:Store' -Status 'CREATED' -Details "Minted new cert and stored to $pfxFile")
+            Import-PfxCertificate -FilePath $pfxFile -CertStoreLocation Cert:\CurrentUser\My -Password $CertPassword -ErrorAction Stop | Out-Null
+            return (New-InitResult -Component 'Cert:Store' -Status 'REPAIRED' -Details "Imported $pfxFile")
         } catch {
-            return (New-InitResult -Component 'Cert:Store' -Status 'FAILED' -Details "Creation failed: $($_.Exception.Message)" -Fatal)
+            return (New-InitResult -Component 'Cert:Store' -Status 'FAILED' -Details "Failed to import $pfxFile : $($_.Exception.Message)" -Fatal)
         }
     }
 
-    function Test-AndFixSshEnvironment {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)][string]$KeyPath,
-            [Parameter(Mandatory)][string]$NfsHome,
-            [Parameter()][switch]$quiet
-        )
-
-        if ([string]::IsNullOrWhiteSpace($KeyPath) -or $KeyPath.EndsWith('\')) {
-            return (New-InitResult -Component 'SSH:Config' -Status 'FAILED' -Details "Invalid SSH key path: '$KeyPath'" -Fatal)
+    # Case B: Mint new certificate, export to share, install locally
+    try {
+        if (-not $CertPassword) {
+            $CertPassword = ConvertTo-SecureString -AsPlainText -Force 'deployer'
         }
 
-        $nfsSsh      = Join-Path $NfsHome '.ssh'
-        $localSsh    = Join-Path $env:USERPROFILE '.ssh'
-        $rAuthorized = Join-Path $nfsSsh 'authorized_keys'
+        $c = New-SelfSignedCertificate `
+            -Subject "CN=$CertName" `
+            -Type DocumentEncryptionCert `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -KeyExportPolicy Exportable `
+            -NotAfter (Get-Date).AddYears(5) `
+            -ErrorAction Stop
 
-        try {
-            # 1. Directory checks
-            foreach ($dir in @($localSsh, $nfsSsh)) {
-                if (-not (Test-Path $dir)) {
-                    New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
-                }
-            }
+        Export-PfxCertificate -Cert $c -FilePath $pfxFile -Password $CertPassword -ErrorAction Stop | Out-Null
+        Export-Certificate -Cert $c -FilePath $cerFile -ErrorAction Stop | Out-Null
 
-            # 2. Permissions lock-down (Inheritance removal + single-owner grant)
-            icacls.exe $localSsh /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)(F)" 2>$null | Out-Null
-            icacls.exe $nfsSsh   /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)(F)" 2>$null | Out-Null
+        return (New-InitResult -Component 'Cert:Store' -Status 'CREATED' -Details "Minted new cert and stored to $pfxFile")
+    } catch {
+        return (New-InitResult -Component 'Cert:Store' -Status 'FAILED' -Details "Creation failed: $($_.Exception.Message)" -Fatal)
+    }
+}
 
-            # 3. Keypair generation
-            $keyCreated = $false
-            if (-not (Test-Path $KeyPath)) {
-                $keyDir = Split-Path -Parent $KeyPath
-                if (-not (Test-Path $keyDir)) { New-Item -ItemType Directory -Path $keyDir -Force | Out-Null }
-                ssh-keygen -f "$KeyPath" -C 'MobileDeployer' -N '""' -t ecdsa -q
-                $keyCreated = $true
-            }
+function Test-AndFixSshEnvironment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$KeyPath,
+        [Parameter(Mandatory)][string]$NfsHome,
+        [Parameter()][switch]$quiet
+    )
 
-            icacls.exe $KeyPath /inheritance:r /grant:r "$($env:USERNAME):(R)" 2>$null | Out-Null
-
-            # 4. Authorized keys enrollment
-            $pubKey = (ssh-keygen -yf $KeyPath).Trim()
-            if (-not (Test-Path $rAuthorized)) {
-                New-Item -ItemType File -Path $rAuthorized -Force | Out-Null
-            }
-
-            $existingAuth = Get-Content -Path $rAuthorized -ErrorAction SilentlyContinue
-            if ($existingAuth -notcontains $pubKey) {
-                Add-Content -Path $rAuthorized -Value $pubKey -Encoding UTF8
-                icacls.exe $rAuthorized /inheritance:r /grant:r "$($env:USERNAME):(R)" 2>$null | Out-Null
-            }
-
-            $status = if ($keyCreated) { 'CREATED' } else { 'OK' }
-            if ($quiet) { return $true }
-            return (New-InitResult -Component 'SSH:Environment' -Status $status -Details "Key at $KeyPath enrolled in $rAuthorized")
-        } catch {
-            if ($quiet) { return $false }
-            return (New-InitResult -Component 'SSH:Environment' -Status 'FAILED' -Details $_.Exception.Message -Fatal)
-        }
+    if ([string]::IsNullOrWhiteSpace($KeyPath) -or $KeyPath.EndsWith('\')) {
+        return (New-InitResult -Component 'SSH:Config' -Status 'FAILED' -Details "Invalid SSH key path: '$KeyPath'" -Fatal)
     }
 
+    $nfsSsh      = Join-Path $NfsHome '.ssh'
+    $localSsh    = Join-Path $env:USERPROFILE '.ssh'
+    $rAuthorized = Join-Path $nfsSsh 'authorized_keys'
 
-    function Initialize-Environment {
-        [CmdletBinding()]
-        param(
-            [Parameter()][string]$SshKeyPath   = $Script:Config.SSHKeyPath,
-            [Parameter()][string]$NfsHome      = $Script:Config.NfsHome,
-            [Parameter()][string]$AdminRoot    = $Script:Config.AdminRoot,
-            [Parameter()][string]$MobileDump   = $Script:Config.MobileDump,
-            [Parameter()][string]$MobileEntries= $Script:Config.MobileEntries,
-            [Parameter()][string]$CertName      = $(if ($Script:Config.CertName) { $Script:Config.CertName } else { 'MobileDeployer' }),
-            [Parameter()][switch]$HaltOnError,
-            [Parameter()][switch]$Console
-        )
-
-        if ($console) { Write-Host "`n[+] Executing System Requirements & Provisioning..." -ForegroundColor Cyan }
-        $results = [System.Collections.Generic.List[object]]::new()
-
-        # 1. Directory Structure Mapping
-        $requiredPaths = @{
-            'NfsHome'       = $NfsHome
-            'AdminRoot'     = $AdminRoot
-            'MobileDump'    = $MobileDump
-            'MobileEntries' = $MobileEntries
+    try {
+        # 1. Directory checks
+        foreach ($dir in @($localSsh, $nfsSsh)) {
+            if (-not (Test-Path $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+            }
         }
-        $results.AddRange((Test-AndFixDirectories -PathMap $requiredPaths))
 
-        # 2. SSH Environment
-        $results.Add((Test-AndFixSshEnvironment -KeyPath $SshKeyPath -NfsHome $NfsHome))
+        # 2. Permissions lock-down (Inheritance removal + single-owner grant)
+        icacls.exe $localSsh /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)(F)" 2>$null | Out-Null
+        icacls.exe $nfsSsh   /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)(F)" 2>$null | Out-Null
 
-        # 3. Document Encryption Cert
-        $results.Add((Test-AndFixDeployerCert -CertName $CertName -PfxStoragePath $AdminRoot))
+        # 3. Keypair generation
+        $keyCreated = $false
+        if (-not (Test-Path $KeyPath)) {
+            $keyDir = Split-Path -Parent $KeyPath
+            if (-not (Test-Path $keyDir)) { New-Item -ItemType Directory -Path $keyDir -Force | Out-Null }
+            ssh-keygen -f "$KeyPath" -C 'MobileDeployer' -N '""' -t ecdsa -q
+            $keyCreated = $true
+        }
 
-        $encCert = Join-Path $AdminRoot "$CertName.cer"
-        $cBytes = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($encCert))
-        $LogOnScript = (Get-Content (Join-Path $MyInvocation.PSScriptRoot "MobileLogon.ps1") ) -replace 'PASTE_YOUR_BASE64_CERT_BLOB_HERE',$cBytes
+        icacls.exe $KeyPath /inheritance:r /grant:r "$($env:USERNAME):(R)" 2>$null | Out-Null
 
-        $GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}"
-        $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
-        $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
-        $rootDSE = [ADSI]"LDAP://RootDSE"
-        $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
-        $outPath = Join-Path $gpoSysvolPath "CreateLocalAccounts.ps1"
-        $actualRunFile = Join-Path $gpoSysvolPath "Run.ps1"
+        # 4. Authorized keys enrollment
+        $pubKey = (ssh-keygen -yf $KeyPath).Trim()
+        if (-not (Test-Path $rAuthorized)) {
+            New-Item -ItemType File -Path $rAuthorized -Force | Out-Null
+        }
 
-        $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers" -quiet -Arguments "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$actualRunFile`""))
-        $runContent = @"
+        $existingAuth = Get-Content -Path $rAuthorized -ErrorAction SilentlyContinue
+        if ($existingAuth -notcontains $pubKey) {
+            Add-Content -Path $rAuthorized -Value $pubKey -Encoding UTF8
+            icacls.exe $rAuthorized /inheritance:r /grant:r "$($env:USERNAME):(R)" 2>$null | Out-Null
+        }
+
+        $status = if ($keyCreated) { 'CREATED' } else { 'OK' }
+        if ($quiet) { return $true }
+        return (New-InitResult -Component 'SSH:Environment' -Status $status -Details "Key at $KeyPath enrolled in $rAuthorized")
+    } catch {
+        if ($quiet) { return $false }
+        return (New-InitResult -Component 'SSH:Environment' -Status 'FAILED' -Details $_.Exception.Message -Fatal)
+    }
+}
+
+
+function Initialize-Environment {
+    [CmdletBinding()]
+    param(
+        [Parameter()][string]$SshKeyPath   = $Script:Config.SSHKeyPath,
+        [Parameter()][string]$NfsHome      = $Script:Config.NfsHome,
+        [Parameter()][string]$AdminRoot    = $Script:Config.AdminRoot,
+        [Parameter()][string]$MobileDump   = $Script:Config.MobileDump,
+        [Parameter()][string]$MobileEntries= $Script:Config.MobileEntries,
+        [Parameter()][string]$CertName      = $(if ($Script:Config.CertName) { $Script:Config.CertName } else { 'MobileDeployer' }),
+        [Parameter()][switch]$HaltOnError,
+        [Parameter()][switch]$Console
+    )
+
+    if ($console) { Write-Host "`n[+] Executing System Requirements & Provisioning..." -ForegroundColor Cyan }
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    # 1. Directory Structure Mapping
+    $requiredPaths = @{
+        'NfsHome'       = $NfsHome
+        'AdminRoot'     = $AdminRoot
+        'MobileDump'    = $MobileDump
+        'MobileEntries' = $MobileEntries
+    }
+    $results.AddRange((Test-AndFixDirectories -PathMap $requiredPaths))
+
+    # 2. SSH Environment
+    $results.Add((Test-AndFixSshEnvironment -KeyPath $SshKeyPath -NfsHome $NfsHome))
+
+    # 3. Document Encryption Cert
+    $results.Add((Test-AndFixDeployerCert -CertName $CertName -PfxStoragePath $AdminRoot))
+
+    $encCert = Join-Path $AdminRoot "$CertName.cer"
+    $cBytes = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($encCert))
+    $LogOnScript = (Get-Content (Join-Path $MyInvocation.PSScriptRoot "MobileLogon.ps1") ) -replace 'PASTE_YOUR_BASE64_CERT_BLOB_HERE',$cBytes
+
+    $GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}"
+    $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
+    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
+    $rootDSE = [ADSI]"LDAP://RootDSE"
+    $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
+    $outPath = Join-Path $gpoSysvolPath "CreateLocalAccounts.ps1"
+    $actualRunFile = Join-Path $gpoSysvolPath "Run.ps1"
+
+    $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers" -quiet -Arguments "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$actualRunFile`""))
+    $runContent = @"
 powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "$outPath" -MobileDumpPath $($Script:Config.MobileDump) -MobileEntriesPath $($Script:Config.MobileEntries)
 "@
-        $LogonScript | Set-Content -Path $outPath
-        $runContent | Set-Content -Path $actualRunFile
+    $LogonScript | Set-Content -Path $outPath
+    $runContent | Set-Content -Path $actualRunFile
 
 
-        #
-        # Pretty-Print Provisioning Ledger
-        #
-        $colorMap = @{
-            'OK'       = 'Green'
-            'CREATED'  = 'Cyan'
-            'REPAIRED' = 'Yellow'
-            'SKIPPED'  = 'DarkGray'
-            'FAILED'   = 'Red'
-        }
-
-        if ($console) {
-            Write-Host ""
-            Write-Host ("  {0,-20} {1,-10} {2}" -f 'COMPONENT', 'STATUS', 'DETAILS') -ForegroundColor DarkGray
-            Write-Host ("  {0,-20} {1,-10} {2}" -f ('-' * 20), ('-' * 10), ('-' * 45)) -ForegroundColor DarkGray
-
-
-            foreach ($r in $results) {
-                $color = $colorMap[$r.Status]
-                Write-Host ("  {0,-20} " -f $r.Component) -NoNewline
-                Write-Host ("[{0,-8}]" -f $r.Status) -ForegroundColor $color -NoNewline
-                Write-Host (" {0}" -f $r.Details)
-            }
-            Write-Host ""
-        }
-
-        #
-        # Final Validation Guard
-        #
-        $criticalFails = @($results | Where-Object { $_.Fatal -and $_.Status -eq 'FAILED' })
-
-        if ($criticalFails.Count -gt 0) {
-            Write-Host "[!] Preflight checks failed with $($criticalFails.Count) fatal error(s)." -ForegroundColor Red
-            if ($HaltOnError) {
-                throw "Environment provisioning incomplete. Halting execution."
-            }
-            return $false
-        }
-
-        if ($console) { Write-Host "[+] All dependencies satisfied. Environment ready for deployment." -ForegroundColor Green}
-        return $true
+    #
+    # Pretty-Print Provisioning Ledger
+    #
+    $colorMap = @{
+        'OK'       = 'Green'
+        'CREATED'  = 'Cyan'
+        'REPAIRED' = 'Yellow'
+        'SKIPPED'  = 'DarkGray'
+        'FAILED'   = 'Red'
     }
 
-    function New-DeployerCertificate {
-        [CmdletBinding()]
-        param(
-            [Parameter()][securestring]$certPass = (ConvertTo-SecureString -AsPlainText -Force 'deployer'),
-            [Parameter()][string]$outPath = $Script:Config.NfsHome
-        )
-        $c = New-SelfSignedCertificate -Subject 'CN=MobileDeployer' -Type DocumentEncryptionCert -CertStoreLocation "Cert:\CurrentUser\My" -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)
-        Export-PFXCertificate -Cert $c -FilePath (Join-Path $outPath "Deployer.pfx") -Password $certPass
-        Export-Certificate -Cert $c -FilePath (Join-Path $outPath "Deployer.cer") 
+    if ($console) {
+        Write-Host ""
+        Write-Host ("  {0,-20} {1,-10} {2}" -f 'COMPONENT', 'STATUS', 'DETAILS') -ForegroundColor DarkGray
+        Write-Host ("  {0,-20} {1,-10} {2}" -f ('-' * 20), ('-' * 10), ('-' * 45)) -ForegroundColor DarkGray
+
+
+        foreach ($r in $results) {
+            $color = $colorMap[$r.Status]
+            Write-Host ("  {0,-20} " -f $r.Component) -NoNewline
+            Write-Host ("[{0,-8}]" -f $r.Status) -ForegroundColor $color -NoNewline
+            Write-Host (" {0}" -f $r.Details)
+        }
+        Write-Host ""
+    }
+
+    #
+    # Final Validation Guard
+    #
+    $criticalFails = @($results | Where-Object { $_.Fatal -and $_.Status -eq 'FAILED' })
+
+    if ($criticalFails.Count -gt 0) {
+        Write-Host "[!] Preflight checks failed with $($criticalFails.Count) fatal error(s)." -ForegroundColor Red
+        if ($HaltOnError) {
+            throw "Environment provisioning incomplete. Halting execution."
+        }
+        return $false
+    }
+
+    if ($console) { Write-Host "[+] All dependencies satisfied. Environment ready for deployment." -ForegroundColor Green}
+    return $true
+}
+
+function New-DeployerCertificate {
+    [CmdletBinding()]
+    param(
+        [Parameter()][securestring]$certPass = (ConvertTo-SecureString -AsPlainText -Force 'deployer'),
+        [Parameter()][string]$outPath = $Script:Config.NfsHome
+    )
+    $c = New-SelfSignedCertificate -Subject 'CN=MobileDeployer' -Type DocumentEncryptionCert -CertStoreLocation "Cert:\CurrentUser\My" -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(5)
+    Export-PFXCertificate -Cert $c -FilePath (Join-Path $outPath "Deployer.pfx") -Password $certPass
+    Export-Certificate -Cert $c -FilePath (Join-Path $outPath "Deployer.cer") 
     
-    }
+}
 
 
 
-    # function Initialize-Ssh-Environment {
-    #     [CmdletBinding()]
-    #     param(
-    #         [string]$keyPath = $Script:Config.SSHKeyPath,
-    #         [string]$nfsHome = $Script:Config.NfsHome
-    #     )
-    #     # r = remote ; l = local
-    #     $nfsSSH = Join-Path  $nfsHome '.ssh'
-    #     $localSSh = Join-Path $env:UserProfile ".ssh"
-    #     $rAuthorized = Join-Path $nfsSSH 'authorized_keys'
-    #
-    #     @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_ ) } | ForEach-Object {
-    #         New-Item -ItemType Directory -Path $_ -Force | Out-Null
-    #     }
-    #
-    #     if ([string]::IsNullOrWhiteSpace($keyPath) -or $keyPath.EndsWith('\')) {
-    #         throw "SSH KEY PATH IS INVALID! -- '$sshKeyPath'  -- CHECK SSH KEY"
-    #     }
-    #
-    #
-    #     icacls.exe $nfsSSH /inheritance:r /T |Out-Null
-    #     icacls.exe $nfsSSH /grant:r "$($env:USERNAME):(R)" /T |out-null
-    #
-    #
-    #     icacls.exe $localSSH /inheritance:r |Out-Null
-    #     icacls.exe $localSSH /grant:r "$($env:USERNAME):(R)" /T | Out-Null
-    #
-    #     if (-not (Test-Path $keyPath)) {
-    #         ssh-keygen -f "$keyPath" -C '""' -N '""' -t ecdsa -q
-    #
-    #     }
-    #
-    #     icacls.exe $keyPath /inheritance:r |Out-Null
-    #     icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
-    #     $pubKey = ssh-keygen -yf $keyPath
-    #     if (-not (Test-Path $rAuthorized)) { New-Item -Type File -Path $rAuthorized -Force | Out-Null
-    #     }
-    #     if (-not (Select-String -Pattern $pubKey -Path $rAuthorized -ErrorAction SIlentlyContinue)) {
-    #         $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
-    #         icacls.exe $rAuthorized /inheritance:r |Out-Null
-    #         icacls.exe $rAuthorized /grant:r "$($env:USERNAME):(R)"| Out-Null
-    #     }
-    #
-    #
-    # }
-    #
-    #
-    #
-    # function Initialize-Functionality {
-    #     [CmdletBinding()]
-    #     param(
-    #         [Parameter()]
-    #         [string]$sshKeyPath = $script:Config.SshKeyPath,
-    #         [string]$nfsHome = $script:Config.nfsHome,
-    #         [string]$adminRoot = $script:Config.AdminRoot,
-    #         [string]$certName = $script:Config.certName
-    #
-    #     )
-    #
-    #     Initialize-Ssh-Environment  -nfsHome $nfsHome -keyPath $sshKeyPath
-    #
-    #     # 2. Ensure Document Encryption Certificate Exists in CurrentUser\My
-    #     $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My | 
-    #         Where-Object { $_.Subject -like '*CN=MobileDeployer*' -or $_.Subject -like "*$($certName)*" }
-    #
-    #     if (-not $existingCert) {
-    #         $pfxFileName = "$($certName).pfx"
-    #         $pfxFullPath = Join-Path $cfg.AdminRoot $pfxFileName
-    #         # $securePass  = ConvertTo-SecureString -AsPlainText -Force $cfg.DefaultPass
-    #         $securePass = Read-Host -AsSecureString -Prompt "[!] The decryption certificate isn't in your cert store. Please enter the administrative password to import it "
-    #
-    #         if (Test-Path $pfxFullPath) {
-    #             Import-PfxCertificate -FilePath $pfxFullPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePass | Out-Null
-    #             Write-Host "[+] Imported existing deployer certificate from: $pfxFullPath" -ForegroundColor Green
-    #         } else {
-    #             # Generates PFX/CER in the target directory and automatically adds to Cert:\CurrentUser\My
-    #             New-DeployerCertificate -certPass $securePass -outPath $pfxFullPath
-    #             Write-Host "[+] Generated and installed new deployment certificate in: $($pfxFullPath)" -ForegroundColor Green
-    #         }
-    #     }
-    # }
-    #
+# function Initialize-Ssh-Environment {
+#     [CmdletBinding()]
+#     param(
+#         [string]$keyPath = $Script:Config.SSHKeyPath,
+#         [string]$nfsHome = $Script:Config.NfsHome
+#     )
+#     # r = remote ; l = local
+#     $nfsSSH = Join-Path  $nfsHome '.ssh'
+#     $localSSh = Join-Path $env:UserProfile ".ssh"
+#     $rAuthorized = Join-Path $nfsSSH 'authorized_keys'
+#
+#     @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_ ) } | ForEach-Object {
+#         New-Item -ItemType Directory -Path $_ -Force | Out-Null
+#     }
+#
+#     if ([string]::IsNullOrWhiteSpace($keyPath) -or $keyPath.EndsWith('\')) {
+#         throw "SSH KEY PATH IS INVALID! -- '$sshKeyPath'  -- CHECK SSH KEY"
+#     }
+#
+#
+#     icacls.exe $nfsSSH /inheritance:r /T |Out-Null
+#     icacls.exe $nfsSSH /grant:r "$($env:USERNAME):(R)" /T |out-null
+#
+#
+#     icacls.exe $localSSH /inheritance:r |Out-Null
+#     icacls.exe $localSSH /grant:r "$($env:USERNAME):(R)" /T | Out-Null
+#
+#     if (-not (Test-Path $keyPath)) {
+#         ssh-keygen -f "$keyPath" -C '""' -N '""' -t ecdsa -q
+#
+#     }
+#
+#     icacls.exe $keyPath /inheritance:r |Out-Null
+#     icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
+#     $pubKey = ssh-keygen -yf $keyPath
+#     if (-not (Test-Path $rAuthorized)) { New-Item -Type File -Path $rAuthorized -Force | Out-Null
+#     }
+#     if (-not (Select-String -Pattern $pubKey -Path $rAuthorized -ErrorAction SIlentlyContinue)) {
+#         $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
+#         icacls.exe $rAuthorized /inheritance:r |Out-Null
+#         icacls.exe $rAuthorized /grant:r "$($env:USERNAME):(R)"| Out-Null
+#     }
+#
+#
+# }
+#
+#
+#
+# function Initialize-Functionality {
+#     [CmdletBinding()]
+#     param(
+#         [Parameter()]
+#         [string]$sshKeyPath = $script:Config.SshKeyPath,
+#         [string]$nfsHome = $script:Config.nfsHome,
+#         [string]$adminRoot = $script:Config.AdminRoot,
+#         [string]$certName = $script:Config.certName
+#
+#     )
+#
+#     Initialize-Ssh-Environment  -nfsHome $nfsHome -keyPath $sshKeyPath
+#
+#     # 2. Ensure Document Encryption Certificate Exists in CurrentUser\My
+#     $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My | 
+#         Where-Object { $_.Subject -like '*CN=MobileDeployer*' -or $_.Subject -like "*$($certName)*" }
+#
+#     if (-not $existingCert) {
+#         $pfxFileName = "$($certName).pfx"
+#         $pfxFullPath = Join-Path $cfg.AdminRoot $pfxFileName
+#         # $securePass  = ConvertTo-SecureString -AsPlainText -Force $cfg.DefaultPass
+#         $securePass = Read-Host -AsSecureString -Prompt "[!] The decryption certificate isn't in your cert store. Please enter the administrative password to import it "
+#
+#         if (Test-Path $pfxFullPath) {
+#             Import-PfxCertificate -FilePath $pfxFullPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePass | Out-Null
+#             Write-Host "[+] Imported existing deployer certificate from: $pfxFullPath" -ForegroundColor Green
+#         } else {
+#             # Generates PFX/CER in the target directory and automatically adds to Cert:\CurrentUser\My
+#             New-DeployerCertificate -certPass $securePass -outPath $pfxFullPath
+#             Write-Host "[+] Generated and installed new deployment certificate in: $($pfxFullPath)" -ForegroundColor Green
+#         }
+#     }
+# }
+#
 
-    function Get-WindowsTask-LogArchiver {
-        return {
-            $system = Get-CimInstance -ClassName Win32_ComputerSystem
-            if (-not ($system.PartOfDomain)) { return }
-            $issoGroupParams = @{
-                Name = "ISSO"
-                Description = "[Mobile] - ISSO GROUP"
-            }
-            if (-not (Get-LocalGroup "ISSO" -ErrorAction SilentlyContinue)) { New-LocalGroup @issoGroupParams } else { Set-LocalGroup @issoGroupParams }
-            $archivePath = "C:\Support\Logs"
-            Start-Transcript -Path "C:\Support\Errata.log"
-            if (-not (Test-Path -Path $archivePath)) { New-Item -ItemType Directory -Path $archivePath -Force }
-            & icacls.exe $archivePath /inheritance:r /T /Q | Out-Null
-            & icacls.exe $archivePath /grant Administrators:F ISSO:F System:F /T /Q | Out-Null
-
-            $timeStamp = Get-Date -Format 'yyyy-MM-dd-HHmmss'
-            $logNames = @(
-                "Application"
-                "System"
-                "Security"
-            )
-            foreach ($ln in $logNames) {
-                $bkUp = Join-Path $archivePath "${ln}_${timeStamp}.evtx"
-                if (Test-Path $bkUp) { throw "Target $bkup exists!" }
-                wevtutil cl $ln "/bu:${bkUp}"
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Error "wevtutil failed with code: $LASTEXITCODE -- Log: $ln was left untouched "
-                }
-            }
-            Stop-Transcript
-        
+function Get-WindowsTask-LogArchiver {
+    return {
+        $system = Get-CimInstance -ClassName Win32_ComputerSystem
+        if (-not ($system.PartOfDomain)) { return }
+        $issoGroupParams = @{
+            Name = "ISSO"
+            Description = "[Mobile] - ISSO GROUP"
         }
-    }
-    function New-WindowsPostTask-SupportAcl {
-        [CmdletBinding()]
-        param(
-            [string]$Path = 'C:\Support'
-        )
+        if (-not (Get-LocalGroup "ISSO" -ErrorAction SilentlyContinue)) { New-LocalGroup @issoGroupParams } else { Set-LocalGroup @issoGroupParams }
+        $archivePath = "C:\Support\Logs"
+        Start-Transcript -Path "C:\Support\Errata.log"
+        if (-not (Test-Path -Path $archivePath)) { New-Item -ItemType Directory -Path $archivePath -Force }
+        & icacls.exe $archivePath /inheritance:r /T /Q | Out-Null
+        & icacls.exe $archivePath /grant Administrators:F ISSO:F System:F /T /Q | Out-Null
 
-        return @"
+        $timeStamp = Get-Date -Format 'yyyy-MM-dd-HHmmss'
+        $logNames = @(
+            "Application"
+            "System"
+            "Security"
+        )
+        foreach ($ln in $logNames) {
+            $bkUp = Join-Path $archivePath "${ln}_${timeStamp}.evtx"
+            if (Test-Path $bkUp) { throw "Target $bkup exists!" }
+            wevtutil cl $ln "/bu:${bkUp}"
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "wevtutil failed with code: $LASTEXITCODE -- Log: $ln was left untouched "
+            }
+        }
+        Stop-Transcript
+        
+    }
+}
+function New-WindowsPostTask-SupportAcl {
+    [CmdletBinding()]
+    param(
+        [string]$Path = 'C:\Support'
+    )
+
+    return @"
 # Task: Support ACL
 
 try {
@@ -1655,28 +1656,28 @@ catch {
     record_failure "Support ACL: `$(`$_.Exception.Message)"
 }
 "@
-    }
+}
 
-    function New-WindowsPostTask-NetworkSharing {
-        [CmdletBinding()]
-        param(
-            [string[]]$DriveLetters
-        )
+function New-WindowsPostTask-NetworkSharing {
+    [CmdletBinding()]
+    param(
+        [string[]]$DriveLetters
+    )
 
-        $driveInit = if ($DriveLetters) {
-            '$driveList = @(' +
-            (($DriveLetters | ForEach-Object { "'$_'" }) -join ',') +
-            ')'
-        } else {
-            @'
+    $driveInit = if ($DriveLetters) {
+        '$driveList = @(' +
+        (($DriveLetters | ForEach-Object { "'$_'" }) -join ',') +
+        ')'
+    } else {
+        @'
 $driveList = @(
     Get-PSDrive -PSProvider FileSystem |
         Select-Object -ExpandProperty Name
 )
 '@
-        }
+    }
 
-        return  $driveInit + @'
+    return  $driveInit + @'
 # Task: Network Sharing
 
 
@@ -1726,19 +1727,19 @@ catch {
     record_failure "Network sharing failed: $($_.Exception.Message)"
 }
 '@
-    }
+}
 
-    function New-WindowsPostTask-UserRights {
-        [CmdletBinding()]
-        param(
-            [switch]$Sharing,
-            [switch]$HasLinux
-        )
+function New-WindowsPostTask-UserRights {
+    [CmdletBinding()]
+    param(
+        [switch]$Sharing,
+        [switch]$HasLinux
+    )
 
-        $sharingSetup = ''
+    $sharingSetup = ''
 
-        if ($Sharing -and $HasLinux) {
-            $sharingSetup = @'
+    if ($Sharing -and $HasLinux) {
+        $sharingSetup = @'
 $smbPass = ConvertTo-SecureString 'SupeSecretSMBP@ssw0rd99' -AsPlainText -Force
 
 if (-not (Get-LocalUser -Name 'mobile-smb-access' -ErrorAction SilentlyContinue)) {
@@ -1751,9 +1752,9 @@ if (-not (Get-LocalUser -Name 'mobile-smb-access' -ErrorAction SilentlyContinue)
 $sharingSid = (Get-LocalUser -Name 'mobile-smb-access').Sid.Value
 
 '@
-        }
+    }
 
-        return $sharingSetup + @'
+    return $sharingSetup + @'
 # Task: User Rights
 
 
@@ -1862,21 +1863,21 @@ else {
 # Cleanup
 Remove-Item -Path $tmpSec, $tmpDB -Force -ErrorAction SilentlyContinue
 '@
-    }
+}
 
-    function Get-PostDeployScript {
-        [CmdletBinding()]
-        param(
-            [switch]$UserRights,
-            [switch]$Sharing,
-            [switch]$HasLinux,
+function Get-PostDeployScript {
+    [CmdletBinding()]
+    param(
+        [switch]$UserRights,
+        [switch]$Sharing,
+        [switch]$HasLinux,
 
-            [string[]]$DriveLetters
-        )
+        [string[]]$DriveLetters
+    )
 
-        $tasks = [System.Collections.Generic.List[string]]::new()
+    $tasks = [System.Collections.Generic.List[string]]::new()
 
-        $tasks.Add(@'
+    $tasks.Add(@'
 # ==================
 # Automated Post-Deployment
 # ==================
@@ -1907,13 +1908,13 @@ function record_failure {
 }
 '@)
 
-        if ($UserRights) { $tasks.Add( (New-WindowsPostTask-UserRights  -Sharing:$Sharing  -HasLinux:$HasLinux)) }
+    if ($UserRights) { $tasks.Add( (New-WindowsPostTask-UserRights  -Sharing:$Sharing  -HasLinux:$HasLinux)) }
 
-        if ($Sharing) { $tasks.Add( (New-WindowsPostTask-NetworkSharing  -DriveLetters $DriveLetters)) }
+    if ($Sharing) { $tasks.Add( (New-WindowsPostTask-NetworkSharing  -DriveLetters $DriveLetters)) }
 
-        # $tasks.Add( (New-WindowsPostTask-SupportAcl))
+    # $tasks.Add( (New-WindowsPostTask-SupportAcl))
 
-        $tasks.Add(@'
+    $tasks.Add(@'
 "[ Post Deployment Ran - $(Get-Date) ]" |
     Out-File C:\Post-Deploy.info
 
@@ -1925,115 +1926,115 @@ function record_failure {
 } | Export-CLIXML C:\Post-Deployment.xml
 '@)
 
-        return ($tasks -join "`n`n")
+    return ($tasks -join "`n`n")
+}
+
+function New-RemoteKeytabBase64 {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DomainController,
+        [Parameter(Mandatory)][System.Security.SecureString]$SecurePassword,
+        [Parameter(Mandatory)][string]$Principal,
+        [Parameter(Mandatory)][int]$Kvno,
+        [string]$Crypto = 'AES256-SHA1'
+    )
+
+    # 1. Export SecureString as an encrypted BSTR / CLIXML standard format across the wire
+    # WinRM natively preserves SecureString encryption across remoting boundaries
+    $b64Result = Invoke-Command -ComputerName$DomainController -ArgumentList $SecurePassword,$Principal, $Kvno,$Crypto -ScriptBlock {
+        param($SecPass,$Princ, $KeyVer,$EncType)
+
+        $tempKeytab = [System.IO.Path]::GetTempFileName()
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecPass)
+
+        try {
+            $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = 'ktpass.exe'
+            # -pass * forces stdin input, evading command line logging
+            $psi.Arguments = "-princ $Princ -pass * -kvno $KeyVer -crypto$EncType -ptype KRB5_NT_PRINCIPAL -out `"$tempKeytab`""
+            $psi.UseShellExecute =$false
+            $psi.RedirectStandardInput =$true
+            $psi.RedirectStandardOutput =$true
+            $psi.RedirectStandardError =$true
+            $psi.CreateNoWindow =$true
+
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $p.StandardInput.WriteLine($plain)
+            $p.StandardInput.Flush()
+            $p.StandardInput.Close()
+
+            $out = $p.StandardOutput.ReadToEnd()
+            $p.WaitForExit()
+
+            if ($p.ExitCode -ne 0 -or -not (Test-Path$tempKeytab)) {
+                throw "ktpass failed with exit code $($p.ExitCode):$out"
+            }
+
+            $bytes = [System.IO.File]::ReadAllBytes($tempKeytab)
+            return [System.Convert]::ToBase64String($bytes)
+        } finally {
+            if (Test-Path $tempKeytab) {
+                [System.IO.File]::WriteAllBytes($tempKeytab, [byte[]]::new(0))
+                Remove-Item -Path $tempKeytab -Force -ErrorAction SilentlyContinue
+            }
+            if ($bstr -ne [System.IntPtr]::Zero) {
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            }
+            $plain =$null
+        }
     }
 
-    function New-RemoteKeytabBase64 {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)][string]$DomainController,
-            [Parameter(Mandatory)][System.Security.SecureString]$SecurePassword,
-            [Parameter(Mandatory)][string]$Principal,
-            [Parameter(Mandatory)][int]$Kvno,
-            [string]$Crypto = 'AES256-SHA1'
-        )
+    return $b64Result
+}
 
-        # 1. Export SecureString as an encrypted BSTR / CLIXML standard format across the wire
-        # WinRM natively preserves SecureString encryption across remoting boundaries
-        $b64Result = Invoke-Command -ComputerName$DomainController -ArgumentList $SecurePassword,$Principal, $Kvno,$Crypto -ScriptBlock {
-            param($SecPass,$Princ, $KeyVer,$EncType)
 
-            $tempKeytab = [System.IO.Path]::GetTempFileName()
-            $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecPass)
+function Get-UserFullName {
+    [CmdletBinding()]
+    param(
+        [Parameter()][string]$UserName,
+        [Parameter()][string]$FullName
+    )
 
-            try {
-                $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    if ([string]::IsNullOrWhiteSpace($FullName) -and -not [string]::IsNullOrWhiteSpace($UserName)) {
+        $searcher = [System.DirectoryServices.DirectorySearcher]::new()
+        $searcher.Filter = "(&(objectCategory=person)(objectClass=user)(sAMAccountName=$([System.Security.SecurityElement]::Escape($UserName))))"
+        $searcher.PropertiesToLoad.AddRange(@('displayName', 'givenName', 'sn'))
 
-                $psi = [System.Diagnostics.ProcessStartInfo]::new()
-                $psi.FileName = 'ktpass.exe'
-                # -pass * forces stdin input, evading command line logging
-                $psi.Arguments = "-princ $Princ -pass * -kvno $KeyVer -crypto$EncType -ptype KRB5_NT_PRINCIPAL -out `"$tempKeytab`""
-                $psi.UseShellExecute =$false
-                $psi.RedirectStandardInput =$true
-                $psi.RedirectStandardOutput =$true
-                $psi.RedirectStandardError =$true
-                $psi.CreateNoWindow =$true
+        $result = $searcher.FindOne()
+        if ($result) {
+            $props = $result.Properties
+            if ($props.Contains('displayName') -and -not [string]::IsNullOrWhiteSpace($props['displayName'][0])) {
+                return $props['displayName'][0]
+            }
 
-                $p = [System.Diagnostics.Process]::Start($psi)
-                $p.StandardInput.WriteLine($plain)
-                $p.StandardInput.Flush()
-                $p.StandardInput.Close()
+            $first = if ($props.Contains('givenName')) {
+                $props['givenName'][0] 
+            } else { 
+                '' 
+            }
+            $last  = if ($props.Contains('sn')) { 
+                $props['sn'][0] 
+            } else {
+                '' 
+            }
+            $combined = "$first $last".Trim()
 
-                $out = $p.StandardOutput.ReadToEnd()
-                $p.WaitForExit()
-
-                if ($p.ExitCode -ne 0 -or -not (Test-Path$tempKeytab)) {
-                    throw "ktpass failed with exit code $($p.ExitCode):$out"
-                }
-
-                $bytes = [System.IO.File]::ReadAllBytes($tempKeytab)
-                return [System.Convert]::ToBase64String($bytes)
-            } finally {
-                if (Test-Path $tempKeytab) {
-                    [System.IO.File]::WriteAllBytes($tempKeytab, [byte[]]::new(0))
-                    Remove-Item -Path $tempKeytab -Force -ErrorAction SilentlyContinue
-                }
-                if ($bstr -ne [System.IntPtr]::Zero) {
-                    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-                }
-                $plain =$null
+            if (-not [string]::IsNullOrWhiteSpace($combined)) {
+                return $combined
             }
         }
-
-        return $b64Result
     }
 
-
-    function Get-UserFullName {
-        [CmdletBinding()]
-        param(
-            [Parameter()][string]$UserName,
-            [Parameter()][string]$FullName
-        )
-
-        if ([string]::IsNullOrWhiteSpace($FullName) -and -not [string]::IsNullOrWhiteSpace($UserName)) {
-            $searcher = [System.DirectoryServices.DirectorySearcher]::new()
-            $searcher.Filter = "(&(objectCategory=person)(objectClass=user)(sAMAccountName=$([System.Security.SecurityElement]::Escape($UserName))))"
-            $searcher.PropertiesToLoad.AddRange(@('displayName', 'givenName', 'sn'))
-
-            $result = $searcher.FindOne()
-            if ($result) {
-                $props = $result.Properties
-                if ($props.Contains('displayName') -and -not [string]::IsNullOrWhiteSpace($props['displayName'][0])) {
-                    return $props['displayName'][0]
-                }
-
-                $first = if ($props.Contains('givenName')) {
-                    $props['givenName'][0] 
-                } else { 
-                    '' 
-                }
-                $last  = if ($props.Contains('sn')) { 
-                    $props['sn'][0] 
-                } else {
-                    '' 
-                }
-                $combined = "$first $last".Trim()
-
-                if (-not [string]::IsNullOrWhiteSpace($combined)) {
-                    return $combined
-                }
-            }
-        }
-
-        return $FullName
-    }
+    return $FullName
+}
 
 
-    function New-LinuxTask-CreateDirectory {
-        [CmdletBinding()]
-        param([string]$Path = '/mobiles/home')
-        return @"
+function New-LinuxTask-CreateDirectory {
+    [CmdletBinding()]
+    param([string]$Path = '/mobiles/home')
+    return @"
 # Task: Create Directory: ($Path)
 if dzdo mkdir -p '$Path' &> /dev/null; then
     record_action 'Directory' '$Path' 'Success'
@@ -2041,12 +2042,12 @@ else
     record_failure 'Directory: $Path failed to create'
 fi
 "@
-    }
+}
 
-    function New-LinuxTask-AddLogService {
-        [CmdletBinding()]
-        param([string]$ExecPath = '/path/to-rotate')
-        return @"
+function New-LinuxTask-AddLogService {
+    [CmdletBinding()]
+    param([string]$ExecPath = '/path/to-rotate')
+    return @"
 #Log rotation Unit Files
 
 cat << 'EOF' | dzdo tee /etc/systemd/system/mobile-logrotate.timer >/dev/null
@@ -2083,16 +2084,16 @@ else
     record_failure "Scheduled task 'mobile-logrotate.timer': failed to enable"
 fi
 "@
-    }
+}
 
-    function New-LinuxTask-Luks {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)] [string]$CurrentPass,
-            [Parameter(Mandatory)] [string]$NewPin
-        )
+function New-LinuxTask-Luks {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$CurrentPass,
+        [Parameter(Mandatory)] [string]$NewPin
+    )
 
-        return @"
+    return @"
 # Task: LUKS Enrollment
 mapfile -t luks_devices < <(
     lsblk -prno NAME,FSTYPE 2>/dev/null | awk '`$2 == "crypto_LUKS" {print `$1}'
@@ -2115,25 +2116,25 @@ fi
 
 
 "@
-    }
+}
 
 
-    function New-LinuxTask-AddUsers {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)] [array]$Users,
-            [string]$HomeBase = '/mobiles/home'
-        )
+function New-LinuxTask-AddUsers {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [array]$Users,
+        [string]$HomeBase = '/mobiles/home'
+    )
 
-        $userBlocks = [System.Collections.Generic.List[string]]::new()
+    $userBlocks = [System.Collections.Generic.List[string]]::new()
 
-        foreach ($u in $Users) {
-            $isWheel = $u.LinuxAccountType -eq [LinuxAccountType]::Wheel
-            $name = $u.LinuxName
-            $pwd  = $u.LinuxPassword
-            $desc = $u.Description
+    foreach ($u in $Users) {
+        $isWheel = $u.LinuxAccountType -eq [LinuxAccountType]::Wheel
+        $name = $u.LinuxName
+        $pwd  = $u.LinuxPassword
+        $desc = $u.Description
 
-            $block = @"
+        $block = @"
 # Provisioning: $name
 if id '$name' &>/dev/null; then
     if dzdo usermod -p '$pwd' '$name' &>/dev/null; then
@@ -2151,8 +2152,8 @@ else
     fi
 fi
 "@
-            if ($isWheel) {
-                $block += @"
+        if ($isWheel) {
+            $block += @"
 
 if id '$name' &>/dev/null; then
     if dzdo usermod -aG wheel '$name' &>/dev/null; then
@@ -2166,10 +2167,10 @@ else
     record_failure 'Privilege "${name}:wheel": user does not exist'
 fi
 "@
-            }
+        }
 
-            if ($u.MustChangePassword) {
-                $block += @"
+        if ($u.MustChangePassword) {
+            $block += @"
 
 if id '$name' &>/dev/null; then
     if dzdo chage -d 0 '$name' &>/dev/null; then
@@ -2183,19 +2184,19 @@ else
     record_failure 'Password expiry "$name": user does not exist'
 fi
 "@
-            }
-
-            $userBlocks.Add($block)
         }
 
-        return ($userBlocks -join "`n`n")
+        $userBlocks.Add($block)
     }
 
+    return ($userBlocks -join "`n`n")
+}
 
-    function New-LinuxTask-LeaveDomain {
-        param($b64Ktab)
 
-        $decodeTab = "@
+function New-LinuxTask-LeaveDomain {
+    param($b64Ktab)
+
+    $decodeTab = "@
 echo -n '$b64Ktab' | base64 -d > /tmp/k
 dzdo mv /tmp/k /root/kTab
 dzdo kinit -k -t /root/kTab
@@ -2214,42 +2215,42 @@ else
 fi
  @"
 
-        return $decodeTab
+    return $decodeTab
 
+}
+
+
+
+
+function Get-LinuxDeployScript {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$AllUsers,
+
+        [Parameter()]
+        [switch]$SkipLuks,
+
+        # [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
+        [switch]$Disjoin,
+
+        # [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
+        [string]$b64kt,
+
+        [Parameter()]
+        [switch]$SkipLogrotate
+    )
+
+    # 1. Resolve users according to metadata priority
+    $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName)) {
+        $group.Group |
+            Where-Object { $null -ne $_.LinuxAccountType } |
+            Sort-Object { $script:GroupMetadata[$_.GroupType].LinuxPriority } -Descending |
+            Select-Object -First 1
     }
 
-
-
-
-    function Get-LinuxDeployScript {
-        [CmdletBinding()]
-        param (
-            [Parameter(Mandatory = $true)]
-            [array]$AllUsers,
-
-            [Parameter()]
-            [switch]$SkipLuks,
-
-            # [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
-            [switch]$Disjoin,
-
-            # [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
-            [string]$b64kt,
-
-            [Parameter()]
-            [switch]$SkipLogrotate
-        )
-
-        # 1. Resolve users according to metadata priority
-        $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName)) {
-            $group.Group |
-                Where-Object { $null -ne $_.LinuxAccountType } |
-                Sort-Object { $script:GroupMetadata[$_.GroupType].LinuxPriority } -Descending |
-                Select-Object -First 1
-        }
-
-        # 2. Bash execution runtime + state logger
-        $header = @'
+    # 2. Bash execution runtime + state logger
+    $header = @'
 #!/usr/bin/env bash
 set -o pipefail
 
@@ -2289,7 +2290,7 @@ array_to_json() {
 }
 '@
 
-        $footer = @'
+    $footer = @'
 # --- Result Serialization ---
 final_actions="[$(IFS=,; echo "${actions_json[*]}")]"
 if [[ ${#failures[@]} -eq 0 ]]; then
@@ -2312,147 +2313,147 @@ jq -n \
     }'
 '@
 
-        # 3. Assemble tasks pipeline dynamically
-        $tasks = [System.Collections.Generic.List[string]]::new()
-        $tasks.Add($header)
+    # 3. Assemble tasks pipeline dynamically
+    $tasks = [System.Collections.Generic.List[string]]::new()
+    $tasks.Add($header)
 
-        $tasks.Add((New-LinuxTask-CreateDirectory -Path '/mobiles/home'))
+    $tasks.Add((New-LinuxTask-CreateDirectory -Path '/mobiles/home'))
 
-        if (-not $SkipLogrotate) { $tasks.Add((New-LinuxTask-AddLogService )) }
+    if (-not $SkipLogrotate) { $tasks.Add((New-LinuxTask-AddLogService )) }
 
-        if (-not $SkipLuks) { $tasks.Add((New-LinuxTask-Luks  -CurrentPass $script:Config.curLuks  -NewPin $script:Config.encryptionPin)) }
+    if (-not $SkipLuks) { $tasks.Add((New-LinuxTask-Luks  -CurrentPass $script:Config.curLuks  -NewPin $script:Config.encryptionPin)) }
 
-        if ($Disjoin) { $tasks.Add((New-LinuxTask-LeaveDomain -b64Ktab $b64kt))}
+    if ($Disjoin) { $tasks.Add((New-LinuxTask-LeaveDomain -b64Ktab $b64kt))}
 
-        if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) }
+    if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) }
 
-        # 4. Standardized JSON Output emitter
-        $tasks.Add($footer)
+    # 4. Standardized JSON Output emitter
+    $tasks.Add($footer)
 
-        return ($tasks -join "`n`n")
+    return ($tasks -join "`n`n")
+}
+
+### END UTILS
+
+function Get-EncryptedCredRSA {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PassFile,
+        [Parameter(Mandatory = $true)]
+        [string]$DefaultPass,
+        [Parameter(Mandatory = $true)]
+        [string]$PfxPath
+    )
+
+    if (-not (Test-Path $PassFile) -or -not (Test-Path $PfxPath)) {
+        return $DefaultPass
     }
 
-    ### END UTILS
+    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($PfxPath)
+    $rsa  = $cert.GetRSAPrivateKey()
 
-    function Get-EncryptedCredRSA {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)]
-            [string]$PassFile,
-            [Parameter(Mandatory = $true)]
-            [string]$DefaultPass,
-            [Parameter(Mandatory = $true)]
-            [string]$PfxPath
-        )
-
-        if (-not (Test-Path $PassFile) -or -not (Test-Path $PfxPath)) {
-            return $DefaultPass
+    try {
+        $eBytes  = [System.Convert]::FromBase64String((Get-Content $PassFile -Raw).Trim())
+        $padding = [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1
+        $dBytes  = $rsa.Decrypt($eBytes, $padding)
+        return [System.Text.Encoding]::UTF8.GetString($dBytes)
+    } catch {
+        Write-Warning "Decryption failed for $PassFile. Returning default password."
+        return $DefaultPass
+    } finally {
+        if ($rsa) { $rsa.Dispose() 
         }
-
-        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($PfxPath)
-        $rsa  = $cert.GetRSAPrivateKey()
-
-        try {
-            $eBytes  = [System.Convert]::FromBase64String((Get-Content $PassFile -Raw).Trim())
-            $padding = [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1
-            $dBytes  = $rsa.Decrypt($eBytes, $padding)
-            return [System.Text.Encoding]::UTF8.GetString($dBytes)
-        } catch {
-            Write-Warning "Decryption failed for $PassFile. Returning default password."
-            return $DefaultPass
-        } finally {
-            if ($rsa) { $rsa.Dispose() 
-            }
-            if ($cert) { $cert.Dispose() 
-            }
+        if ($cert) { $cert.Dispose() 
         }
     }
+}
 
-    #### USER PASSWORD AND DERIVATION FUNCTIONS
+#### USER PASSWORD AND DERIVATION FUNCTIONS
 
-    function Get-UserCreds {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)][string]$MobileName,
-            [Parameter(Mandatory = $true)][array]$AllUsers,
-            [Parameter(Mandatory = $true)][string]$mobileDumpPath
-        )
-        foreach ($bName in ($allUsers.BaseName | Sort-Object -Unique)) {
-            $PwFile = Join-Path  $mobileDumpPath $bName
-            if ( ! (Test-Path $PwFile )) {  continue }
+function Get-UserCreds {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$MobileName,
+        [Parameter(Mandatory = $true)][array]$AllUsers,
+        [Parameter(Mandatory = $true)][string]$mobileDumpPath
+    )
+    foreach ($bName in ($allUsers.BaseName | Sort-Object -Unique)) {
+        $PwFile = Join-Path  $mobileDumpPath $bName
+        if ( ! (Test-Path $PwFile )) {  continue }
 
-            $content = Unprotect-CmsMessage -Path  $PwFile
-            foreach ($line in ( $content -split '\r?\n')) {
-                if ([string]::IsNullOrWhiteSpace($line)) { continue }
-                $timestamp, $username, $pw = $line -split ':',3
-                $uObject = $allUsers | Where-Object Name -eq $username | Select-Object -First 1
-                if ($null -eq $uObject) { Write-Warning "[!] No matching user for $username with user: $bName" ; continue }
-                $uObject.Password = ConvertTo-SecureString -AsPlainText -Force $pw
-                $uObject.LinuxPassword = [Sha512Crypt]::Crypt($pw)
-                $uObject.MustChangePassword = $false
-            }
+        $content = Unprotect-CmsMessage -Path  $PwFile
+        foreach ($line in ( $content -split '\r?\n')) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $timestamp, $username, $pw = $line -split ':',3
+            $uObject = $allUsers | Where-Object Name -eq $username | Select-Object -First 1
+            if ($null -eq $uObject) { Write-Warning "[!] No matching user for $username with user: $bName" ; continue }
+            $uObject.Password = ConvertTo-SecureString -AsPlainText -Force $pw
+            $uObject.LinuxPassword = [Sha512Crypt]::Crypt($pw)
+            $uObject.MustChangePassword = $false
         }
+    }
     
 
-        $pw = $null
-        [System.GC]::Collect()
-        return $AllUsers
+    $pw = $null
+    [System.GC]::Collect()
+    return $AllUsers
+}
+
+
+# --- Public Exported Functions ---
+
+
+
+
+
+
+
+## MOBILE RETRIEVAL
+
+function Get-MobileData {
+    [CmdletBinding(DefaultParameterSetName = 'ExplicitPaths')]
+    param(
+        [Parameter(Position = 0)]
+        [string]$MobileName,
+        
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [ValidateNotNullOrEmpty()]
+        [string]$defaultUserpath = $Script:Config.mobileDefaultUsers,
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [ValidateNotNullOrEmpty()]
+        [string]$mobileEntriesPath = $Script:Config.MobileEntries,
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [ValidateNotNullOrEmpty()]
+        [string]$fallbackPass = $Script:Config.fallbackPass,
+        
+        [Parameter(Mandatory = $true, ParameterSetName = 'Config')]
+        [PSCustomObject]$Config
+
+    )
+
+
+
+
+    if ($PSCmdlet.ParameterSetName -eq 'Config') {
+        $cfg = Get-MobileConfig $Config
+        $defaultUserpath = $cfg.mobileDefaultUsers
+        $mobileEntriesPath = $cfg.MobileEntries
+        $fallbackPass = $cfg.fallbackPass
     }
 
+    $userPathExists = if (-not [string]::IsNullOrWhiteSpace($defaultUserpath)) { 
+        Test-Path $defaultUserpath
+    } else {
+        $false
+    }
+    $mobileEntriesExist = if (-not [string]::IsNullOrWhiteSpace($mobileEntriesPath)) { 
+        Test-Path $mobileEntriesPath
+    } else {
+        $false
+    }
 
-    # --- Public Exported Functions ---
-
-
-
-
-
-
-
-    ## MOBILE RETRIEVAL
-
-    function Get-MobileData {
-        [CmdletBinding(DefaultParameterSetName = 'ExplicitPaths')]
-        param(
-            [Parameter(Position = 0)]
-            [string]$MobileName,
-        
-            [Parameter(ParameterSetName = 'ExplicitPaths')]
-            [ValidateNotNullOrEmpty()]
-            [string]$defaultUserpath = $Script:Config.mobileDefaultUsers,
-            [Parameter(ParameterSetName = 'ExplicitPaths')]
-            [ValidateNotNullOrEmpty()]
-            [string]$mobileEntriesPath = $Script:Config.MobileEntries,
-            [Parameter(ParameterSetName = 'ExplicitPaths')]
-            [ValidateNotNullOrEmpty()]
-            [string]$fallbackPass = $Script:Config.fallbackPass,
-        
-            [Parameter(Mandatory = $true, ParameterSetName = 'Config')]
-            [PSCustomObject]$Config
-
-        )
-
-
-
-
-        if ($PSCmdlet.ParameterSetName -eq 'Config') {
-            $cfg = Get-MobileConfig $Config
-            $defaultUserpath = $cfg.mobileDefaultUsers
-            $mobileEntriesPath = $cfg.MobileEntries
-            $fallbackPass = $cfg.fallbackPass
-        }
-
-        $userPathExists = if (-not [string]::IsNullOrWhiteSpace($defaultUserpath)) { 
-            Test-Path $defaultUserpath
-        } else {
-            $false
-        }
-        $mobileEntriesExist = if (-not [string]::IsNullOrWhiteSpace($mobileEntriesPath)) { 
-            Test-Path $mobileEntriesPath
-        } else {
-            $false
-        }
-
-        Write-Debug "@
+    Write-Debug "@
     =====
     Function = Get-MobileData
     [MobileName] = $mobileName
@@ -2462,879 +2463,879 @@ jq -n \
     =====
  @" 
 
-        if (-not $userPathExists -or -not $mobileEntriesExist) {
-            Write-Error "[!] Ensure proper directory setup"
-            Write-Warning "--- ${defaultUserPath}:${userPathExists}"
-            Write-Warning "--- ${mobileEntriesPath}:${mobileEntriesExist}"
-            exit 1
+    if (-not $userPathExists -or -not $mobileEntriesExist) {
+        Write-Error "[!] Ensure proper directory setup"
+        Write-Warning "--- ${defaultUserPath}:${userPathExists}"
+        Write-Warning "--- ${mobileEntriesPath}:${mobileEntriesExist}"
+        exit 1
+    }
+
+    $result = [PsCustomObject]@{
+        AllMobiles   = @()
+        MobileUsers  = @()
+        DefaultUsers = @()
+        AllUsers     = @()
+        Linux        = @()
+        Windows      = @()
+    }
+
+    if (Test-Path $mobileEntriesPath) {
+        $result.AllMobiles = Get-ChildItem -Path $mobileEntriesPath  |
+            Select-Object -ExpandProperty BaseName -Unique
+    }
+
+    if ([string]::IsNullOrWhiteSpace($MobileName)) {
+        return [PSCustomObject]$result
+    }
+    ## Default users
+    $result.DefaultUsers = Get-ChildItem -Force -Path $defaultUserpath | Get-Content | ConvertFrom-CSV 
+    Write-Debug " default user parsing: $($result.DefaultUsers)"
+
+
+    ## Actual Mobile Data
+    $path = Join-Path $mobileEntriesPath $MobileName
+
+    $currentSection = $null
+    $sections = @{}
+
+    foreach ($line in Get-Content $path) {
+        $trimmed = $line.Trim()
+
+        if (
+            [string]::IsNullOrWhiteSpace($trimmed) -or
+            $trimmed.StartsWith('#') -or
+            $trimmed.StartsWith(';')
+        ) {
+            continue
         }
 
-        $result = [PsCustomObject]@{
-            AllMobiles   = @()
-            MobileUsers  = @()
-            DefaultUsers = @()
-            AllUsers     = @()
-            Linux        = @()
-            Windows      = @()
-        }
+        if ($trimmed -match '^\[(?<Header>.+)\]$') {
+            $currentSection = $Matches.Header
 
-        if (Test-Path $mobileEntriesPath) {
-            $result.AllMobiles = Get-ChildItem -Path $mobileEntriesPath  |
-                Select-Object -ExpandProperty BaseName -Unique
-        }
-
-        if ([string]::IsNullOrWhiteSpace($MobileName)) {
-            return [PSCustomObject]$result
-        }
-        ## Default users
-        $result.DefaultUsers = Get-ChildItem -Force -Path $defaultUserpath | Get-Content | ConvertFrom-CSV 
-        Write-Debug " default user parsing: $($result.DefaultUsers)"
-
-
-        ## Actual Mobile Data
-        $path = Join-Path $mobileEntriesPath $MobileName
-
-        $currentSection = $null
-        $sections = @{}
-
-        foreach ($line in Get-Content $path) {
-            $trimmed = $line.Trim()
-
-            if (
-                [string]::IsNullOrWhiteSpace($trimmed) -or
-                $trimmed.StartsWith('#') -or
-                $trimmed.StartsWith(';')
-            ) {
-                continue
+            if (-not $sections.ContainsKey($currentSection)) {
+                $sections[$currentSection] =
+                [System.Collections.Generic.List[string]]::new()
             }
 
-            if ($trimmed -match '^\[(?<Header>.+)\]$') {
-                $currentSection = $Matches.Header
-
-                if (-not $sections.ContainsKey($currentSection)) {
-                    $sections[$currentSection] =
-                    [System.Collections.Generic.List[string]]::new()
-                }
-
-                continue
-            }
-
-            if ($null -ne $currentSection) {
-                $sections[$currentSection].Add($trimmed)
-            }
+            continue
         }
 
-        if ($sections.ContainsKey('users')) {
-            $result.MobileUsers = @(
-                $sections['users'] |
-                    ConvertFrom-Csv |
-                    ForEach-Object {
-                        [PSCustomObject]@{
-                            Username = $_.username
-                            Groups   = if ($_.groups) {
-                                $_.groups -split ';'
-                            } else {
-                                @()
-                            }
-                            Name = $_.name
+        if ($null -ne $currentSection) {
+            $sections[$currentSection].Add($trimmed)
+        }
+    }
+
+    if ($sections.ContainsKey('users')) {
+        $result.MobileUsers = @(
+            $sections['users'] |
+                ConvertFrom-Csv |
+                ForEach-Object {
+                    [PSCustomObject]@{
+                        Username = $_.username
+                        Groups   = if ($_.groups) {
+                            $_.groups -split ';'
+                        } else {
+                            @()
                         }
-                    }
-            )
-        }
-
-        if ($sections.ContainsKey('Windows')) {
-            $result.Windows = @($sections['Windows'])
-        }
-
-        if ($sections.ContainsKey('Linux')) {
-            $result.Linux = @($sections['Linux'])
-        }
-        $tmp = @($result.DefaultUsers) + @($result.MobileUsers)
-
-        $allUsers = [System.Collections.Generic.List[object]]::new()
-
-        foreach ($u in $tmp) {
-            $grps = Set-Groups $u.Groups
-            Write-Debug "$($u.Username) -- $($grps)"
-            foreach ($grp in $grps) {
-                $meta = $Script:GroupMetadata[$grp]
-                $accountName = if ($meta.Suffix) {
-                    "$($u.Username).$($meta.Suffix)"
-                } else {
-                    $u.Username
-                }
-
-                $uData = [PSCustomObject]@{
-                    BaseName = $u.UserName
-                    Name     = $accountName
-                    GroupType = $grp
-                    FullName = Get-UserFullName $u.Username $u.Name
-                    Password = (ConvertTo-SecureString -AsPlainText -Force $fallbackPass)
-                    Description = "$($meta.Description)"
-                    LinuxName = "$($u.UserName).local"
-                    LinuxPassword = [sha512Crypt]::Crypt($fallbackPass)
-                    LinuxAccountType = $meta.LinuxAccountType
-                    MustChangePassword = $true
-                }
-
-                $allUsers.Add($uData)
-            }
-        }
-        $allUsers = $allUsers | Sort-Object Name -Unique
-
-        $result.AllUsers = $allUsers
-
-        [PSCustomObject]$result
-    }
-
-
-
-
-    function Get-TaskData {
-        param(
-            [string]$tasksPath,
-            [bool]$hasLinux
-        )
-
-        $taskData = @()
-        $disjoinData = Get-PostDeployScript -userRights -Sharing -hasLinux:$hasLinux
-        # $disjoinB64 = ConvertTo-Base64 $disjoinData
-        $bootTrigger = @{
-            Type = [TaskTriggerType]::Boot
-            Delay = 'PT1M'
-        }
-        $weeklyTrigger = @{
-            Type = [TaskTriggerType]::Weekly
-            DaysOfWeek = 1
-            StartBoundary = (Get-Date "00:00:00").AddDays(1).ToString('s')
-        }
-
-
-        $domainDisjoinTask = New-TaskXML -Description 'Runs once after domain disjoin' `
-            -Author '[Mobile Administration]' -Execute 'powershell.exe' `
-            -ToEncode $disjoinData `
-            -TriggerConfigs @($bootTrigger)
-        # -Arguments "-NoProfile -ExecutionPolicyBypass -Encoded $disjoinB64" `
-
-
-        $logCollect = New-TaskXML -Description 'Mobile Auto Log Archiver' `
-            -Author '[Mobile Administration]' -Execute 'powershell.exe' `
-            -ToEncode (Get-WindowsTask-LogArchiver).ToString() -TriggerConfigs @($weeklyTrigger)
-
-        $taskData += @([PsCustomObject]@{Taskname = "Mobile-LogArchiver"; TaskXml = $logCollect})
-        $taskData += @([PsCustomObject]@{Taskname = "Mobile-DisjoinTask"; TaskXml = $domainDisjoinTask})
-    
-        return $taskData
-    }
-
-    function Format-HostCollector {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory, ValueFromPipeline)]
-            [object[]]$InputObject
-        )
-        begin {
-            $results = [System.Collections.Generic.List[object]]::new()
-        }
-        process {
-            foreach ($item in $InputObject) {
-                $results.Add($item)
-            }
-        }
-        end {
-            if ($results.Count -eq 0) {
-                Write-Host "  No telemetry results returned." -ForegroundColor Yellow
-                return
-            }
-
-            # Column definitions: header text + the property/logic used to derive each row's value
-            $columns = @(
-                @{ Header = 'HOST';    Getter = { param($r) $r.HostName.ToUpper() } }
-                @{ Header = 'OS';      Getter = { param($r) $r.Platform } }
-                @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
-                @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
-                @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
-                @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
-                @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion) { $r.Summary.AdminRotateVersion } else { '-' } } }
-                @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount) { $r.Summary.PackageCount } else { '-' } } }
-                # @{ Header = 'CPU';     Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.Cores) { $r.Summary.Cores } else { '-' } } }
-            )
-
-            $sorted = $results | Sort-Object Platform, HostName
-
-            # Pre-compute every cell value once, then derive each column's width from
-            # the longest of: its header, or any value that will appear under it.
-            $rows = foreach ($r in $sorted) {
-                [PSCustomObject]@{
-                    Result = $r
-                    Cells  = $columns | ForEach-Object { & $_.Getter $r }
-                }
-            }
-
-            $widths = for ($i = 0; $i -lt $columns.Count; $i++) {
-                $maxCellLen = ($rows | ForEach-Object { "$($_.Cells[$i])".Length } | Measure-Object -Maximum).Maximum
-                [Math]::Max($columns[$i].Header.Length, $maxCellLen)
-            }
-
-            # Build the format string dynamically: "  {0,-W0} {1,-W1} ... {N,-Wn}"
-            $fmt = "  " + (
-                (0..($columns.Count - 1) | ForEach-Object { "{$($_),-$($widths[$_])}" }) -join ' '
-            )
-
-            Write-Host ($fmt -f $columns.Header) -ForegroundColor DarkGray
-
-            foreach ($row in $rows) {
-                $r = $row.Result
-                if ($r.Success) {
-                    Write-Host ($fmt -f $row.Cells)
-                } else {
-                    $failCells = $row.Cells.Clone()
-                    $failCells[-1] = ''   # blank the last column so FAILED can be appended after
-                    Write-Host ($fmt -f $failCells) -NoNewline
-                    Write-Host 'FAILED' -ForegroundColor Red
-                }
-            }
-
-            #
-            # Failures beneath table
-            #
-            $failed = @($results | Where-Object { -not $_.Success })
-            if ($failed.Count) {
-                Write-Host ""
-                Write-Host "  Failures:" -ForegroundColor DarkRed
-                $hostWidth = [Math]::Max(
-                    10,
-                    [int](
-                        $hosts |
-                            ForEach-Object { $_.Length } |
-                            Measure-Object -Maximum
-                    ).Maximum
-                )
-                foreach ($r in $failed) {
-                    foreach ($failure in @($r.Failures)) {
-                        Write-Host ("    {0,-$hostWidth} {1}" -f $r.HostName, $failure) -ForegroundColor Red
+                        Name = $_.name
                     }
                 }
-            }
-        }
+        )
     }
 
+    if ($sections.ContainsKey('Windows')) {
+        $result.Windows = @($sections['Windows'])
+    }
 
-    function Get-MobileOverview {
-        [CmdletBinding(DefaultParameterSetName = 'ExplicitPaths')]
-        param(
-            [Parameter(Position = 0)]
-            [string]$MobileName,
+    if ($sections.ContainsKey('Linux')) {
+        $result.Linux = @($sections['Linux'])
+    }
+    $tmp = @($result.DefaultUsers) + @($result.MobileUsers)
 
-            [Parameter(ParameterSetName = 'Config')]
-            [AllowNull()]
-            [object]$Config,
+    $allUsers = [System.Collections.Generic.List[object]]::new()
 
-            [Parameter(ParameterSetName = 'ExplicitPaths')]
-            [string]$defaultUsersPath = $Script:Config.mobileDefaultUsers,
-
-            [Parameter(ParameterSetName = 'ExplicitPaths')]
-            [string]$mobileEntriesPath = $Script:Config.MobileEntries,
-
-            [Parameter(ParameterSetName = 'ExplicitPaths')]
-            [string]$fallBackPass = $Script:Config.fallbackPass,
-
-            [Parameter(ParameterSetName = 'ExplicitPaths')]
-            [string]$nfsHome = $Script:Config.NfsHome,
-
-            [Parameter(ParameterSetName = 'ExplicitPaths')]
-            [string]$mobileDumpPath = $Script:Config.MobileDump,
-
-            [Parameter(ParameterSetName = 'ExplicitPaths')]
-            [string]$sshKeyPath = $Script:Config.SSHKeyPath,
-
-            [Parameter()]
-            [switch]$Full
-        )
-
-        # 1. Resolve Active Paths Based on Parameter Set
-        if ($PSCmdlet.ParameterSetName -eq 'Config') {
-            $cfg = Get-MobileConfig $Config
-            $defaultUsersPath  = $cfg.mobileDefaultUsers
-            $mobileEntriesPath = $cfg.MobileEntries
-            $fallBackPass      = $cfg.fallbackPass
-            $nfsHome           = $cfg.NfsHome
-            $sshKeyPath        = $cfg.SSHKeyPath
-            $mobileDumpPath    = $cfg.MobileDump
-
-            $data = Get-MobileData -MobileName $MobileName -Config $cfg
-        } else {
-            $data = Get-MobileData -MobileName $MobileName `
-                -defaultUserpath $defaultUsersPath `
-                -mobileEntriesPath $mobileEntriesPath `
-                -fallbackPass $fallBackPass
-        }
-
-        $width = 76
-
-        function Write-CenteredHeader {
-            param([string]$Text, [ConsoleColor]$Color = 'Cyan')
-            $border  = '=' * $width
-            $padding = [Math]::Max(0, [Math]::Floor(($width - $Text.Length) / 2))
-            Write-Host $border -ForegroundColor $Color
-            Write-Host (' ' * $padding + $Text) -ForegroundColor $Color
-            Write-Host $border -ForegroundColor $Color
-        }
-
-        function Write-Section {
-            param([string]$Text, [ConsoleColor]$Color = 'DarkYellow')
-            Write-Host ""
-            Write-Host ("[{0}]" -f $Text) -ForegroundColor $Color
-            Write-Host ('-' * $width) -ForegroundColor DarkGray
-        }
-
-        if ($data.AllMobiles.Count -eq 0) {
-            Write-Host "No available mobiles found." -ForegroundColor Yellow
-            return
-        }
-
-        if ([string]::IsNullOrWhiteSpace($MobileName)) {
-            Write-CenteredHeader -Text 'AVAILABLE MOBILES'
-            foreach ($name in $data.AllMobiles) {
-                Write-Host ("  {0,-30}" -f $name) -ForegroundColor Green
-            }
-            Write-Host ""
-            return
-        }
-
-        Write-CenteredHeader -Text "MOBILE: $MobileName"
-
-        # --- SECTION: Configured Users ---
-        Write-Section -Text 'USERS' -Color DarkYellow
-        Write-Host ("  {0,-18} {1,-18} {2,-24} {3}" -f 'USERNAME', 'GROUPS', 'FULL NAME', 'PASSWORD SET') -ForegroundColor DarkYellow
-
-        foreach ($u in ($data.MobileUsers | Sort-Object Username)) {
-            $hasPassword = $false
-            if (-not [string]::IsNullOrWhiteSpace($mobileDumpPath) -and (Test-Path $mobileDumpPath)) {
-                $passPath = Join-Path $mobileDumpPath $u.Username
-                $hasPassword = Test-Path $passPath
-            }
-
-            $statusText  = if ($hasPassword) { "[+] SET" } else { "[-] PENDING" }
-            $statusColor = if ($hasPassword) { 'Green' } else { 'DarkRed' }
-            $groups      = $u.Groups -join ', '
-
-            Write-Host ("  {0,-18} {1,-18} {2,-24} " -f $u.Username, $groups, $u.Name) -ForegroundColor Yellow -NoNewline
-            Write-Host $statusText -ForegroundColor $statusColor
-        }
-
-        # --- SECTION: Windows Nodes ---
-        if ($data.Windows.Count -gt 0) {
-            Write-Section -Text 'WINDOWS ENDPOINTS' -Color DarkCyan
-            foreach ($c in ($data.Windows | Sort-Object)) {
-                Write-Host ("  [+] {0}" -f $c) -ForegroundColor Cyan
-            }
-        }
-
-        # --- SECTION: Linux Nodes ---
-        if ($data.Linux.Count -gt 0) {
-            Write-Section -Text 'LINUX ENDPOINTS' -Color DarkRed
-            foreach ($c in ($data.Linux | Sort-Object)) {
-                Write-Host ("  [+] {0}" -f $c) -ForegroundColor Red
-            }
-        }
-
-        # --- SECTION: Role Expansion ---
-        Write-Section -Text 'SIMULATED DEPLOYMENT ACCOUNTS' -Color DarkGreen
-        Write-Host ("  {0,-24} {1,-22} {2}" -f 'ACCOUNT NAME', 'FULL NAME', 'ROLE DESCRIPTION') -ForegroundColor DarkGreen
-        foreach ($u in $data.AllUsers) {
-            Write-Host ("  {0,-24} {1,-22} {2}" -f $u.Name, $u.FullName, $u.Description) -ForegroundColor Green
-        }
-
-        # --- SECTION: Deep Telemetry (-Full) ---
-        if ($Full) {
-            Write-Section -Text 'HOST TELEMETRY AUDIT' -Color Magenta
-
-            if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyPath)) {
-                $keyName = Split-Path $sshKeyPath -Leaf
-                # Test-AndFixSshEnvironment -KeyPath $SshKeyPath -NfsHome $NfsHome -quiet
-                if (-not (Initialize-Environment)) {
-                    Write-Warning "[!] -- Fix Environment"
-                    exit 1
-                }
-            }
-
-            $computerData = Invoke-InformationCollector `
-                -winComputers $data.Windows `
-                -linComputers $data.Linux `
-                -sshKeyPath $sshKeyPath
-
-            if (Get-Command Format-HostCollector -ErrorAction SilentlyContinue) {
-                $computerData | Format-HostCollector
+    foreach ($u in $tmp) {
+        $grps = Set-Groups $u.Groups
+        Write-Debug "$($u.Username) -- $($grps)"
+        foreach ($grp in $grps) {
+            $meta = $Script:GroupMetadata[$grp]
+            $accountName = if ($meta.Suffix) {
+                "$($u.Username).$($meta.Suffix)"
             } else {
-                $computerData | Format-Table -AutoSize
+                $u.Username
             }
-        }
 
-        Write-Host "`n"
+            $uData = [PSCustomObject]@{
+                BaseName = $u.UserName
+                Name     = $accountName
+                GroupType = $grp
+                FullName = Get-UserFullName $u.Username $u.Name
+                Password = (ConvertTo-SecureString -AsPlainText -Force $fallbackPass)
+                Description = "$($meta.Description)"
+                LinuxName = "$($u.UserName).local"
+                LinuxPassword = [sha512Crypt]::Crypt($fallbackPass)
+                LinuxAccountType = $meta.LinuxAccountType
+                MustChangePassword = $true
+            }
+
+            $allUsers.Add($uData)
+        }
+    }
+    $allUsers = $allUsers | Sort-Object Name -Unique
+
+    $result.AllUsers = $allUsers
+
+    [PSCustomObject]$result
+}
+
+
+
+
+function Get-TaskData {
+    param(
+        [string]$tasksPath,
+        [bool]$hasLinux
+    )
+
+    $taskData = @()
+    $disjoinData = Get-PostDeployScript -userRights -Sharing -hasLinux:$hasLinux
+    # $disjoinB64 = ConvertTo-Base64 $disjoinData
+    $bootTrigger = @{
+        Type = [TaskTriggerType]::Boot
+        Delay = 'PT1M'
+    }
+    $weeklyTrigger = @{
+        Type = [TaskTriggerType]::Weekly
+        DaysOfWeek = 1
+        StartBoundary = (Get-Date "00:00:00").AddDays(1).ToString('s')
     }
 
 
+    $domainDisjoinTask = New-TaskXML -Description 'Runs once after domain disjoin' `
+        -Author '[Mobile Administration]' -Execute 'powershell.exe' `
+        -ToEncode $disjoinData `
+        -TriggerConfigs @($bootTrigger)
+    # -Arguments "-NoProfile -ExecutionPolicyBypass -Encoded $disjoinB64" `
 
-    function Set-MobileGpoPermission {
-        [CmdletBinding(DefaultParameterSetName = 'Add')]
-        param(
-            [Parameter(Mandatory = $true, Position = 0)]
-            [string]$MobileName,
 
-            [Parameter(Mandatory = $true)]
-            [string]$GpoID,
+    $logCollect = New-TaskXML -Description 'Mobile Auto Log Archiver' `
+        -Author '[Mobile Administration]' -Execute 'powershell.exe' `
+        -ToEncode (Get-WindowsTask-LogArchiver).ToString() -TriggerConfigs @($weeklyTrigger)
 
-            [Parameter(Mandatory = $true, ParameterSetName = 'Add')]
-            [switch]$Add,
+    $taskData += @([PsCustomObject]@{Taskname = "Mobile-LogArchiver"; TaskXml = $logCollect})
+    $taskData += @([PsCustomObject]@{Taskname = "Mobile-DisjoinTask"; TaskXml = $domainDisjoinTask})
+    
+    return $taskData
+}
 
-            [Parameter(Mandatory = $true, ParameterSetName = 'Remove')]
-            [switch]$Remove,
+function Format-HostCollector {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object[]]$InputObject
+    )
+    begin {
+        $results = [System.Collections.Generic.List[object]]::new()
+    }
+    process {
+        foreach ($item in $InputObject) {
+            $results.Add($item)
+        }
+    }
+    end {
+        if ($results.Count -eq 0) {
+            Write-Host "  No telemetry results returned." -ForegroundColor Yellow
+            return
+        }
 
-            [Parameter(ParameterSetName = 'Remove')]
-            [switch]$Force,
-
-            [Parameter()]
-            [PSCustomObject]$Config
+        # Column definitions: header text + the property/logic used to derive each row's value
+        $columns = @(
+            @{ Header = 'HOST';    Getter = { param($r) $r.HostName.ToUpper() } }
+            @{ Header = 'OS';      Getter = { param($r) $r.Platform } }
+            @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
+            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
+            @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
+            @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
+            @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion) { $r.Summary.AdminRotateVersion } else { '-' } } }
+            @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount) { $r.Summary.PackageCount } else { '-' } } }
+            # @{ Header = 'CPU';     Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.Cores) { $r.Summary.Cores } else { '-' } } }
         )
 
-        $cfg = Get-MobileConfig $Config
+        $sorted = $results | Sort-Object Platform, HostName
 
-        # Standardize GPO GUID format: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
-        $cleanGuid = if ($GpoID -match '^{[0-9a-fA-F-]+}$') { $GpoID 
-        } else { "{$GpoID}" 
+        # Pre-compute every cell value once, then derive each column's width from
+        # the longest of: its header, or any value that will appear under it.
+        $rows = foreach ($r in $sorted) {
+            [PSCustomObject]@{
+                Result = $r
+                Cells  = $columns | ForEach-Object { & $_.Getter $r }
+            }
         }
 
-        # Bind to GPO container in AD
-        $rootDSE       = [ADSI]"LDAP://RootDSE"
-        $namingContext = $rootDSE.defaultNamingContext
-        $gpoPath       = "LDAP://CN=$cleanGuid,CN=Policies,CN=System,$namingContext"
-    
-        $gpoEntry = [System.DirectoryServices.DirectoryEntry]::new($gpoPath)
-        if (-not $gpoEntry.Path) {
-            Write-Error "Could not bind to GPO ($cleanGuid) in Active Directory."
-            return
+        $widths = for ($i = 0; $i -lt $columns.Count; $i++) {
+            $maxCellLen = ($rows | ForEach-Object { "$($_.Cells[$i])".Length } | Measure-Object -Maximum).Maximum
+            [Math]::Max($columns[$i].Header.Length, $maxCellLen)
         }
 
-        $secDesc      = $gpoEntry.ObjectSecurity
-        $applyGpoGuid = [Guid]"edacfc86-b327-11d2-9701-00c04fd91ab0"
+        # Build the format string dynamically: "  {0,-W0} {1,-W1} ... {N,-Wn}"
+        $fmt = "  " + (
+            (0..($columns.Count - 1) | ForEach-Object { "{$($_),-$($widths[$_])}" }) -join ' '
+        )
 
-        if ($Force -and $Remove) {
-            # Get only explicit Access Control Entries (exclude inherited container ACLs)
-            $rules = $secDesc.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])
-            $removedCount = 0
+        Write-Host ($fmt -f $columns.Header) -ForegroundColor DarkGray
 
-            # Protected well-known administrative SIDs (Domain Admins, Enterprise Admins, SYSTEM, etc.)
-            # Domain Admins ends in -512, Enterprise Admins in -519, Domain Controllers in -516
-            $adminRids = @(512, 516, 519)
+        foreach ($row in $rows) {
+            $r = $row.Result
+            if ($r.Success) {
+                Write-Host ($fmt -f $row.Cells)
+            } else {
+                $failCells = $row.Cells.Clone()
+                $failCells[-1] = ''   # blank the last column so FAILED can be appended after
+                Write-Host ($fmt -f $failCells) -NoNewline
+                Write-Host 'FAILED' -ForegroundColor Red
+            }
+        }
 
-            foreach ($rule in $rules) {
-                $sid = $rule.IdentityReference.Value
-            
-                # Skip well-known built-in/service identities (NT AUTHORITY, SYSTEM, etc.)
-                if ($sid -match '^S-1-5-(18|19|20|32-544)') {
-                    continue
-                }
-
-                # Check if this rule is a domain administrative group by RID
-                $isProtectedAdmin = $false
-                foreach ($rid in $adminRids) {
-                    if ($sid -match "-$rid$") {
-                        $isProtectedAdmin = $true
-                        break
-                    }
-                }
-
-                if ($isProtectedAdmin) {
-                    continue
-                }
-
-                # Target only GpoRead (GenericRead) or ExtendedRight (Apply Group Policy)
-                $isReadOrApply = ($rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericRead) -or
-                ($rule.ObjectType -eq $applyGpoGuid)
-
-                if ($isReadOrApply) {
-                    $secDesc.RemoveAccessRuleSpecific($rule) | Out-Null
-                    $removedCount++
+        #
+        # Failures beneath table
+        #
+        $failed = @($results | Where-Object { -not $_.Success })
+        if ($failed.Count) {
+            Write-Host ""
+            Write-Host "  Failures:" -ForegroundColor DarkRed
+            $hostWidth = [Math]::Max(
+                10,
+                [int](
+                    $hosts |
+                        ForEach-Object { $_.Length } |
+                        Measure-Object -Maximum
+                ).Maximum
+            )
+            foreach ($r in $failed) {
+                foreach ($failure in @($r.Failures)) {
+                    Write-Host ("    {0,-$hostWidth} {1}" -f $r.HostName, $failure) -ForegroundColor Red
                 }
             }
+        }
+    }
+}
 
-            $gpoEntry.CommitChanges()
-            Write-Host "[+] Force removed $removedCount GpoRead / Apply ACEs from GPO ($cleanGuid)" -ForegroundColor Yellow
-            return
+
+function Get-MobileOverview {
+    [CmdletBinding(DefaultParameterSetName = 'ExplicitPaths')]
+    param(
+        [Parameter(Position = 0)]
+        [string]$MobileName,
+
+        [Parameter(ParameterSetName = 'Config')]
+        [AllowNull()]
+        [object]$Config,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$defaultUsersPath = $Script:Config.mobileDefaultUsers,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$mobileEntriesPath = $Script:Config.MobileEntries,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$fallBackPass = $Script:Config.fallbackPass,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$nfsHome = $Script:Config.NfsHome,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$mobileDumpPath = $Script:Config.MobileDump,
+
+        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [string]$sshKeyPath = $Script:Config.SSHKeyPath,
+
+        [Parameter()]
+        [switch]$Full
+    )
+
+    # 1. Resolve Active Paths Based on Parameter Set
+    if ($PSCmdlet.ParameterSetName -eq 'Config') {
+        $cfg = Get-MobileConfig $Config
+        $defaultUsersPath  = $cfg.mobileDefaultUsers
+        $mobileEntriesPath = $cfg.MobileEntries
+        $fallBackPass      = $cfg.fallbackPass
+        $nfsHome           = $cfg.NfsHome
+        $sshKeyPath        = $cfg.SSHKeyPath
+        $mobileDumpPath    = $cfg.MobileDump
+
+        $data = Get-MobileData -MobileName $MobileName -Config $cfg
+    } else {
+        $data = Get-MobileData -MobileName $MobileName `
+            -defaultUserpath $defaultUsersPath `
+            -mobileEntriesPath $mobileEntriesPath `
+            -fallbackPass $fallBackPass
+    }
+
+    $width = 76
+
+    function Write-CenteredHeader {
+        param([string]$Text, [ConsoleColor]$Color = 'Cyan')
+        $border  = '=' * $width
+        $padding = [Math]::Max(0, [Math]::Floor(($width - $Text.Length) / 2))
+        Write-Host $border -ForegroundColor $Color
+        Write-Host (' ' * $padding + $Text) -ForegroundColor $Color
+        Write-Host $border -ForegroundColor $Color
+    }
+
+    function Write-Section {
+        param([string]$Text, [ConsoleColor]$Color = 'DarkYellow')
+        Write-Host ""
+        Write-Host ("[{0}]" -f $Text) -ForegroundColor $Color
+        Write-Host ('-' * $width) -ForegroundColor DarkGray
+    }
+
+    if ($data.AllMobiles.Count -eq 0) {
+        Write-Host "No available mobiles found." -ForegroundColor Yellow
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($MobileName)) {
+        Write-CenteredHeader -Text 'AVAILABLE MOBILES'
+        foreach ($name in $data.AllMobiles) {
+            Write-Host ("  {0,-30}" -f $name) -ForegroundColor Green
+        }
+        Write-Host ""
+        return
+    }
+
+    Write-CenteredHeader -Text "MOBILE: $MobileName"
+
+    # --- SECTION: Configured Users ---
+    Write-Section -Text 'USERS' -Color DarkYellow
+    Write-Host ("  {0,-18} {1,-18} {2,-24} {3}" -f 'USERNAME', 'GROUPS', 'FULL NAME', 'PASSWORD SET') -ForegroundColor DarkYellow
+
+    foreach ($u in ($data.MobileUsers | Sort-Object Username)) {
+        $hasPassword = $false
+        if (-not [string]::IsNullOrWhiteSpace($mobileDumpPath) -and (Test-Path $mobileDumpPath)) {
+            $passPath = Join-Path $mobileDumpPath $u.Username
+            $hasPassword = Test-Path $passPath
         }
 
-        $mobileData  = Get-MobileData -MobileName $MobileName -Config $cfg
-        $targetUsers = if ($Add) { $mobileData.AllUsers 
-        } else { $mobileData.MobileUsers 
+        $statusText  = if ($hasPassword) { "[+] SET" } else { "[-] PENDING" }
+        $statusColor = if ($hasPassword) { 'Green' } else { 'DarkRed' }
+        $groups      = $u.Groups -join ', '
+
+        Write-Host ("  {0,-18} {1,-18} {2,-24} " -f $u.Username, $groups, $u.Name) -ForegroundColor Yellow -NoNewline
+        Write-Host $statusText -ForegroundColor $statusColor
+    }
+
+    # --- SECTION: Windows Nodes ---
+    if ($data.Windows.Count -gt 0) {
+        Write-Section -Text 'WINDOWS ENDPOINTS' -Color DarkCyan
+        foreach ($c in ($data.Windows | Sort-Object)) {
+            Write-Host ("  [+] {0}" -f $c) -ForegroundColor Cyan
+        }
+    }
+
+    # --- SECTION: Linux Nodes ---
+    if ($data.Linux.Count -gt 0) {
+        Write-Section -Text 'LINUX ENDPOINTS' -Color DarkRed
+        foreach ($c in ($data.Linux | Sort-Object)) {
+            Write-Host ("  [+] {0}" -f $c) -ForegroundColor Red
+        }
+    }
+
+    # --- SECTION: Role Expansion ---
+    Write-Section -Text 'SIMULATED DEPLOYMENT ACCOUNTS' -Color DarkGreen
+    Write-Host ("  {0,-24} {1,-22} {2}" -f 'ACCOUNT NAME', 'FULL NAME', 'ROLE DESCRIPTION') -ForegroundColor DarkGreen
+    foreach ($u in $data.AllUsers) {
+        Write-Host ("  {0,-24} {1,-22} {2}" -f $u.Name, $u.FullName, $u.Description) -ForegroundColor Green
+    }
+
+    # --- SECTION: Deep Telemetry (-Full) ---
+    if ($Full) {
+        Write-Section -Text 'HOST TELEMETRY AUDIT' -Color Magenta
+
+        if (-not [string]::IsNullOrWhiteSpace($nfsHome) -and -not [string]::IsNullOrWhiteSpace($sshKeyPath)) {
+            $keyName = Split-Path $sshKeyPath -Leaf
+            # Test-AndFixSshEnvironment -KeyPath $SshKeyPath -NfsHome $NfsHome -quiet
+            if (-not (Initialize-Environment)) {
+                Write-Warning "[!] -- Fix Environment"
+                exit 1
+            }
         }
 
-        foreach ($u in $targetUsers) {
-            try {
-                $account = [System.Security.Principal.NTAccount]::new($u.Name)
-                $sid     = $account.Translate([System.Security.Principal.SecurityIdentifier])
-            } catch {
-                Write-Warning "Could not resolve SID for user: $($u.Name)"
+        $computerData = Invoke-InformationCollector `
+            -winComputers $data.Windows `
+            -linComputers $data.Linux `
+            -sshKeyPath $sshKeyPath
+
+        if (Get-Command Format-HostCollector -ErrorAction SilentlyContinue) {
+            $computerData | Format-HostCollector
+        } else {
+            $computerData | Format-Table -AutoSize
+        }
+    }
+
+    Write-Host "`n"
+}
+
+
+
+function Set-MobileGpoPermission {
+    [CmdletBinding(DefaultParameterSetName = 'Add')]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [string]$MobileName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$GpoID,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'Add')]
+        [switch]$Add,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'Remove')]
+        [switch]$Remove,
+
+        [Parameter(ParameterSetName = 'Remove')]
+        [switch]$Force,
+
+        [Parameter()]
+        [PSCustomObject]$Config
+    )
+
+    $cfg = Get-MobileConfig $Config
+
+    # Standardize GPO GUID format: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
+    $cleanGuid = if ($GpoID -match '^{[0-9a-fA-F-]+}$') { $GpoID 
+    } else { "{$GpoID}" 
+    }
+
+    # Bind to GPO container in AD
+    $rootDSE       = [ADSI]"LDAP://RootDSE"
+    $namingContext = $rootDSE.defaultNamingContext
+    $gpoPath       = "LDAP://CN=$cleanGuid,CN=Policies,CN=System,$namingContext"
+    
+    $gpoEntry = [System.DirectoryServices.DirectoryEntry]::new($gpoPath)
+    if (-not $gpoEntry.Path) {
+        Write-Error "Could not bind to GPO ($cleanGuid) in Active Directory."
+        return
+    }
+
+    $secDesc      = $gpoEntry.ObjectSecurity
+    $applyGpoGuid = [Guid]"edacfc86-b327-11d2-9701-00c04fd91ab0"
+
+    if ($Force -and $Remove) {
+        # Get only explicit Access Control Entries (exclude inherited container ACLs)
+        $rules = $secDesc.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])
+        $removedCount = 0
+
+        # Protected well-known administrative SIDs (Domain Admins, Enterprise Admins, SYSTEM, etc.)
+        # Domain Admins ends in -512, Enterprise Admins in -519, Domain Controllers in -516
+        $adminRids = @(512, 516, 519)
+
+        foreach ($rule in $rules) {
+            $sid = $rule.IdentityReference.Value
+            
+            # Skip well-known built-in/service identities (NT AUTHORITY, SYSTEM, etc.)
+            if ($sid -match '^S-1-5-(18|19|20|32-544)') {
                 continue
             }
 
-            $ruleRead = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
-                $sid,
-                [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
-                [System.Security.AccessControl.AccessControlType]::Allow
-            )
+            # Check if this rule is a domain administrative group by RID
+            $isProtectedAdmin = $false
+            foreach ($rid in $adminRids) {
+                if ($sid -match "-$rid$") {
+                    $isProtectedAdmin = $true
+                    break
+                }
+            }
 
-            $ruleApply = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
-                $sid,
-                [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
-                [System.Security.AccessControl.AccessControlType]::Allow,
-                $applyGpoGuid
-            )
+            if ($isProtectedAdmin) {
+                continue
+            }
 
-            if ($Add) {
-                $secDesc.AddAccessRule($ruleRead)
-                $secDesc.AddAccessRule($ruleApply)
-            } else {
-                $secDesc.RemoveAccessRule($ruleRead)
-                $secDesc.RemoveAccessRule($ruleApply)
+            # Target only GpoRead (GenericRead) or ExtendedRight (Apply Group Policy)
+            $isReadOrApply = ($rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericRead) -or
+            ($rule.ObjectType -eq $applyGpoGuid)
+
+            if ($isReadOrApply) {
+                $secDesc.RemoveAccessRuleSpecific($rule) | Out-Null
+                $removedCount++
             }
         }
 
         $gpoEntry.CommitChanges()
-
-        $actionText = if ($Add) { "Added" 
-        } else { "Removed" 
-        }
-        Write-Host "[+] $actionText users from '$MobileName' on GPO ($cleanGuid)" -ForegroundColor Green
+        Write-Host "[+] Force removed $removedCount GpoRead / Apply ACEs from GPO ($cleanGuid)" -ForegroundColor Yellow
+        return
     }
 
+    $mobileData  = Get-MobileData -MobileName $MobileName -Config $cfg
+    $targetUsers = if ($Add) { $mobileData.AllUsers 
+    } else { $mobileData.MobileUsers 
+    }
 
-    function Format-DeploymentResults {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)]
-            [array]$Results,
+    foreach ($u in $targetUsers) {
+        try {
+            $account = [System.Security.Principal.NTAccount]::new($u.Name)
+            $sid     = $account.Translate([System.Security.Principal.SecurityIdentifier])
+        } catch {
+            Write-Warning "Could not resolve SID for user: $($u.Name)"
+            continue
+        }
 
-            [Parameter(Mandatory)]
-            [array]$AllUsers,
-        
-            [switch]$Unregister
+        $ruleRead = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+            $sid,
+            [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+            [System.Security.AccessControl.AccessControlType]::Allow
         )
 
-        if (-not $Results) {
-            Write-Warning "No deployment results returned."
-            return
+        $ruleApply = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+            $sid,
+            [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+            [System.Security.AccessControl.AccessControlType]::Allow,
+            $applyGpoGuid
+        )
+
+        if ($Add) {
+            $secDesc.AddAccessRule($ruleRead)
+            $secDesc.AddAccessRule($ruleApply)
+        } else {
+            $secDesc.RemoveAccessRule($ruleRead)
+            $secDesc.RemoveAccessRule($ruleApply)
+        }
+    }
+
+    $gpoEntry.CommitChanges()
+
+    $actionText = if ($Add) { "Added" 
+    } else { "Removed" 
+    }
+    Write-Host "[+] $actionText users from '$MobileName' on GPO ($cleanGuid)" -ForegroundColor Green
+}
+
+
+function Format-DeploymentResults {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [array]$Results,
+
+        [Parameter(Mandatory)]
+        [array]$AllUsers,
+        
+        [switch]$Unregister
+    )
+
+    if (-not $Results) {
+        Write-Warning "No deployment results returned."
+        return
+    }
+
+    function Get-ShortHostName {
+        param([string]$Name)
+
+        if ([string]::IsNullOrWhiteSpace($Name)) {
+            return '-'
         }
 
-        function Get-ShortHostName {
-            param([string]$Name)
+        return ($Name -split '\.')[0]
+    }
 
-            if ([string]::IsNullOrWhiteSpace($Name)) {
-                return '-'
+    function Get-AggregateStatus {
+        param(
+            [Parameter(Mandatory)]
+            $Result,
+
+            [Parameter(Mandatory)]
+            [string]$Category
+        )
+
+        $actions = @( $Result.Actions | Where-Object Category -eq $Category)
+
+        if (-not $actions) { return '-' }
+
+        if ($actions.Status -contains 'Failed') { return 'FAILED' }
+
+        return 'OK'
+    }
+
+    #
+    # USERS
+    #
+    $userRows = foreach ($result in $Results) {
+
+        $host = Get-ShortHostName $result.HostName
+
+        foreach ($baseName in ($AllUsers.BaseName | Sort-Object -Unique)) {
+
+            $userDefs = @( $AllUsers | Where-Object BaseName -eq $baseName)
+
+            #
+            # Canonical roles come directly from the user model.
+            #
+            $roles = @( $userDefs | Select-Object -ExpandProperty GroupType -Unique | ForEach-Object { $_.ToString() })
+
+            #
+            # Determine the account names actually deployed
+            # on this platform.
+            #
+            $accountNames = if ($result.Platform -eq 'Linux') { 
+                @( $userDefs.LinuxName | Where-Object { $_ } | Sort-Object -Unique)
+            } else {
+                @( $userDefs.Name | Where-Object { $_ } | Sort-Object -Unique)
             }
 
-            return ($Name -split '\.')[0]
-        }
-
-        function Get-AggregateStatus {
-            param(
-                [Parameter(Mandatory)]
-                $Result,
-
-                [Parameter(Mandatory)]
-                [string]$Category
+            $accountActions = @( $result.Actions | Where-Object { $_.Category -match 'User(Removal)?' -and $_.Name -in $accountNames }
             )
 
-            $actions = @( $Result.Actions | Where-Object Category -eq $Category)
+            #
+            # We're intentionally collapsing Created/Existing
+            # because deployment reporting only cares whether
+            # the desired account state succeeded.
+            #
+            $status = if (-not $accountActions) {
+                '-'
+            } elseif ($accountActions.Status -contains 'Failed') { 'FAILED' } else { 'OK' }
 
-            if (-not $actions) { return '-' }
-
-            if ($actions.Status -contains 'Failed') { return 'FAILED' }
-
-            return 'OK'
-        }
-
-        #
-        # USERS
-        #
-        $userRows = foreach ($result in $Results) {
-
-            $host = Get-ShortHostName $result.HostName
-
-            foreach ($baseName in ($AllUsers.BaseName | Sort-Object -Unique)) {
-
-                $userDefs = @( $AllUsers | Where-Object BaseName -eq $baseName)
-
-                #
-                # Canonical roles come directly from the user model.
-                #
-                $roles = @( $userDefs | Select-Object -ExpandProperty GroupType -Unique | ForEach-Object { $_.ToString() })
-
-                #
-                # Determine the account names actually deployed
-                # on this platform.
-                #
-                $accountNames = if ($result.Platform -eq 'Linux') { 
-                    @( $userDefs.LinuxName | Where-Object { $_ } | Sort-Object -Unique)
-                } else {
-                    @( $userDefs.Name | Where-Object { $_ } | Sort-Object -Unique)
-                }
-
-                $accountActions = @( $result.Actions | Where-Object { $_.Category -match 'User(Removal)?' -and $_.Name -in $accountNames }
-                )
-
-                #
-                # We're intentionally collapsing Created/Existing
-                # because deployment reporting only cares whether
-                # the desired account state succeeded.
-                #
-                $status = if (-not $accountActions) {
-                    '-'
-                } elseif ($accountActions.Status -contains 'Failed') { 'FAILED' } else { 'OK' }
-
-                $password = if ($userDefs.MustChangePassword -contains $true) { 'DefaultPasswordSet' } else { 'UserSet' }
-                if ($unRegister) { $password = ""}
-
-                [PSCustomObject]@{
-                    Host     = $host
-                    User     = $baseName
-                    Groups   = $roles -join ', '
-                    Status   = $status
-                    Password = $password
-                }
-            }
-        }
-
-        Write-Host ""
-        Write-Host "[USERS]" -ForegroundColor Cyan
-        # Optional header row to visually anchor the columns
-        Write-Host ("{0,-30} {1,-30} {2,-30}" -f "USER", "GROUPS", "PASSWORD") -ForegroundColor Gray
-
-        $curUser = ""
-        foreach ($uRow in $userRows | Sort-Object User) {
-            if ($curUser -ne $uRow.User) {
-                $curUser = $uRow.User
-        
-                # Safely truncate values exceeding 30 characters to prevent line wrapping/shifting
-                $userCol   = if ($curUser.Length -gt 30) { $curUser.Substring(0, 27) + '...' } else { $curUser }
-                $groupsCol = "[$($uRow.Groups)]"
-                $groupsCol = if ($groupsCol.Length -gt 30) { $groupsCol.Substring(0, 27) + '...]' } else { $groupsCol }
-                $passCol   = if ($uRow.Password.Length -gt 30) { $uRow.Password.Substring(0, 27) + '...' } else { $uRow.Password }
-
-                $line = "{0,-30} {1,-30} {2,-30}" -f $userCol, $groupsCol, $passCol
-                Write-Host $line -ForegroundColor DarkYellow
-            }
-
-            # Indent host status under the active user row
-            if ($status -eq 'OK') {
-                Write-Host ("  [+] {0}" -f $uRow.Host) -ForegroundColor Green
-            } else {
-                Write-Host ("  [-] {0}" -f $uRow.Host) -ForegroundColor Red
-            }
-        }
-
-        # $userRows | Sort-Object Host, User | Format-Table Host, User, Groups, Status, Password -AutoSize
-
-        #
-        # DEPLOYMENT TASKS
-        #
-        $taskRows = foreach ($result in $Results) {
-
-            $host = Get-ShortHostName $result.HostName
+            $password = if ($userDefs.MustChangePassword -contains $true) { 'DefaultPasswordSet' } else { 'UserSet' }
+            if ($unRegister) { $password = ""}
 
             [PSCustomObject]@{
-                Host = $host
-
-                # Privileges = Get-AggregateStatus  -Result $result  -Category 'Privilege'
-                # NetworkSharing = Get-AggregateStatus -Result $result -Category 'NetworkSharing'
-
-                LogArchiveTask = Get-AggregateStatus -Result $result -Category 'Task: LogArchive'
-                # ScheduledTasks = Get-AggregateStatus  -Result $result  -Category 'ScheduledTask'
-
-                Encryption = Get-AggregateStatus  -Result $result  -Category 'DiskEncryption'
-
-                DomainDisjoin = if ($result.Platform -eq 'Windows') {
-                    Get-AggregateStatus -Result $result -Category 'Domain'
-                } else {
-                    'N/A'
-                }
-
-                PostDisjoin = if ($result.Platform -eq 'Windows') {
-                    Get-AggregateStatus  -Result $result  -Category 'Task: Disjoin'
-                } else {
-                    'N/A'
-                }
+                Host     = $host
+                User     = $baseName
+                Groups   = $roles -join ', '
+                Status   = $status
+                Password = $password
             }
-        }
-
-        Write-Host ""
-        Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
-
-        $taskRows | Sort-Object Host | Format-Table -AutoSize
-        #
-        # FAILURES
-        #
-        $failureRows = foreach ($result in $Results) {
-
-            foreach ($failure in @($result.Failures)) {
-                [PSCustomObject]@{
-                    Host    = Get-ShortHostName $result.HostName
-                    Failure = $failure
-                }
-            }
-        }
-
-        if ($failureRows) {
-            Write-Host ""
-            Write-Host "[FAILURES]" -ForegroundColor Red
-
-            $failureRows | Format-Table Host, Failure -AutoSize
         }
     }
 
+    Write-Host ""
+    Write-Host "[USERS]" -ForegroundColor Cyan
+    # Optional header row to visually anchor the columns
+    Write-Host ("{0,-30} {1,-30} {2,-30}" -f "USER", "GROUPS", "PASSWORD") -ForegroundColor Gray
 
-    function Register-MobileDeployment {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true, Position = 0)]
-            [string]$MobileName,
-            [Parameter()]
-            [string]$sshKeyName    = $Script:Config.sshKeyName,
-            [string]$sshKeyPath    = $Script:Config.SSHKeyPath,
-            [string]$certName      = $Script:Config.certName,
-            [string]$adminRoot     = $Script:Config.adminRoot,
-            [string]$defaultPass   = $Script:Config.defaultPass,
-            [string]$defaultPin    = $Script:Config.encryptionPin,
-            [string]$oldEncryption = $Script:Config.curLuks,
-            [string]$mobileDump    = $Script:Config.mobileDump,
-            [string]$nfsHome       = $Script:Config.NfsHome,
-            [switch]$Disjoin
-        )
+    $curUser = ""
+    foreach ($uRow in $userRows | Sort-Object User) {
+        if ($curUser -ne $uRow.User) {
+            $curUser = $uRow.User
+        
+            # Safely truncate values exceeding 30 characters to prevent line wrapping/shifting
+            $userCol   = if ($curUser.Length -gt 30) { $curUser.Substring(0, 27) + '...' } else { $curUser }
+            $groupsCol = "[$($uRow.Groups)]"
+            $groupsCol = if ($groupsCol.Length -gt 30) { $groupsCol.Substring(0, 27) + '...]' } else { $groupsCol }
+            $passCol   = if ($uRow.Password.Length -gt 30) { $uRow.Password.Substring(0, 27) + '...' } else { $uRow.Password }
 
-        # $cfg = Get-MobileConfig $Config
-        # Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
-        if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
-        $mobileData = Get-MobileData -MobileName $MobileName 
-        $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
-        $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
-    
-
-        $windowsPayload = [PSCustomObject]@{
-            allUsers = @($mobileData.AllUsers)
-            taskData = @($taskData)
-            MobileName = $MobileName
-            Disjoin = $disJoin
-            Bitlocker = $defaultPin
-
+            $line = "{0,-30} {1,-30} {2,-30}" -f $userCol, $groupsCol, $passCol
+            Write-Host $line -ForegroundColor DarkYellow
         }
 
-        $winErrors = [System.Collections.Generic.List[object]]::new()
-        $rawWindows = Invoke-Command `
-            -ComputerName $mobileData.Windows `
-            -ScriptBlock $Script:WindowsDeployBlock `
-            -ArgumentList $windowsPayload `
-            -ErrorVariable winErrors `
-            -ErrorAction SilentlyContinue
+        # Indent host status under the active user row
+        if ($status -eq 'OK') {
+            Write-Host ("  [+] {0}" -f $uRow.Host) -ForegroundColor Green
+        } else {
+            Write-Host ("  [-] {0}" -f $uRow.Host) -ForegroundColor Red
+        }
+    }
 
+    # $userRows | Sort-Object Host, User | Format-Table Host, User, Groups, Status, Password -AutoSize
 
-        $winResults = @(
-            foreach ($r in $rawWindows) {
-                [PSCustomObject]@{
-                    HostName = $r.PSComputerName
-                    Platform = 'Windows'
-                    Success  = [bool]$r.Success
-                    Actions  = @($r.Actions)
-                    Failures = @($r.Failures)
-                }
-            }
-        )
+    #
+    # DEPLOYMENT TASKS
+    #
+    $taskRows = foreach ($result in $Results) {
 
+        $host = Get-ShortHostName $result.HostName
 
-        foreach ($computer in $mobileData.Windows) {
-            $alreadyReturned = $winResults |
-                Where-Object HostName -eq $computer
+        [PSCustomObject]@{
+            Host = $host
 
-            if ($alreadyReturned) { continue }
+            # Privileges = Get-AggregateStatus  -Result $result  -Category 'Privilege'
+            # NetworkSharing = Get-AggregateStatus -Result $result -Category 'NetworkSharing'
 
-            $hostErrors = @(
-                $winErrors |
-                    Where-Object {
-                        $_.TargetObject -eq $computer -or
-                        $_.OriginInfo.PSComputerName -eq $computer
-                    }
-            )
+            LogArchiveTask = Get-AggregateStatus -Result $result -Category 'Task: LogArchive'
+            # ScheduledTasks = Get-AggregateStatus  -Result $result  -Category 'ScheduledTask'
 
-            $messages = if ($hostErrors) { 
-                @($hostErrors | ForEach-Object { $_.Exception.Message })
+            Encryption = Get-AggregateStatus  -Result $result  -Category 'DiskEncryption'
+
+            DomainDisjoin = if ($result.Platform -eq 'Windows') {
+                Get-AggregateStatus -Result $result -Category 'Domain'
             } else {
-                @('No result returned from remote host.')
+                'N/A'
             }
 
-            $winResults += [PSCustomObject]@{
-                HostName = $computer
-                Platform = 'Windows'
-                Success  = $false
-                Actions  = @()
-                Failures = $messages
+            PostDisjoin = if ($result.Platform -eq 'Windows') {
+                Get-AggregateStatus  -Result $result  -Category 'Task: Disjoin'
+            } else {
+                'N/A'
             }
         }
+    }
 
-        # Need the linux computers and the linux computers there for easy processing
-        # $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
-    
-        $linRes = @()
-        $linResults = @()
-        if ($mobileData.Linux.Count -gt 0) {
-            $curDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
-            $DC = $curDomain.FindDomainController().Name
-            $linSplat = @{ allUsers = $mobileData.AllUsers }
-            if ($disjoin) {
-                $linSplat['disjoin'] = $Disjoin
-                $linSplat['b64kt'] = New-RemoteKeytabBase64 -DomainController $DC -Principal $env:USERNAME -SecurePassword  (ConvertTo-SecureString -AsPlainText -Force $secretPass)
+    Write-Host ""
+    Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
+
+    $taskRows | Sort-Object Host | Format-Table -AutoSize
+    #
+    # FAILURES
+    #
+    $failureRows = foreach ($result in $Results) {
+
+        foreach ($failure in @($result.Failures)) {
+            [PSCustomObject]@{
+                Host    = Get-ShortHostName $result.HostName
+                Failure = $failure
             }
-            # $linuxDeploy = Get-LinuxDeployScript -allUsers $mobileData.AllUsers -Disjoin:$Disjoin 
-            $linuxDeploy = Get-LinuxDeployScript @linSplat
-            $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $sshKeyPath
+        }
+    }
+
+    if ($failureRows) {
+        Write-Host ""
+        Write-Host "[FAILURES]" -ForegroundColor Red
+
+        $failureRows | Format-Table Host, Failure -AutoSize
+    }
+}
+
+
+function Register-MobileDeployment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [string]$MobileName,
+        [Parameter()]
+        [string]$sshKeyName    = $Script:Config.sshKeyName,
+        [string]$sshKeyPath    = $Script:Config.SSHKeyPath,
+        [string]$certName      = $Script:Config.certName,
+        [string]$adminRoot     = $Script:Config.adminRoot,
+        [string]$defaultPass   = $Script:Config.defaultPass,
+        [string]$defaultPin    = $Script:Config.encryptionPin,
+        [string]$oldEncryption = $Script:Config.curLuks,
+        [string]$mobileDump    = $Script:Config.mobileDump,
+        [string]$nfsHome       = $Script:Config.NfsHome,
+        [switch]$Disjoin
+    )
+
+    # $cfg = Get-MobileConfig $Config
+    # Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
+    if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
+    $mobileData = Get-MobileData -MobileName $MobileName 
+    $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
+    $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
     
-            $linResults = foreach ($r in $linRes) {
-                if ($r.ExitCode -eq 0 -and $r.StdOut) {
-                    try {
-                        $r.StdOut | ConvertFrom-Json
-                    } catch {
-                        [PSCustomObject]@{
-                            HostName = $r.Target
-                            Platform = 'Linux'
-                            Success  = $false
-                            Actions  = @()
-                            Failures = @(
-                                "Invalid JSON response: $($_.Exception.Message)"
-                                "STDOUT: $($r.StdOut)"
-                                "STDERR: $($r.StdErr)"
-                            )
-                        }
-                    }
-                } else {
+
+    $windowsPayload = [PSCustomObject]@{
+        allUsers = @($mobileData.AllUsers)
+        taskData = @($taskData)
+        MobileName = $MobileName
+        Disjoin = $disJoin
+        Bitlocker = $defaultPin
+
+    }
+
+    $winErrors = [System.Collections.Generic.List[object]]::new()
+    $rawWindows = Invoke-Command `
+        -ComputerName $mobileData.Windows `
+        -ScriptBlock $Script:WindowsDeployBlock `
+        -ArgumentList $windowsPayload `
+        -ErrorVariable winErrors `
+        -ErrorAction SilentlyContinue
+
+
+    $winResults = @(
+        foreach ($r in $rawWindows) {
+            [PSCustomObject]@{
+                HostName = $r.PSComputerName
+                Platform = 'Windows'
+                Success  = [bool]$r.Success
+                Actions  = @($r.Actions)
+                Failures = @($r.Failures)
+            }
+        }
+    )
+
+
+    foreach ($computer in $mobileData.Windows) {
+        $alreadyReturned = $winResults |
+            Where-Object HostName -eq $computer
+
+        if ($alreadyReturned) { continue }
+
+        $hostErrors = @(
+            $winErrors |
+                Where-Object {
+                    $_.TargetObject -eq $computer -or
+                    $_.OriginInfo.PSComputerName -eq $computer
+                }
+        )
+
+        $messages = if ($hostErrors) { 
+            @($hostErrors | ForEach-Object { $_.Exception.Message })
+        } else {
+            @('No result returned from remote host.')
+        }
+
+        $winResults += [PSCustomObject]@{
+            HostName = $computer
+            Platform = 'Windows'
+            Success  = $false
+            Actions  = @()
+            Failures = $messages
+        }
+    }
+
+    # Need the linux computers and the linux computers there for easy processing
+    # $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
+    
+    $linRes = @()
+    $linResults = @()
+    if ($mobileData.Linux.Count -gt 0) {
+        $curDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+        $DC = $curDomain.FindDomainController().Name
+        $linSplat = @{ allUsers = $mobileData.AllUsers }
+        if ($disjoin) {
+            $linSplat['disjoin'] = $Disjoin
+            $linSplat['b64kt'] = New-RemoteKeytabBase64 -DomainController $DC -Principal $env:USERNAME -SecurePassword  (ConvertTo-SecureString -AsPlainText -Force $secretPass)
+        }
+        # $linuxDeploy = Get-LinuxDeployScript -allUsers $mobileData.AllUsers -Disjoin:$Disjoin 
+        $linuxDeploy = Get-LinuxDeployScript @linSplat
+        $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $sshKeyPath
+    
+        $linResults = foreach ($r in $linRes) {
+            if ($r.ExitCode -eq 0 -and $r.StdOut) {
+                try {
+                    $r.StdOut | ConvertFrom-Json
+                } catch {
                     [PSCustomObject]@{
                         HostName = $r.Target
                         Platform = 'Linux'
                         Success  = $false
                         Actions  = @()
-                        Failures = @($r.StdErr)
+                        Failures = @(
+                            "Invalid JSON response: $($_.Exception.Message)"
+                            "STDOUT: $($r.StdOut)"
+                            "STDERR: $($r.StdErr)"
+                        )
                     }
                 }
+            } else {
+                [PSCustomObject]@{
+                    HostName = $r.Target
+                    Platform = 'Linux'
+                    Success  = $false
+                    Actions  = @()
+                    Failures = @($r.StdErr)
+                }
             }
-
-
         }
-        $results = @($winResults) + @($linResults)
-        Format-DeploymentResults -results $results -allUsers $mobileData.AllUsers
+
+
     }
+    $results = @($winResults) + @($linResults)
+    Format-DeploymentResults -results $results -allUsers $mobileData.AllUsers
+}
 
-    function Get-WindowsCollector-DiskSpace {
-        [CmdletBinding()]
-        param()
+function Get-WindowsCollector-DiskSpace {
+    [CmdletBinding()]
+    param()
 
-        return @'
+    return @'
 function Get-DiskSpace {
     param([int]$MinimumFreeGB = 20, [int]$MinimumFreePercent = 10)
 
@@ -3359,13 +3360,13 @@ function Get-DiskSpace {
 }
 '@
 
-    }
+}
 
-    function Get-WindowsCollector-Ivanti {
-        [CmdletBinding()]
-        param()
+function Get-WindowsCollector-Ivanti {
+    [CmdletBinding()]
+    param()
 
-        return @'
+    return @'
 function Get-IvantiInformation {
     $paths = @(
         'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
@@ -3404,13 +3405,13 @@ function Get-IvantiInformation {
     }
 }
 '@
-    }
+}
 
-    function Get-WindowsCollector-SecurityUpdates {
-        [CmdletBinding()]
-        param()
+function Get-WindowsCollector-SecurityUpdates {
+    [CmdletBinding()]
+    param()
 
-        return @'
+    return @'
 function Get-SecurityUpdateInformation {
     $session = New-Object -ComObject Microsoft.Update.Session
     $searcher = $session.CreateUpdateSearcher()
@@ -3435,22 +3436,22 @@ function Get-SecurityUpdateInformation {
     }
 }
 '@
-    }
+}
 
 
-    function Get-WindowsInformationBlock {
-        [CmdletBinding()]
-        param()
+function Get-WindowsInformationBlock {
+    [CmdletBinding()]
+    param()
 
-        $parts = [System.Collections.Generic.List[string]]::new()
+    $parts = [System.Collections.Generic.List[string]]::new()
 
-        # 1. Inject Child Functions
-        $parts.Add((Get-WindowsCollector-DiskSpace))
-        $parts.Add((Get-WindowsCollector-Ivanti))
-        $parts.Add((Get-WindowsCollector-SecurityUpdates))
+    # 1. Inject Child Functions
+    $parts.Add((Get-WindowsCollector-DiskSpace))
+    $parts.Add((Get-WindowsCollector-Ivanti))
+    $parts.Add((Get-WindowsCollector-SecurityUpdates))
 
-        # 2. Add System Baseline & Aggregator Script
-        $parts.Add(@'
+    # 2. Add System Baseline & Aggregator Script
+    $parts.Add(@'
 # OS Build to Friendly Name Mapping
 $osInfo = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion'
 $kernelString = "$($osInfo.LCUVer)"
@@ -3545,15 +3546,15 @@ $systemDisk  = $diskInfo.Volumes | Where-Object Drive -eq $systemDrive | Select-
 }
 '@)
 
-        return [scriptblock]::Create($parts -join "`n`n")
-    }
+    return [scriptblock]::Create($parts -join "`n`n")
+}
 
 
-    function Get-LinuxCollector-DiskSpace {
-        [CmdletBinding()]
-        param()
+function Get-LinuxCollector-DiskSpace {
+    [CmdletBinding()]
+    param()
 
-        return @'
+    return @'
 # Task: Disk Space
 
 disk_paths=('/')
@@ -3581,18 +3582,18 @@ disk_json="$(
         '
 )"
 '@
-    }
+}
 
 
-    function Get-LinuxInformationScript {
-        [CmdletBinding()]
-        param()
+function Get-LinuxInformationScript {
+    [CmdletBinding()]
+    param()
 
-        $parts = [System.Collections.Generic.List[string]]::new()
-        $parts.Add('#!/usr/bin/env bash')
-        $parts.Add((Get-LinuxCollector-DiskSpace))
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add('#!/usr/bin/env bash')
+    $parts.Add((Get-LinuxCollector-DiskSpace))
 
-        $parts.Add(@'
+    $parts.Add(@'
 hostname_value="$(hostname -s)"
 cores_value="$(nproc)"
 os=$(. /etc/os-release && echo "${ID^^}-${VERSION_ID}")
@@ -3669,119 +3670,119 @@ jq -n \
 '
 '@)
 
-        return $parts -join "`n`n"
-    }
+    return $parts -join "`n`n"
+}
 
-    # =====================================================================
-    # Main Multi-Platform Remote Orchestrator
-    # =====================================================================
+# =====================================================================
+# Main Multi-Platform Remote Orchestrator
+# =====================================================================
 
-    function Invoke-InformationCollector {
-        [CmdletBinding()]
-        param(
-            [Parameter()][array]$winComputers,
-            [Parameter()][array]$linComputers,
-            [Parameter()][string]$sshKeyPath
-        )
+function Invoke-InformationCollector {
+    [CmdletBinding()]
+    param(
+        [Parameter()][array]$winComputers,
+        [Parameter()][array]$linComputers,
+        [Parameter()][string]$sshKeyPath
+    )
 
-        $winResult = @()
-        $linResult = @()
+    $winResult = @()
+    $linResult = @()
 
-        # --- Windows Node Processing ---
-        if (@($winComputers).Count -gt 0) {
-            $winFails = [System.Collections.Generic.List[object]]::new()
-            $winScriptBlock = Get-WindowsInformationBlock
+    # --- Windows Node Processing ---
+    if (@($winComputers).Count -gt 0) {
+        $winFails = [System.Collections.Generic.List[object]]::new()
+        $winScriptBlock = Get-WindowsInformationBlock
 
-            $rawWindows = Invoke-Command `
-                -ComputerName $winComputers `
-                -ScriptBlock $winScriptBlock `
-                -ErrorAction SilentlyContinue `
-                -ErrorVariable winFails
+        $rawWindows = Invoke-Command `
+            -ComputerName $winComputers `
+            -ScriptBlock $winScriptBlock `
+            -ErrorAction SilentlyContinue `
+            -ErrorVariable winFails
 
-            $winResult = @(
-                foreach ($r in $rawWindows) {
-                    [PSCustomObject]@{
-                        HostName = $r.HostName
-                        Platform = $r.Platform
-                        Success  = $true
-                        Summary  = $r.Summary
-                        Details  = $r.Details
-                        Failures = @()
-                    }
-                }
-            )
-
-            foreach ($computer in $winComputers) {
-                if ($winResult.HostName -contains $computer) { continue }
-
-                $hostErrors = @($winFails | Where-Object { $_.TargetObject -eq $computer -or $_.OriginInfo.PSComputerName -eq $computer })
-                $winResult += [PSCustomObject]@{
-                    HostName = $computer
-                    Platform = 'Windows'
-                    Success  = $false
-                    Summary  = $null
-                    Details  = $null
-                    Failures = if ($hostErrors) { @($hostErrors.Exception.Message) } else { @('No result returned from remote host.') }
+        $winResult = @(
+            foreach ($r in $rawWindows) {
+                [PSCustomObject]@{
+                    HostName = $r.HostName
+                    Platform = $r.Platform
+                    Success  = $true
+                    Summary  = $r.Summary
+                    Details  = $r.Details
+                    Failures = @()
                 }
             }
+        )
+
+        foreach ($computer in $winComputers) {
+            if ($winResult.HostName -contains $computer) { continue }
+
+            $hostErrors = @($winFails | Where-Object { $_.TargetObject -eq $computer -or $_.OriginInfo.PSComputerName -eq $computer })
+            $winResult += [PSCustomObject]@{
+                HostName = $computer
+                Platform = 'Windows'
+                Success  = $false
+                Summary  = $null
+                Details  = $null
+                Failures = if ($hostErrors) { @($hostErrors.Exception.Message) } else { @('No result returned from remote host.') }
+            }
         }
-
-        # --- Linux Node Processing ---
-        if (@($linComputers).Count -gt 0) {
-            $bashScript = Get-LinuxInformationScript
-
-            $rawLinux = Invoke-Linux `
-                -Computers $linComputers `
-                -Script $bashScript `
-                -KeyPath $sshKeyPath
-
-            $linResult = @(
-                foreach ($r in $rawLinux) {
-                    if ($r.ExitCode -ne 0) {
-                        [PSCustomObject]@{
-                            HostName = $r.Target
-                            Platform = 'Linux'
-                            Success  = $false
-                            Summary  = $null
-                            Details  = $null
-                            Failures = @(if ($r.StdErr) { $r.StdErr } else { "SSH exited with code $($r.ExitCode)" })
-                        }
-                        continue
-                    }
-
-                    try {
-                        $p = $r.StdOut | ConvertFrom-Json
-                        [PSCustomObject]@{
-                            HostName = $p.HostName
-                            Platform = $p.Platform
-                            Success  = $true
-                            Summary  = $p.Summary
-                            Details  = $p.Details
-                            Failures = @()
-                        }
-                    } catch {
-                        [PSCustomObject]@{
-                            HostName = $r.Target
-                            Platform = 'Linux'
-                            Success  = $false
-                            Summary  = $null
-                            Details  = $null
-                            Failures = @("Invalid JSON response: $($_.Exception.Message)")
-                        }
-                    }
-                }
-            )
-        }
-
-        return @($winResult) + @($linResult)
     }
 
+    # --- Linux Node Processing ---
+    if (@($linComputers).Count -gt 0) {
+        $bashScript = Get-LinuxInformationScript
 
-    function Invoke-InformationCollectorOld {
-        [CmdletBinding()]
-        param([Parameter()][array]$winComputers, [array]$linComputers, [string]$sshKeyPath)
+        $rawLinux = Invoke-Linux `
+            -Computers $linComputers `
+            -Script $bashScript `
+            -KeyPath $sshKeyPath
 
-        $bashScript = @'
+        $linResult = @(
+            foreach ($r in $rawLinux) {
+                if ($r.ExitCode -ne 0) {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Summary  = $null
+                        Details  = $null
+                        Failures = @(if ($r.StdErr) { $r.StdErr } else { "SSH exited with code $($r.ExitCode)" })
+                    }
+                    continue
+                }
+
+                try {
+                    $p = $r.StdOut | ConvertFrom-Json
+                    [PSCustomObject]@{
+                        HostName = $p.HostName
+                        Platform = $p.Platform
+                        Success  = $true
+                        Summary  = $p.Summary
+                        Details  = $p.Details
+                        Failures = @()
+                    }
+                } catch {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Summary  = $null
+                        Details  = $null
+                        Failures = @("Invalid JSON response: $($_.Exception.Message)")
+                    }
+                }
+            }
+        )
+    }
+
+    return @($winResult) + @($linResult)
+}
+
+
+function Invoke-InformationCollectorOld {
+    [CmdletBinding()]
+    param([Parameter()][array]$winComputers, [array]$linComputers, [string]$sshKeyPath)
+
+    $bashScript = @'
 #!/usr/bin/env bash
 
 hostname_value="$(hostname -s)"
@@ -3886,717 +3887,717 @@ jq -n \
 '
 '@
 
-        $windowsInformationBlock = {
+    $windowsInformationBlock = {
 
-            # $os = Get-CimInstance Win32_OperatingSystem
-            $osInfo = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion'
-            $KernelString = "$($osInfo.LCUVer)"
-            function Get-WinVersion {
-                param($buildNumber)
+        # $os = Get-CimInstance Win32_OperatingSystem
+        $osInfo = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion'
+        $KernelString = "$($osInfo.LCUVer)"
+        function Get-WinVersion {
+            param($buildNumber)
 
-                $map = @{
-                    2600  = "WINXP"
-                    3790  = "WINXP64"
-                    6002  = "WINVISTA"
-                    7601  = "WIN7"
-                    9200  = "WIN8"
-                    9600  = "WIN8.1"
+            $map = @{
+                2600  = "WINXP"
+                3790  = "WINXP64"
+                6002  = "WINVISTA"
+                7601  = "WIN7"
+                9200  = "WIN8"
+                9600  = "WIN8.1"
 
-                    10240 = "WIN10-1507"
-                    10586 = "WIN10-1511"
-                    14393 = "WIN10-1607"
-                    15063 = "WIN10-1703"
-                    16299 = "WIN10-1709"
-                    17134 = "WIN10-1803"
-                    17763 = "WIN10-1809"
-                    18362 = "WIN10-1903"
-                    18363 = "WIN10-1909"
-                    19041 = "WIN10-2004"
-                    19042 = "WIN10-20H2"
-                    19043 = "WIN10-21H1"
-                    19044 = "WIN10-21H2"
-                    19045 = "WIN10-22H2"
+                10240 = "WIN10-1507"
+                10586 = "WIN10-1511"
+                14393 = "WIN10-1607"
+                15063 = "WIN10-1703"
+                16299 = "WIN10-1709"
+                17134 = "WIN10-1803"
+                17763 = "WIN10-1809"
+                18362 = "WIN10-1903"
+                18363 = "WIN10-1909"
+                19041 = "WIN10-2004"
+                19042 = "WIN10-20H2"
+                19043 = "WIN10-21H1"
+                19044 = "WIN10-21H2"
+                19045 = "WIN10-22H2"
 
-                    22000 = "WIN11-21H2"
-                    22621 = "WIN11-22H2"
-                    22631 = "WIN11-23H2"
-                    26100 = "WIN11-24H2"
-                    26200 = "WIN11-25H2"
-                    28000 = "WIN11-26H1"
-                    26300 = "WIN11-26H2"
-                }
-
-                if ($map.ContainsKey($buildNumber)) {
-                    "$($map[$buildNumber])-$buildNumber"
-                } else {
-                    "WIN-UNK-$buildNumber"
-                }
-            }
-            $osString = "$(Get-WinVersion ([int]$osInfo.currentBuildNumber))"
-
-            $cores = ( Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum
-
-            $packages = @(
-                Get-ItemProperty @(
-                    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-                    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-                    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-                ) -ErrorAction SilentlyContinue |
-                    Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
-                    Select-Object `
-                        DisplayName,
-                    DisplayVersion,
-                    Publisher,
-                    InstallDate |
-                    Sort-Object DisplayName -Unique
-            )
-
-            $ivantiVersion = (
-                Get-ItemProperty -Path @(
-                    'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
-                    'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
-                    'HKLM:\SOFTWARE\Wow6432Node\LANDesk\Inventory'
-                    'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
-                ) -ErrorAction SilentlyContinue |
-                    Select-Object -First 1 -ExpandProperty Version -ErrorAction SilentlyContinue
-            )
-
-            $symantecAvDefs = ( Get-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' -ErrorAction SilentlyContinue).DefSetVersion
-
-            $adminRotateScriptVersion = $null
-
-            $adminScriptExists = Get-ScheduledTask  -TaskName 'ADMIN-LAPS'  -ErrorAction SilentlyContinue
-
-            if ($adminScriptExists) {
-                $xml = schtasks /query /tn ADMIN-LAPS /xml
-
-                $versionMatch = ( $xml | Select-String -Pattern '<Version>(.*?)</Version>').Matches
-
-                if ($versionMatch.Count) {
-                    $adminRotateScriptVersion =
-                    $versionMatch[0].Groups[1].Value
-                }
+                22000 = "WIN11-21H2"
+                22621 = "WIN11-22H2"
+                22631 = "WIN11-23H2"
+                26100 = "WIN11-24H2"
+                26200 = "WIN11-25H2"
+                28000 = "WIN11-26H1"
+                26300 = "WIN11-26H2"
             }
 
-            $activation = Get-CimInstance `
-                -ClassName SoftwareLicensingProduct `
-                -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" `
-                -ErrorAction SilentlyContinue |
-                Where-Object PartialProductKey |
-                Select-Object -First 1 -ExpandProperty LicenseStatus
-
-            $licenseStatusMap = @{
-                0 = 'Unlicensed'
-                1 = 'Licensed'
-                2 = 'OOB Grace'
-                3 = 'OOT Grace'
-                4 = 'Non-Genuine Grace'
-                5 = 'Notification'
-                6 = 'Extended Grace'
-            }
-
-            $activationStatus = if ($null -ne $activation) {
-                $licenseStatusMap[[int]$activation]
+            if ($map.ContainsKey($buildNumber)) {
+                "$($map[$buildNumber])-$buildNumber"
             } else {
-                'Unknown'
+                "WIN-UNK-$buildNumber"
             }
+        }
+        $osString = "$(Get-WinVersion ([int]$osInfo.currentBuildNumber))"
 
-            $session  = New-Object -ComObject Microsoft.Update.Session
-            $searcher = $session.CreateUpdateSearcher()
+        $cores = ( Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum
 
-            $latestUpdates = @(
-                $searcher.QueryHistory(0, 10) |
-                    Select-Object `
-                        Title,
-                    Date,
-                    @{
-                        Name = 'Status'
-                        Expression = {
-                            switch ($_.ResultCode) {
-                                2 { 'Succeeded' }
-                                3 { 'Succeeded With Errors' }
-                                4 { 'Failed' }
-                                5 { 'Aborted' }
-                                default { "Other: $($_.ResultCode)" }
-                            }
+        $packages = @(
+            Get-ItemProperty @(
+                'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            ) -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
+                Select-Object `
+                    DisplayName,
+                DisplayVersion,
+                Publisher,
+                InstallDate |
+                Sort-Object DisplayName -Unique
+        )
+
+        $ivantiVersion = (
+            Get-ItemProperty -Path @(
+                'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
+                'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
+                'HKLM:\SOFTWARE\Wow6432Node\LANDesk\Inventory'
+                'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
+            ) -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty Version -ErrorAction SilentlyContinue
+        )
+
+        $symantecAvDefs = ( Get-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' -ErrorAction SilentlyContinue).DefSetVersion
+
+        $adminRotateScriptVersion = $null
+
+        $adminScriptExists = Get-ScheduledTask  -TaskName 'ADMIN-LAPS'  -ErrorAction SilentlyContinue
+
+        if ($adminScriptExists) {
+            $xml = schtasks /query /tn ADMIN-LAPS /xml
+
+            $versionMatch = ( $xml | Select-String -Pattern '<Version>(.*?)</Version>').Matches
+
+            if ($versionMatch.Count) {
+                $adminRotateScriptVersion =
+                $versionMatch[0].Groups[1].Value
+            }
+        }
+
+        $activation = Get-CimInstance `
+            -ClassName SoftwareLicensingProduct `
+            -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" `
+            -ErrorAction SilentlyContinue |
+            Where-Object PartialProductKey |
+            Select-Object -First 1 -ExpandProperty LicenseStatus
+
+        $licenseStatusMap = @{
+            0 = 'Unlicensed'
+            1 = 'Licensed'
+            2 = 'OOB Grace'
+            3 = 'OOT Grace'
+            4 = 'Non-Genuine Grace'
+            5 = 'Notification'
+            6 = 'Extended Grace'
+        }
+
+        $activationStatus = if ($null -ne $activation) {
+            $licenseStatusMap[[int]$activation]
+        } else {
+            'Unknown'
+        }
+
+        $session  = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+
+        $latestUpdates = @(
+            $searcher.QueryHistory(0, 10) |
+                Select-Object `
+                    Title,
+                Date,
+                @{
+                    Name = 'Status'
+                    Expression = {
+                        switch ($_.ResultCode) {
+                            2 { 'Succeeded' }
+                            3 { 'Succeeded With Errors' }
+                            4 { 'Failed' }
+                            5 { 'Aborted' }
+                            default { "Other: $($_.ResultCode)" }
                         }
                     }
+                }
+        )
+
+        $lastUpdate = $latestUpdates | Where-Object Status -like 'Succeeded*' | Sort-Object Date -Descending | Select-Object -First 1 -ExpandProperty Date
+
+        [PSCustomObject]@{
+            HostName = $env:COMPUTERNAME
+            Platform = $osString
+
+            Summary = [PSCustomObject]@{
+                Kernel             = $KernelString
+                Cores              = $cores
+                PackageCount       = $packages.Count
+                AdminRotateVersion = $adminRotateScriptVersion
+                AVDefs             = $symantecAvDefs
+                IvantiVersion      = $ivantiVersion
+                License            = $activationStatus
+                LastUpdate         = $lastUpdate
+            }
+
+            Details = [PSCustomObject]@{
+                Packages = $packages
+                Updates  = $latestUpdates
+            }
+        }
+    }
+    $winResult = @()
+    $linResult = @()
+
+    if (@($winComputers).Count -gt 0) {
+        $winFails = [System.Collections.Generic.List[object]]::new()
+
+        $rawWindows = Invoke-Command `
+            -ComputerName $winComputers `
+            -ScriptBlock $windowsInformationBlock `
+            -ErrorAction SilentlyContinue `
+            -ErrorVariable winFails
+
+        $winResult = @(
+            foreach ($r in $rawWindows) {
+                [PSCustomObject]@{
+                    HostName = $r.HostName
+                    Platform = $r.Platform
+                    Success  = $true
+                    Summary  = $r.Summary
+                    Details  = $r.Details
+                    Failures = @()
+                }
+            }
+        )
+
+        foreach ($computer in $winComputers) {
+            if ($winResult.HostName -contains $computer) {
+                continue
+            }
+
+            $hostErrors = @( $winFails | Where-Object { $_.TargetObject -eq $computer -or $_.OriginInfo.PSComputerName -eq $computer }
             )
 
-            $lastUpdate = $latestUpdates | Where-Object Status -like 'Succeeded*' | Sort-Object Date -Descending | Select-Object -First 1 -ExpandProperty Date
-
-            [PSCustomObject]@{
-                HostName = $env:COMPUTERNAME
-                Platform = $osString
-
-                Summary = [PSCustomObject]@{
-                    Kernel             = $KernelString
-                    Cores              = $cores
-                    PackageCount       = $packages.Count
-                    AdminRotateVersion = $adminRotateScriptVersion
-                    AVDefs             = $symantecAvDefs
-                    IvantiVersion      = $ivantiVersion
-                    License            = $activationStatus
-                    LastUpdate         = $lastUpdate
-                }
-
-                Details = [PSCustomObject]@{
-                    Packages = $packages
-                    Updates  = $latestUpdates
+            $winResult += [PSCustomObject]@{
+                HostName = $computer
+                Platform = 'Windows'
+                Success  = $false
+                Summary  = $null
+                Details  = $null
+                Failures = if ($hostErrors) {
+                    @($hostErrors.Exception.Message)
+                } else {
+                    @('No result returned from remote host.')
                 }
             }
         }
-        $winResult = @()
-        $linResult = @()
+    }
 
-        if (@($winComputers).Count -gt 0) {
-            $winFails = [System.Collections.Generic.List[object]]::new()
+    if (@($linComputers).Count -gt 0) {
+        $rawLinux = Invoke-Linux `
+            -Computers $linComputers `
+            -Script $bashScript `
+            -KeyPath $sshKeyPath
 
-            $rawWindows = Invoke-Command `
-                -ComputerName $winComputers `
-                -ScriptBlock $windowsInformationBlock `
-                -ErrorAction SilentlyContinue `
-                -ErrorVariable winFails
-
-            $winResult = @(
-                foreach ($r in $rawWindows) {
+        $linResult = @(
+            foreach ($r in $rawLinux) {
+                if ($r.ExitCode -ne 0) {
                     [PSCustomObject]@{
-                        HostName = $r.HostName
-                        Platform = $r.Platform
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Summary  = $null
+                        Details  = $null
+                        Failures = @(
+                            if ($r.StdErr) {
+                                $r.StdErr
+                            } else {
+                                "SSH exited with code $($r.ExitCode)"
+                            }
+                        )
+                    }
+
+                    continue
+                }
+
+                try {
+                    $p = $r.StdOut | ConvertFrom-Json
+
+                    [PSCustomObject]@{
+                        HostName = $p.HostName
+                        Platform = $p.Platform
                         Success  = $true
-                        Summary  = $r.Summary
-                        Details  = $r.Details
+                        Summary  = $p.Summary
+                        Details  = $p.Details
                         Failures = @()
                     }
-                }
-            )
-
-            foreach ($computer in $winComputers) {
-                if ($winResult.HostName -contains $computer) {
-                    continue
-                }
-
-                $hostErrors = @( $winFails | Where-Object { $_.TargetObject -eq $computer -or $_.OriginInfo.PSComputerName -eq $computer }
-                )
-
-                $winResult += [PSCustomObject]@{
-                    HostName = $computer
-                    Platform = 'Windows'
-                    Success  = $false
-                    Summary  = $null
-                    Details  = $null
-                    Failures = if ($hostErrors) {
-                        @($hostErrors.Exception.Message)
-                    } else {
-                        @('No result returned from remote host.')
+                } catch {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Summary  = $null
+                        Details  = $null
+                        Failures = @(
+                            "Invalid JSON response: $($_.Exception.Message)"
+                        )
                     }
                 }
             }
-        }
-
-        if (@($linComputers).Count -gt 0) {
-            $rawLinux = Invoke-Linux `
-                -Computers $linComputers `
-                -Script $bashScript `
-                -KeyPath $sshKeyPath
-
-            $linResult = @(
-                foreach ($r in $rawLinux) {
-                    if ($r.ExitCode -ne 0) {
-                        [PSCustomObject]@{
-                            HostName = $r.Target
-                            Platform = 'Linux'
-                            Success  = $false
-                            Summary  = $null
-                            Details  = $null
-                            Failures = @(
-                                if ($r.StdErr) {
-                                    $r.StdErr
-                                } else {
-                                    "SSH exited with code $($r.ExitCode)"
-                                }
-                            )
-                        }
-
-                        continue
-                    }
-
-                    try {
-                        $p = $r.StdOut | ConvertFrom-Json
-
-                        [PSCustomObject]@{
-                            HostName = $p.HostName
-                            Platform = $p.Platform
-                            Success  = $true
-                            Summary  = $p.Summary
-                            Details  = $p.Details
-                            Failures = @()
-                        }
-                    } catch {
-                        [PSCustomObject]@{
-                            HostName = $r.Target
-                            Platform = 'Linux'
-                            Success  = $false
-                            Summary  = $null
-                            Details  = $null
-                            Failures = @(
-                                "Invalid JSON response: $($_.Exception.Message)"
-                            )
-                        }
-                    }
-                }
-            )
-        }
-
-        return @($winResult) + @($linResult)
+        )
     }
 
+    return @($winResult) + @($linResult)
+}
 
-    function Show-TerminalMultiPicker {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)][string]$Title,
-            [Parameter(Mandatory = $true)][string[]]$Options
-        )
 
-        $esc = [char]27
-        $selectedIndices = [System.Collections.Generic.HashSet[int]]::new()
-        $currentIndex = 0
-        $total = $Options.Count
+function Show-TerminalMultiPicker {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string[]]$Options
+    )
 
-        Write-Host "`n=== $Title ===" -ForegroundColor Cyan
-        Write-Host "[Up/Down] Navigate | [Space] Toggle | [A] All | [C] Clear | [Enter] Confirm" -ForegroundColor DarkGray
+    $esc = [char]27
+    $selectedIndices = [System.Collections.Generic.HashSet[int]]::new()
+    $currentIndex = 0
+    $total = $Options.Count
 
-        # Pre-allocate buffer lines
-        1..$total | ForEach-Object { [Console]::WriteLine("") }
+    Write-Host "`n=== $Title ===" -ForegroundColor Cyan
+    Write-Host "[Up/Down] Navigate | [Space] Toggle | [A] All | [C] Clear | [Enter] Confirm" -ForegroundColor DarkGray
 
-        [Console]::CursorVisible = $false
+    # Pre-allocate buffer lines
+    1..$total | ForEach-Object { [Console]::WriteLine("") }
 
-        try {
-            while ($true) {
-                [Console]::Write("$esc[${total}A")
+    [Console]::CursorVisible = $false
 
-                for ($i = 0; $i -lt $total; $i++) {
-                    $isChecked = if ($selectedIndices.Contains($i)) { "[*]" 
-                    } else { "[ ]" 
-                    }
-                    $pointer   = if ($i -eq $currentIndex) { " > " 
-                    } else { "   " 
-                    }
+    try {
+        while ($true) {
+            [Console]::Write("$esc[${total}A")
 
-                    [Console]::Write("$esc[2K`r")
-
-                    if ($i -eq $currentIndex) {
-                        Write-Host "$pointer$isChecked $($Options[$i])" -ForegroundColor Black -BackgroundColor White
-                    } elseif ($selectedIndices.Contains($i)) {
-                        Write-Host "$pointer$isChecked $($Options[$i])" -ForegroundColor Green
-                    } else {
-                        Write-Host "$pointer$isChecked $($Options[$i])" -ForegroundColor Gray
-                    }
+            for ($i = 0; $i -lt $total; $i++) {
+                $isChecked = if ($selectedIndices.Contains($i)) { "[*]" 
+                } else { "[ ]" 
+                }
+                $pointer   = if ($i -eq $currentIndex) { " > " 
+                } else { "   " 
                 }
 
-                $key = [Console]::ReadKey($true)
+                [Console]::Write("$esc[2K`r")
 
-                switch ($key.Key) {
-                    'UpArrow' {
-                        $currentIndex = ($currentIndex - 1 + $total) % $total
-                    }
-                    'DownArrow' {
-                        $currentIndex = ($currentIndex + 1) % $total
-                    }
-                    'Spacebar' {
-                        if ($selectedIndices.Contains($currentIndex)) {
-                            [void]$selectedIndices.Remove($currentIndex)
-                        } else {
-                            [void]$selectedIndices.Add($currentIndex)
-                        }
-                    }
-                    'A' {
-                        0..($total - 1) | ForEach-Object { [void]$selectedIndices.Add($_) }
-                    }
-                    'C' {
-                        $selectedIndices.Clear()
-                    }
-                    'Enter' {
-                        # Wipe interactive menu
-                        [Console]::Write("$esc[${total}A")
-                        for ($i = 0; $i -lt $total; $i++) {
-                            [Console]::Write("$esc[2K`r`n")
-                        }
-                        [Console]::Write("$esc[${total}A$esc[2K`r")
-
-                        $picked = @($selectedIndices | Sort-Object | ForEach-Object { $Options[$_] })
-                        $summary = if ($picked.Count -gt 0) { $picked -join ';' 
-                        } else { "(none)" 
-                        }
-                        Write-Host "Selected Groups: $summary" -ForegroundColor Green
-                        return $picked
-                    }
-                }
-            }
-        } finally {
-            [Console]::CursorVisible = $true
-        }
-    }
-
-    function Show-TerminalSinglePicker {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)][string]$Title,
-            [Parameter(Mandatory = $true)][array]$Options,
-            [Parameter(Mandatory = $true)][string]$DisplayProperty
-        )
-
-        $esc = [char]27
-        $currentIndex = 0
-        $total = $Options.Count
-
-        Write-Host "`n=== $Title ===" -ForegroundColor Cyan
-        Write-Host "[Up/Down] Navigate | [Enter] Select Match" -ForegroundColor DarkGray
-
-        # Pre-allocate buffer lines
-        1..$total | ForEach-Object { [Console]::WriteLine("") }
-
-        [Console]::CursorVisible = $false
-
-        try {
-            while ($true) {
-                [Console]::Write("$esc[${total}A")
-
-                for ($i = 0; $i -lt $total; $i++) {
-                    $pointer = if ($i -eq $currentIndex) { " > " 
-                    } else { "   " 
-                    }
-                    $label   = $Options[$i].$DisplayProperty
-
-                    [Console]::Write("$esc[2K`r")
-
-                    if ($i -eq $currentIndex) {
-                        Write-Host "$pointer$label" -ForegroundColor Black -BackgroundColor White
-                    } else {
-                        Write-Host "$pointer$label" -ForegroundColor Gray
-                    }
-                }
-
-                $key = [Console]::ReadKey($true)
-
-                switch ($key.Key) {
-                    'UpArrow' {
-                        $currentIndex = ($currentIndex - 1 + $total) % $total
-                    }
-                    'DownArrow' {
-                        $currentIndex = ($currentIndex + 1) % $total
-                    }
-                    'Enter' {
-                        # Wipe interactive menu
-                        [Console]::Write("$esc[${total}A")
-                        for ($i = 0; $i -lt $total; $i++) {
-                            [Console]::Write("$esc[2K`r`n")
-                        }
-                        [Console]::Write("$esc[${total}A$esc[2K`r")
-
-                        $choice = $Options[$currentIndex]
-                        Write-Host "Resolved Match: $($choice.$DisplayProperty)" -ForegroundColor Green
-                        return $choice
-                    }
-                }
-            }
-        } finally {
-            [Console]::CursorVisible = $true
-        }
-    }
-
-    function Find-ADComputerMatch {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)][string]$SearchTerm
-        )
-
-        $searcher = [System.DirectoryServices.DirectorySearcher]::new()
-        $cleanTerm = [System.Security.SecurityElement]::Escape($SearchTerm.Trim())
-        $searcher.Filter = "(&(objectCategory=computer)(|(name=$cleanTerm)(sAMAccountName=$cleanTerm*)(name=*$cleanTerm*)))"
-        $searcher.PropertiesToLoad.AddRange(@('name', 'dNSHostName', 'operatingSystem'))
-
-        $results = @($searcher.FindAll())
-        $pMatches = foreach ($res in $results) {
-            $props = $res.Properties
-            [PSCustomObject]@{
-                Name            = if ($props.Contains('name')) { $props['name'][0] 
-                } else { '' 
-                }
-                DnsHostName     = if ($props.Contains('dnshostname')) { $props['dnshostname'][0] 
-                } else { '' 
-                }
-                OperatingSystem = if ($props.Contains('operatingsystem')) { $props['operatingsystem'][0] 
-                } else { '' 
-                }
-                DisplayText     = "$($props['name'][0]) ($($props['operatingsystem'][0]))"
-            }
-        }
-
-        return $pMatches
-    }
-
-    function Find-ADUserMatch {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)][string]$SearchTerm
-        )
-
-        $searcher = [System.DirectoryServices.DirectorySearcher]::new()
-        $cleanTerm = [System.Security.SecurityElement]::Escape($SearchTerm.Trim())
-        $searcher.Filter = "(&(objectCategory=person)(objectClass=user)(|(sAMAccountName=$cleanTerm)(sAMAccountName=*$cleanTerm*)(displayName=*$cleanTerm*)(mail=*$cleanTerm*)))"
-        $searcher.PropertiesToLoad.AddRange(@('sAMAccountName', 'displayName', 'givenName', 'sn', 'mail'))
-
-        $results = @($searcher.FindAll())
-        $pMatches = foreach ($res in $results) {
-            $props = $res.Properties
-            $first = if ($props.Contains('givenName')) { $props['givenName'][0] 
-            } else { '' 
-            }
-            $last  = if ($props.Contains('sn')) { $props['sn'][0] 
-            } else { '' 
-            }
-            $combined = "$first $last".Trim()
-
-            $resolvedName = if ($props.Contains('displayName') -and -not [string]::IsNullOrWhiteSpace($props['displayName'][0])) {
-                $props['displayName'][0]
-            } elseif (-not [string]::IsNullOrWhiteSpace($combined)) {
-                $combined
-            } else {
-                ''
-            }
-
-            $sam = if ($props.Contains('samaccountname')) { $props['samaccountname'][0] 
-            } else { '' 
-            }
-
-            [PSCustomObject]@{
-                UserName    = $sam
-                FullName    = $resolvedName
-                Email       = if ($props.Contains('mail')) { $props['mail'][0] 
-                } else { '' 
-                }
-                DisplayText = "$sam - $resolvedName"
-            }
-        }
-
-        return $pMatches
-    }
-
-    function New-MobileDeployment {
-        [CmdletBinding()]
-        param(
-            [string]$mobilePath = $Script:Config.MobileEntries
-
-        )
-        $mobileName = Read-Host -Prompt "Enter a Mobile Name"
-        if ([string]::IsNullOrWhiteSpace($mobileName)) {
-            Write-Warning "Mobile Name cannot be empty."
-            return
-        }
-
-        # Available group tags for terminal multi-select
-    
-        $availableGroups = $script:GroupMetadata.Keys | Where-Object {$Script:GroupMetadata[$_].Selectable} | ForEach-Object { $_.ToString() }
-
-        # Computer Entry & Disambiguation
-        $ResolveComputerInput = {
-            param([string]$PlatformLabel)
-        
-            $collected = [System.Collections.Generic.List[string]]::new()
-            Write-Host "`n=== Enter $PlatformLabel Computers ===" -ForegroundColor Cyan
-        
-            do {
-                $raw = (Read-Host -Prompt "Enter $PlatformLabel host name (Enter to finish)").Trim()
-                if ([string]::IsNullOrWhiteSpace($raw)) { break 
-                }
-
-                $pMatches = @(Find-ADComputerMatch -SearchTerm $raw)
-
-                # 1. Exact match
-                $exact = $pMatches | Where-Object { $_.Name -ieq $raw }
-                if ($exact) {
-                    Write-Host "Found AD Computer: $($exact.Name)" -ForegroundColor Green
-                    $collected.Add($exact.Name)
-                    continue
-                }
-
-                # 2. Ambiguous match -> Terminal single-select picker
-                if ($pMatches.Count -gt 1) {
-                    $picked = Show-TerminalSinglePicker `
-                        -Title "Multiple $PlatformLabel AD Matches for '$raw'" `
-                        -Options $pMatches `
-                        -DisplayProperty "DisplayText"
-                
-                    if ($picked) {
-                        $collected.Add($picked.Name)
-                        continue
-                    }
-                } elseif ($pMatches.Count -eq 1) {
-                    $confirmMatch = Read-Host -Prompt "Did you mean '$($matches[0].Name)'? (y/n)"
-                    if ($confirmMatch -match '^(y|yes)$') {
-                        $collected.Add($pMatches[0].Name)
-                        continue
-                    }
-                }
-
-                # 3. Not found in AD -> Manual confirmation
-                Write-Warning "Host '$raw' was not found in Active Directory."
-                $confirm = Read-Host -Prompt "Add '$raw' as unjoined $PlatformLabel host? (y/n)"
-                if ($confirm -match '^(y|yes)$') {
-                    $collected.Add($raw.ToUpper())
+                if ($i -eq $currentIndex) {
+                    Write-Host "$pointer$isChecked $($Options[$i])" -ForegroundColor Black -BackgroundColor White
+                } elseif ($selectedIndices.Contains($i)) {
+                    Write-Host "$pointer$isChecked $($Options[$i])" -ForegroundColor Green
                 } else {
-                    Write-Host "Skipping '$raw'." -ForegroundColor Yellow
+                    Write-Host "$pointer$isChecked $($Options[$i])" -ForegroundColor Gray
                 }
-
-            } while ($true)
-
-            return $collected.ToArray()
-        }
-
-        # Collect Computers
-        $windowsComputers = & $ResolveComputerInput -PlatformLabel "Windows"
-        $linuxComputers   = & $ResolveComputerInput -PlatformLabel "Linux"
-
-        # Collect Users
-        $users = [System.Collections.Generic.List[PSCustomObject]]::new()
-        Write-Host "`n=== Enter Users ===" -ForegroundColor Cyan
-
-        do {
-            $rawUser = (Read-Host -Prompt "Enter username/search term (Enter to finish)").Trim()
-            if ([string]::IsNullOrWhiteSpace($rawUser)) { break 
             }
 
-            $resolvedUsername = $rawUser
-            $resolvedFullName = ''
-            $isDomainUser = $false
+            $key = [Console]::ReadKey($true)
 
-            $userMatches = @(Find-ADUserMatch -SearchTerm $rawUser)
+            switch ($key.Key) {
+                'UpArrow' {
+                    $currentIndex = ($currentIndex - 1 + $total) % $total
+                }
+                'DownArrow' {
+                    $currentIndex = ($currentIndex + 1) % $total
+                }
+                'Spacebar' {
+                    if ($selectedIndices.Contains($currentIndex)) {
+                        [void]$selectedIndices.Remove($currentIndex)
+                    } else {
+                        [void]$selectedIndices.Add($currentIndex)
+                    }
+                }
+                'A' {
+                    0..($total - 1) | ForEach-Object { [void]$selectedIndices.Add($_) }
+                }
+                'C' {
+                    $selectedIndices.Clear()
+                }
+                'Enter' {
+                    # Wipe interactive menu
+                    [Console]::Write("$esc[${total}A")
+                    for ($i = 0; $i -lt $total; $i++) {
+                        [Console]::Write("$esc[2K`r`n")
+                    }
+                    [Console]::Write("$esc[${total}A$esc[2K`r")
+
+                    $picked = @($selectedIndices | Sort-Object | ForEach-Object { $Options[$_] })
+                    $summary = if ($picked.Count -gt 0) { $picked -join ';' 
+                    } else { "(none)" 
+                    }
+                    Write-Host "Selected Groups: $summary" -ForegroundColor Green
+                    return $picked
+                }
+            }
+        }
+    } finally {
+        [Console]::CursorVisible = $true
+    }
+}
+
+function Show-TerminalSinglePicker {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][array]$Options,
+        [Parameter(Mandatory = $true)][string]$DisplayProperty
+    )
+
+    $esc = [char]27
+    $currentIndex = 0
+    $total = $Options.Count
+
+    Write-Host "`n=== $Title ===" -ForegroundColor Cyan
+    Write-Host "[Up/Down] Navigate | [Enter] Select Match" -ForegroundColor DarkGray
+
+    # Pre-allocate buffer lines
+    1..$total | ForEach-Object { [Console]::WriteLine("") }
+
+    [Console]::CursorVisible = $false
+
+    try {
+        while ($true) {
+            [Console]::Write("$esc[${total}A")
+
+            for ($i = 0; $i -lt $total; $i++) {
+                $pointer = if ($i -eq $currentIndex) { " > " 
+                } else { "   " 
+                }
+                $label   = $Options[$i].$DisplayProperty
+
+                [Console]::Write("$esc[2K`r")
+
+                if ($i -eq $currentIndex) {
+                    Write-Host "$pointer$label" -ForegroundColor Black -BackgroundColor White
+                } else {
+                    Write-Host "$pointer$label" -ForegroundColor Gray
+                }
+            }
+
+            $key = [Console]::ReadKey($true)
+
+            switch ($key.Key) {
+                'UpArrow' {
+                    $currentIndex = ($currentIndex - 1 + $total) % $total
+                }
+                'DownArrow' {
+                    $currentIndex = ($currentIndex + 1) % $total
+                }
+                'Enter' {
+                    # Wipe interactive menu
+                    [Console]::Write("$esc[${total}A")
+                    for ($i = 0; $i -lt $total; $i++) {
+                        [Console]::Write("$esc[2K`r`n")
+                    }
+                    [Console]::Write("$esc[${total}A$esc[2K`r")
+
+                    $choice = $Options[$currentIndex]
+                    Write-Host "Resolved Match: $($choice.$DisplayProperty)" -ForegroundColor Green
+                    return $choice
+                }
+            }
+        }
+    } finally {
+        [Console]::CursorVisible = $true
+    }
+}
+
+function Find-ADComputerMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SearchTerm
+    )
+
+    $searcher = [System.DirectoryServices.DirectorySearcher]::new()
+    $cleanTerm = [System.Security.SecurityElement]::Escape($SearchTerm.Trim())
+    $searcher.Filter = "(&(objectCategory=computer)(|(name=$cleanTerm)(sAMAccountName=$cleanTerm*)(name=*$cleanTerm*)))"
+    $searcher.PropertiesToLoad.AddRange(@('name', 'dNSHostName', 'operatingSystem'))
+
+    $results = @($searcher.FindAll())
+    $pMatches = foreach ($res in $results) {
+        $props = $res.Properties
+        [PSCustomObject]@{
+            Name            = if ($props.Contains('name')) { $props['name'][0] 
+            } else { '' 
+            }
+            DnsHostName     = if ($props.Contains('dnshostname')) { $props['dnshostname'][0] 
+            } else { '' 
+            }
+            OperatingSystem = if ($props.Contains('operatingsystem')) { $props['operatingsystem'][0] 
+            } else { '' 
+            }
+            DisplayText     = "$($props['name'][0]) ($($props['operatingsystem'][0]))"
+        }
+    }
+
+    return $pMatches
+}
+
+function Find-ADUserMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SearchTerm
+    )
+
+    $searcher = [System.DirectoryServices.DirectorySearcher]::new()
+    $cleanTerm = [System.Security.SecurityElement]::Escape($SearchTerm.Trim())
+    $searcher.Filter = "(&(objectCategory=person)(objectClass=user)(|(sAMAccountName=$cleanTerm)(sAMAccountName=*$cleanTerm*)(displayName=*$cleanTerm*)(mail=*$cleanTerm*)))"
+    $searcher.PropertiesToLoad.AddRange(@('sAMAccountName', 'displayName', 'givenName', 'sn', 'mail'))
+
+    $results = @($searcher.FindAll())
+    $pMatches = foreach ($res in $results) {
+        $props = $res.Properties
+        $first = if ($props.Contains('givenName')) { $props['givenName'][0] 
+        } else { '' 
+        }
+        $last  = if ($props.Contains('sn')) { $props['sn'][0] 
+        } else { '' 
+        }
+        $combined = "$first $last".Trim()
+
+        $resolvedName = if ($props.Contains('displayName') -and -not [string]::IsNullOrWhiteSpace($props['displayName'][0])) {
+            $props['displayName'][0]
+        } elseif (-not [string]::IsNullOrWhiteSpace($combined)) {
+            $combined
+        } else {
+            ''
+        }
+
+        $sam = if ($props.Contains('samaccountname')) { $props['samaccountname'][0] 
+        } else { '' 
+        }
+
+        [PSCustomObject]@{
+            UserName    = $sam
+            FullName    = $resolvedName
+            Email       = if ($props.Contains('mail')) { $props['mail'][0] 
+            } else { '' 
+            }
+            DisplayText = "$sam - $resolvedName"
+        }
+    }
+
+    return $pMatches
+}
+
+function New-MobileDeployment {
+    [CmdletBinding()]
+    param(
+        [string]$mobilePath = $Script:Config.MobileEntries
+
+    )
+    $mobileName = Read-Host -Prompt "Enter a Mobile Name"
+    if ([string]::IsNullOrWhiteSpace($mobileName)) {
+        Write-Warning "Mobile Name cannot be empty."
+        return
+    }
+
+    # Available group tags for terminal multi-select
+    
+    $availableGroups = $script:GroupMetadata.Keys | Where-Object {$Script:GroupMetadata[$_].Selectable} | ForEach-Object { $_.ToString() }
+
+    # Computer Entry & Disambiguation
+    $ResolveComputerInput = {
+        param([string]$PlatformLabel)
+        
+        $collected = [System.Collections.Generic.List[string]]::new()
+        Write-Host "`n=== Enter $PlatformLabel Computers ===" -ForegroundColor Cyan
+        
+        do {
+            $raw = (Read-Host -Prompt "Enter $PlatformLabel host name (Enter to finish)").Trim()
+            if ([string]::IsNullOrWhiteSpace($raw)) { break 
+            }
+
+            $pMatches = @(Find-ADComputerMatch -SearchTerm $raw)
 
             # 1. Exact match
-            $exactUser = $userMatches | Where-Object { $_.UserName -ieq $rawUser }
-            if ($exactUser) {
-                $resolvedUsername = $exactUser.UserName
-                $resolvedFullName = $exactUser.FullName
-                $isDomainUser = $true
-                Write-Host "Found AD User: $resolvedFullName ($resolvedUsername)" -ForegroundColor Green
+            $exact = $pMatches | Where-Object { $_.Name -ieq $raw }
+            if ($exact) {
+                Write-Host "Found AD Computer: $($exact.Name)" -ForegroundColor Green
+                $collected.Add($exact.Name)
+                continue
             }
-            # 2. Ambiguous matches -> Terminal single-select picker
-            elseif ($userMatches.Count -gt 1) {
-                $pickedUser = Show-TerminalSinglePicker `
-                    -Title "Multiple User Matches for '$rawUser'" `
-                    -Options $userMatches `
+
+            # 2. Ambiguous match -> Terminal single-select picker
+            if ($pMatches.Count -gt 1) {
+                $picked = Show-TerminalSinglePicker `
+                    -Title "Multiple $PlatformLabel AD Matches for '$raw'" `
+                    -Options $pMatches `
                     -DisplayProperty "DisplayText"
-
-                if ($pickedUser) {
-                    $resolvedUsername = $pickedUser.UserName
-                    $resolvedFullName = $pickedUser.FullName
-                    $isDomainUser = $true
-                }
-            }
-            # 3. Single partial match
-            elseif ($userMatches.Count -eq 1) {
-                $confirmCandidate = Read-Host -Prompt "Did you mean '$($userMatches[0].FullName)' ($($userMatches[0].UserName))? (y/n)"
-                if ($confirmCandidate -match '^(y|yes)$') {
-                    $resolvedUsername = $userMatches[0].UserName
-                    $resolvedFullName = $userMatches[0].FullName
-                    $isDomainUser = $true
-                }
-            }
-
-            # 4. Non-domain fallback
-            if (-not $isDomainUser) {
-                Write-Warning "User '$rawUser' was not found in Active Directory."
-                $confirmNonDomain = Read-Host -Prompt "Add '$rawUser' as a non-domain user? (y/n)"
-                if ($confirmNonDomain -notmatch '^(y|yes)$') {
-                    Write-Host "Skipping '$rawUser'." -ForegroundColor Yellow
+                
+                if ($picked) {
+                    $collected.Add($picked.Name)
                     continue
                 }
-                $manualFull = Read-Host -Prompt "Enter Full Name for '$rawUser' (leave blank if none)"
-                $resolvedFullName = if (-not [string]::IsNullOrWhiteSpace($manualFull)) { $manualFull.Trim() 
-                } else { '' 
+            } elseif ($pMatches.Count -eq 1) {
+                $confirmMatch = Read-Host -Prompt "Did you mean '$($matches[0].Name)'? (y/n)"
+                if ($confirmMatch -match '^(y|yes)$') {
+                    $collected.Add($pMatches[0].Name)
+                    continue
                 }
             }
 
-            # Terminal Multi-Select Checklist for Groups
-            $pickedGroups = Show-TerminalMultiPicker `
-                -Title "Select Group Tags for '$resolvedUsername' ($resolvedFullName) (local is always made)" `
-                -Options $availableGroups
-
-
-            $groupString = $pickedGroups -join ';'
-
-            $users.Add([PSCustomObject]@{
-                    username = $resolvedUsername
-                    groups   = $groupString
-                    fullname = $resolvedFullName
-                })
+            # 3. Not found in AD -> Manual confirmation
+            Write-Warning "Host '$raw' was not found in Active Directory."
+            $confirm = Read-Host -Prompt "Add '$raw' as unjoined $PlatformLabel host? (y/n)"
+            if ($confirm -match '^(y|yes)$') {
+                $collected.Add($raw.ToUpper())
+            } else {
+                Write-Host "Skipping '$raw'." -ForegroundColor Yellow
+            }
 
         } while ($true)
 
-        $mobile = [PSCustomObject]@{ 
-            MobileName = $mobileName
-            WindowsComputers = $windowsComputers
-            LinuxComputers = $linuxComputers
-            Users = $users.ToArray()
-
-        }
-        # Output Structured Deployment Object
-        Write-MobileFile  -NewMobile  $mobile -mobilesPath $mobilePath
+        return $collected.ToArray()
     }
 
+    # Collect Computers
+    $windowsComputers = & $ResolveComputerInput -PlatformLabel "Windows"
+    $linuxComputers   = & $ResolveComputerInput -PlatformLabel "Linux"
 
-    function Write-MobileFile {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)]
-            [PSCustomObject]$newMobile,
-            [Parameter(Mandatory = $false)]
-            [ValidateNotNullOrEmpty()]
-            [string]$mobilesPath   = $script:Config.MobileEntries
-        )
+    # Collect Users
+    $users = [System.Collections.Generic.List[PSCustomObject]]::new()
+    Write-Host "`n=== Enter Users ===" -ForegroundColor Cyan
 
-        Write-Host $Script:Config.Keys
-        Write-Host $newMobile.MobileName
-        Write-Host $mobilesPath
-        $outPath = Join-Path $Script:Config.MobileEntries $newMobile.MobileName
-        Write-Host "[+] Mobile getting written to $outpath"
-        $lines = [System.Collections.Generic.List[string]]::new()
+    do {
+        $rawUser = (Read-Host -Prompt "Enter username/search term (Enter to finish)").Trim()
+        if ([string]::IsNullOrWhiteSpace($rawUser)) { break 
+        }
 
-        # [windows]
-        $lines.Add('[windows]')
-        foreach ($c in $newMobile.WindowsComputers) {
-            if (-not [string]::IsNullOrWhiteSpace($c)) {
-                $lines.Add($c)
+        $resolvedUsername = $rawUser
+        $resolvedFullName = ''
+        $isDomainUser = $false
+
+        $userMatches = @(Find-ADUserMatch -SearchTerm $rawUser)
+
+        # 1. Exact match
+        $exactUser = $userMatches | Where-Object { $_.UserName -ieq $rawUser }
+        if ($exactUser) {
+            $resolvedUsername = $exactUser.UserName
+            $resolvedFullName = $exactUser.FullName
+            $isDomainUser = $true
+            Write-Host "Found AD User: $resolvedFullName ($resolvedUsername)" -ForegroundColor Green
+        }
+        # 2. Ambiguous matches -> Terminal single-select picker
+        elseif ($userMatches.Count -gt 1) {
+            $pickedUser = Show-TerminalSinglePicker `
+                -Title "Multiple User Matches for '$rawUser'" `
+                -Options $userMatches `
+                -DisplayProperty "DisplayText"
+
+            if ($pickedUser) {
+                $resolvedUsername = $pickedUser.UserName
+                $resolvedFullName = $pickedUser.FullName
+                $isDomainUser = $true
+            }
+        }
+        # 3. Single partial match
+        elseif ($userMatches.Count -eq 1) {
+            $confirmCandidate = Read-Host -Prompt "Did you mean '$($userMatches[0].FullName)' ($($userMatches[0].UserName))? (y/n)"
+            if ($confirmCandidate -match '^(y|yes)$') {
+                $resolvedUsername = $userMatches[0].UserName
+                $resolvedFullName = $userMatches[0].FullName
+                $isDomainUser = $true
             }
         }
 
-        # [linux]
-        $lines.Add('[linux]')
-        foreach ($c in $newMobile.LinuxComputers) {
-            if (-not [string]::IsNullOrWhiteSpace($c)) {
-                $lines.Add($c)
+        # 4. Non-domain fallback
+        if (-not $isDomainUser) {
+            Write-Warning "User '$rawUser' was not found in Active Directory."
+            $confirmNonDomain = Read-Host -Prompt "Add '$rawUser' as a non-domain user? (y/n)"
+            if ($confirmNonDomain -notmatch '^(y|yes)$') {
+                Write-Host "Skipping '$rawUser'." -ForegroundColor Yellow
+                continue
+            }
+            $manualFull = Read-Host -Prompt "Enter Full Name for '$rawUser' (leave blank if none)"
+            $resolvedFullName = if (-not [string]::IsNullOrWhiteSpace($manualFull)) { $manualFull.Trim() 
+            } else { '' 
             }
         }
 
-        # [users]
-        $lines.Add('[users]')
-        $lines.Add('username,groups,fullname')
-        foreach ($u in $newMobile.Users) {
-            $lines.Add("$($u.username),$($u.groups),$($u.fullname)")
-        }
+        # Terminal Multi-Select Checklist for Groups
+        $pickedGroups = Show-TerminalMultiPicker `
+            -Title "Select Group Tags for '$resolvedUsername' ($resolvedFullName) (local is always made)" `
+            -Options $availableGroups
 
-        # Write out without BOM issues or extra blank lines
-        [System.IO.File]::WriteAllLines($outPath, $lines)
+
+        $groupString = $pickedGroups -join ';'
+
+        $users.Add([PSCustomObject]@{
+                username = $resolvedUsername
+                groups   = $groupString
+                fullname = $resolvedFullName
+            })
+
+    } while ($true)
+
+    $mobile = [PSCustomObject]@{ 
+        MobileName = $mobileName
+        WindowsComputers = $windowsComputers
+        LinuxComputers = $linuxComputers
+        Users = $users.ToArray()
+
+    }
+    # Output Structured Deployment Object
+    Write-MobileFile  -NewMobile  $mobile -mobilesPath $mobilePath
+}
+
+
+function Write-MobileFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [PSCustomObject]$newMobile,
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$mobilesPath   = $script:Config.MobileEntries
+    )
+
+    Write-Host $Script:Config.Keys
+    Write-Host $newMobile.MobileName
+    Write-Host $mobilesPath
+    $outPath = Join-Path $Script:Config.MobileEntries $newMobile.MobileName
+    Write-Host "[+] Mobile getting written to $outpath"
+    $lines = [System.Collections.Generic.List[string]]::new()
+
+    # [windows]
+    $lines.Add('[windows]')
+    foreach ($c in $newMobile.WindowsComputers) {
+        if (-not [string]::IsNullOrWhiteSpace($c)) {
+            $lines.Add($c)
+        }
     }
 
+    # [linux]
+    $lines.Add('[linux]')
+    foreach ($c in $newMobile.LinuxComputers) {
+        if (-not [string]::IsNullOrWhiteSpace($c)) {
+            $lines.Add($c)
+        }
+    }
 
-    function New-LinuxUnregisterTask-LogService {
-        [CmdletBinding()]
-        param()
+    # [users]
+    $lines.Add('[users]')
+    $lines.Add('username,groups,fullname')
+    foreach ($u in $newMobile.Users) {
+        $lines.Add("$($u.username),$($u.groups),$($u.fullname)")
+    }
 
-        return @'
+    # Write out without BOM issues or extra blank lines
+    [System.IO.File]::WriteAllLines($outPath, $lines)
+}
+
+
+function New-LinuxUnregisterTask-LogService {
+    [CmdletBinding()]
+    param()
+
+    return @'
 # Task: Remove Log Rotation Service
 
 mobile_units=(
@@ -4640,26 +4641,26 @@ else
     record_action 'ScheduledTask' 'mobile-logrotate' 'Failed'
 fi
 '@
-    }
+}
 
-    function New-LinuxUnregisterTask-Users {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)]
-            [array]$Users,
+function New-LinuxUnregisterTask-Users {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [array]$Users,
 
-            [bool]$Archive = $true,
+        [bool]$Archive = $true,
 
-            [string]$HomeBase = '/mobiles/home',
+        [string]$HomeBase = '/mobiles/home',
 
-            [string]$ArchiveRoot = '/mobiles/archive'
-        )
+        [string]$ArchiveRoot = '/mobiles/archive'
+    )
 
-        $blocks = [System.Collections.Generic.List[string]]::new()
+    $blocks = [System.Collections.Generic.List[string]]::new()
 
-        $archiveValue = $Archive.ToString().ToLowerInvariant()
+    $archiveValue = $Archive.ToString().ToLowerInvariant()
 
-        $blocks.Add(@"
+    $blocks.Add(@"
 archive=$archiveValue
 mobileHome='$HomeBase'
 archiveRoot='$ArchiveRoot'
@@ -4678,10 +4679,10 @@ if [[ "`$archive" == true ]]; then
 fi
 "@)
 
-        foreach ($u in $Users) {
-            $name = $u.LinuxName
+    foreach ($u in $Users) {
+        $name = $u.LinuxName
 
-            $blocks.Add(@"
+        $blocks.Add(@"
 # Task: Remove User: $name
 
 username='$name'
@@ -4731,35 +4732,35 @@ else
     fi
 fi
 "@)
-        }
-
-        return ($blocks -join "`n`n")
     }
 
-    function Get-LinuxUnregisterScript {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)]
-            [array]$AllUsers,
+    return ($blocks -join "`n`n")
+}
 
-            [bool]$Archive = $true,
+function Get-LinuxUnregisterScript {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [array]$AllUsers,
 
-            [switch]$SkipLogrotate
-        )
+        [bool]$Archive = $true,
 
-        #
-        # Resolve canonical Linux account for each user.
-        #
-        $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName)) {
-            $group.Group |
-                Where-Object { $null -ne $_.LinuxAccountType } |
-                Sort-Object {
-                    $script:GroupMetadata[$_.GroupType].LinuxPriority
-                } -Descending |
-                Select-Object -First 1
-        }
+        [switch]$SkipLogrotate
+    )
 
-        $header = @'
+    #
+    # Resolve canonical Linux account for each user.
+    #
+    $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName)) {
+        $group.Group |
+            Where-Object { $null -ne $_.LinuxAccountType } |
+            Sort-Object {
+                $script:GroupMetadata[$_.GroupType].LinuxPriority
+            } -Descending |
+            Select-Object -First 1
+    }
+
+    $header = @'
 #!/usr/bin/env bash
 set -o pipefail
 
@@ -4798,24 +4799,24 @@ array_to_json() {
 }
 '@
 
-        $tasks = [System.Collections.Generic.List[string]]::new()
-        $tasks.Add($header)
+    $tasks = [System.Collections.Generic.List[string]]::new()
+    $tasks.Add($header)
 
-        if ($linuxUsers) {
-            $tasks.Add(
-                (New-LinuxUnregisterTask-Users `
-                    -Users $linuxUsers `
-                    -Archive $Archive)
-            )
-        }
+    if ($linuxUsers) {
+        $tasks.Add(
+            (New-LinuxUnregisterTask-Users `
+                -Users $linuxUsers `
+                -Archive $Archive)
+        )
+    }
 
-        if (-not $SkipLogrotate) {
-            $tasks.Add(
-                (New-LinuxUnregisterTask-LogService)
-            )
-        }
+    if (-not $SkipLogrotate) {
+        $tasks.Add(
+            (New-LinuxUnregisterTask-LogService)
+        )
+    }
 
-        $footer = @'
+    $footer = @'
 # --- Result Serialization ---
 
 final_actions="[$(IFS=,; echo "${actions_json[*]}")]"
@@ -4835,155 +4836,155 @@ jq -n \
     }'
 '@
 
-        $tasks.Add($footer)
+    $tasks.Add($footer)
 
-        return ($tasks -join "`n`n")
-    }
+    return ($tasks -join "`n`n")
+}
 
-    function Unregister-Deployment {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true, Position = 0)]
-            [string]$MobileName,
-            [Parameter()]
-            [string]$sshKeyName = $Script:Config.sshKeyName,
-            [string]$sshKeyPath = $Script:Config.SSHKeyPath,
-            [string]$certName = $Script:Config.certName,
-            [string]$adminRoot = $Script:Config.adminRoot,
-            [string]$defaultPass = $Script:Config.defaultPass, 
-            [string]$defaultPin = $Script:Config.encryptionPin,
-            [string]$oldEncryption = $Script:Config.curLuks,
-            [string]$mobileDump = $Script:Config.mobileDump,
-            [Parameter()]
-            [switch]$archive
-        )
-        $mobileData = Get-MobileData -MobileName $MobileName 
-        $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
+function Unregister-Deployment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [string]$MobileName,
+        [Parameter()]
+        [string]$sshKeyName = $Script:Config.sshKeyName,
+        [string]$sshKeyPath = $Script:Config.SSHKeyPath,
+        [string]$certName = $Script:Config.certName,
+        [string]$adminRoot = $Script:Config.adminRoot,
+        [string]$defaultPass = $Script:Config.defaultPass, 
+        [string]$defaultPin = $Script:Config.encryptionPin,
+        [string]$oldEncryption = $Script:Config.curLuks,
+        [string]$mobileDump = $Script:Config.mobileDump,
+        [Parameter()]
+        [switch]$archive
+    )
+    $mobileData = Get-MobileData -MobileName $MobileName 
+    $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
+    $winErrors = [System.Collections.Generic.List[object]]::new()
+
+    $winResults = @()
+    $linResults = @()
+
+    if (@($mobileData.Windows).Count -gt 0) {
         $winErrors = [System.Collections.Generic.List[object]]::new()
-
-        $winResults = @()
-        $linResults = @()
-
-        if (@($mobileData.Windows).Count -gt 0) {
-            $winErrors = [System.Collections.Generic.List[object]]::new()
         
-            $payload = [PSCustomObject]@{
-                MobileName = $MobileName
-                TaskData = $taskData
-                Archive =  [bool]$archive.IsPresent
-                AllUsers = $mobileData.AllUsers
-                Bitlocker = $oldEncryption
-            }
-
-            $rawWindows = Invoke-Command `
-                -ComputerName $mobileData.Windows `
-                -ScriptBlock $script:WindowsUnregisterBlock `
-                -ArgumentList $payload `
-                -ErrorAction SilentlyContinue `
-                -ErrorVariable winErrors
-
-            $winResults = @(
-                foreach ($r in $rawWindows) {
-                    [PSCustomObject]@{
-                        HostName = $r.PSComputerName
-                        Platform = 'Windows'
-                        Success  = [bool]$r.Success
-                        Actions  = @($r.Actions)
-                        Failures = @($r.Failures)
-                    }
-                }
-            )
-
-            foreach ($computer in $mobileData.Windows) {
-                $alreadyReturned = $winResults |
-                    Where-Object HostName -eq $computer
-
-                if ($alreadyReturned) {
-                    continue
-                }
-
-                $hostErrors = @(
-                    $winErrors |
-                        Where-Object {
-                            $_.TargetObject -eq $computer -or
-                            $_.OriginInfo.PSComputerName -eq $computer
-                        }
-                )
-
-                $messages = if ($hostErrors) {
-                    @(
-                        $hostErrors |
-                            ForEach-Object { $_.Exception.Message }
-                    )
-                } else {
-                    @('No result returned from remote host.')
-                }
-
-                $winResults += [PSCustomObject]@{
-                    HostName = $computer
-                    Platform = 'Windows'
-                    Success  = $false
-                    Actions  = @()
-                    Failures = $messages
-                }
-            }
+        $payload = [PSCustomObject]@{
+            MobileName = $MobileName
+            TaskData = $taskData
+            Archive =  [bool]$archive.IsPresent
+            AllUsers = $mobileData.AllUsers
+            Bitlocker = $oldEncryption
         }
 
-        if (@($mobileData.Linux).Count -gt 0) {
-            $linuxUnregister = Get-LinuxUnregisterScript `
-                -AllUsers $mobileData.AllUsers `
-                -Archive:$archive
+        $rawWindows = Invoke-Command `
+            -ComputerName $mobileData.Windows `
+            -ScriptBlock $script:WindowsUnregisterBlock `
+            -ArgumentList $payload `
+            -ErrorAction SilentlyContinue `
+            -ErrorVariable winErrors
 
-            $rawLinux = Invoke-Linux `
-                -Computers $mobileData.Linux `
-                -Script $linuxUnregister `
-                -KeyPath $sshKeyPath
+        $winResults = @(
+            foreach ($r in $rawWindows) {
+                [PSCustomObject]@{
+                    HostName = $r.PSComputerName
+                    Platform = 'Windows'
+                    Success  = [bool]$r.Success
+                    Actions  = @($r.Actions)
+                    Failures = @($r.Failures)
+                }
+            }
+        )
 
-            $linResults = @(
-                foreach ($r in $rawLinux) {
-                    if ($r.ExitCode -eq 0 -and $r.StdOut) {
-                        try {
-                            $r.StdOut | ConvertFrom-Json
-                        } catch {
-                            [PSCustomObject]@{
-                                HostName = $r.Target
-                                Platform = 'Linux'
-                                Success  = $false
-                                Actions  = @()
-                                Failures = @(
-                                    "Invalid JSON response: $($_.Exception.Message)"
-                                )
-                            }
-                        }
-                    } else {
+        foreach ($computer in $mobileData.Windows) {
+            $alreadyReturned = $winResults |
+                Where-Object HostName -eq $computer
+
+            if ($alreadyReturned) {
+                continue
+            }
+
+            $hostErrors = @(
+                $winErrors |
+                    Where-Object {
+                        $_.TargetObject -eq $computer -or
+                        $_.OriginInfo.PSComputerName -eq $computer
+                    }
+            )
+
+            $messages = if ($hostErrors) {
+                @(
+                    $hostErrors |
+                        ForEach-Object { $_.Exception.Message }
+                )
+            } else {
+                @('No result returned from remote host.')
+            }
+
+            $winResults += [PSCustomObject]@{
+                HostName = $computer
+                Platform = 'Windows'
+                Success  = $false
+                Actions  = @()
+                Failures = $messages
+            }
+        }
+    }
+
+    if (@($mobileData.Linux).Count -gt 0) {
+        $linuxUnregister = Get-LinuxUnregisterScript `
+            -AllUsers $mobileData.AllUsers `
+            -Archive:$archive
+
+        $rawLinux = Invoke-Linux `
+            -Computers $mobileData.Linux `
+            -Script $linuxUnregister `
+            -KeyPath $sshKeyPath
+
+        $linResults = @(
+            foreach ($r in $rawLinux) {
+                if ($r.ExitCode -eq 0 -and $r.StdOut) {
+                    try {
+                        $r.StdOut | ConvertFrom-Json
+                    } catch {
                         [PSCustomObject]@{
                             HostName = $r.Target
                             Platform = 'Linux'
                             Success  = $false
                             Actions  = @()
                             Failures = @(
-                                if ($r.StdErr) {
-                                    $r.StdErr
-                                } else {
-                                    "SSH exited with code $($r.ExitCode)"
-                                }
+                                "Invalid JSON response: $($_.Exception.Message)"
                             )
                         }
                     }
+                } else {
+                    [PSCustomObject]@{
+                        HostName = $r.Target
+                        Platform = 'Linux'
+                        Success  = $false
+                        Actions  = @()
+                        Failures = @(
+                            if ($r.StdErr) {
+                                $r.StdErr
+                            } else {
+                                "SSH exited with code $($r.ExitCode)"
+                            }
+                        )
+                    }
                 }
-            )
-        }
-
-        Format-DeploymentResults (@($winResults) + @($linResults)) -AllUsers $mobileData.AllUsers -Unregister
-
-
+            }
+        )
     }
 
+    Format-DeploymentResults (@($winResults) + @($linResults)) -AllUsers $mobileData.AllUsers -Unregister
+
+
+}
 
 
 
 
-    $bashScript = @'
+
+$bashScript = @'
 #!/usr/bin/env bash
 collect_hostname()   { printf "hostname\t%s\n" "$(hostname)"; }
 collect_cores()      { printf "cores\t%s\n"    "$(nproc)"; }
