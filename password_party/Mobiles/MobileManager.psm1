@@ -236,7 +236,6 @@ $script:WindowsDeployBlock = {
         #
         # Groups
         #
-        Write-Host "GROUPS: $($u.WindowsGroups)"
         foreach ($g in $u.WindowsGroups) {
             $actionName = "$($u.Name):$g"
             $groupStatus = 'Failed'
@@ -2578,6 +2577,7 @@ function Get-MobileData {
                 LinuxPassword = [sha512Crypt]::Crypt($fallbackPass)
                 LinuxAccountType = $meta.LinuxAccountType
                 MustChangePassword = $true
+                WindowsGroups = $meta.WindowsGroups
             }
 
             $allUsers.Add($uData)
