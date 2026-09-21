@@ -255,67 +255,68 @@ $script:WindowsDeployBlock = {
 
             Add-Action -Category 'Privilege' -Name $actionName -Status $(if ($success) { 'OK' } else { 'Failed' })
         }
+    }
 
-        #
-        # Scheduled tasks
-        #
-        foreach ($t in $payload.TaskData) {
+    #
+    # Scheduled tasks
+    #
+    foreach ($t in $payload.TaskData) {
 
-            $success = Invoke-Step  -Context "Scheduled task '$($t.TaskName)'"  -Action { Register-ScheduledTask  -TaskName $t.TaskName  -Xml $t.TaskXML  -User System  -Force  -ErrorAction Stop }
-            $cat = switch ($t.TaskName) {
-                "Mobile-LogArchiver" {"Task: LogArchive"}
-                "Mobile-DisjoinTask" {"Task: Disjoin"}
-            }
-
-
-            Add-Action  -Category $cat  -Name $t.TaskName  -Status $(if ($success) { 'OK' } else { 'Failed' })
+        $success = Invoke-Step  -Context "Scheduled task '$($t.TaskName)'"  -Action { Register-ScheduledTask  -TaskName $t.TaskName  -Xml $t.TaskXML  -User System  -Force  -ErrorAction Stop }
+        $cat = switch ($t.TaskName) {
+            "Mobile-LogArchiver" {"Task: LogArchive"}
+            "Mobile-DisjoinTask" {"Task: Disjoin"}
         }
 
-        #
-        # BitLocker
-        #
-        $drives = @( Get-BitLockerVolume | Where-Object VolumeType -eq 'OperatingSystem')
 
-        $tpm = Get-Tpm
+        Add-Action  -Category $cat  -Name $t.TaskName  -Status $(if ($success) { 'OK' } else { 'Failed' })
+    }
 
-        foreach ($drive in $drives) {
+    #
+    # BitLocker
+    #
+    $drives = @( Get-BitLockerVolume | Where-Object VolumeType -eq 'OperatingSystem')
 
-            $bitLockerParams = @{
-                MountPoint  = $drive.MountPoint
-                ErrorAction = 'Stop'
-            }
+    $tpm = Get-Tpm
 
-            if ($tpm.IsPresent -and $tpm.IsEnabled) {
-                $bitLockerParams.TpmAndPinProtector = $true
-                $bitLockerParams.Pin = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
-            } else {
-                $bitLockerParams.PasswordProtector = $true
-                $bitLockerParams.Password = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
-            }
+    foreach ($drive in $drives) {
 
-            $success = Invoke-Step  -Context "BitLocker '$($drive.MountPoint)'"  -Action { Enable-BitLocker @bitLockerParams }
-
-            Add-Action  -Category 'DiskEncryption'  -Name $drive.MountPoint  -Status $(if ($success) { 'Changed' } else { 'Failed' })
+        $bitLockerParams = @{
+            MountPoint  = $drive.MountPoint
+            ErrorAction = 'Stop'
         }
 
-        #
-        # Domain
-        #
-        if ($payload.DisJoin) {
-
-            $success = Invoke-Step  -Context 'Domain Disjoin'  -Action { Remove-Computer  -WorkGroupName $payload.MobileName  -Force  -Restart:$false  -ErrorAction Stop }
-
-            Add-Action  -Category 'Domain'  -Name 'Disjoin'  -Status $(if ($success) { 'Changed' } else { 'Failed' })
+        if ($tpm.IsPresent -and $tpm.IsEnabled) {
+            $bitLockerParams.TpmAndPinProtector = $true
+            $bitLockerParams.Pin = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
+        } else {
+            $bitLockerParams.PasswordProtector = $true
+            $bitLockerParams.Password = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
         }
 
-        [PSCustomObject]@{
-            Platform = 'Windows'
-            Success  = ($failures.Count -eq 0)
-            Actions  = $actions.ToArray()
-            Failures = $failures.ToArray()
-        }
+        $success = Invoke-Step  -Context "BitLocker '$($drive.MountPoint)'"  -Action { Enable-BitLocker @bitLockerParams }
+
+        Add-Action  -Category 'DiskEncryption'  -Name $drive.MountPoint  -Status $(if ($success) { 'Changed' } else { 'Failed' })
+    }
+
+    #
+    # Domain
+    #
+    if ($payload.DisJoin) {
+
+        $success = Invoke-Step  -Context 'Domain Disjoin'  -Action { Remove-Computer  -WorkGroupName $payload.MobileName  -Force  -Restart:$false  -ErrorAction Stop }
+
+        Add-Action  -Category 'Domain'  -Name 'Disjoin'  -Status $(if ($success) { 'Changed' } else { 'Failed' })
+    }
+
+    [PSCustomObject]@{
+        Platform = 'Windows'
+        Success  = ($failures.Count -eq 0)
+        Actions  = $actions.ToArray()
+        Failures = $failures.ToArray()
     }
 }
+
 
 
 $script:WindowsUnregisterBlock = {
