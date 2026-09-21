@@ -3104,7 +3104,7 @@ function Format-DeploymentResults {
                 User     = $baseName
                 Groups   = $roles -join ', '
                 Status   = $status
-                Password = $password
+                Password = $password.ToString()
             }
         }
     }
