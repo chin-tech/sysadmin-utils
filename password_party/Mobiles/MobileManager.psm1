@@ -2388,7 +2388,7 @@ function Get-UserCreds {
         $content = Unprotect-CmsMessage -Path  $PwFile
         foreach ($line in ( $content -split '\r?\n')) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            $timestamp, $username, $pw = $line -split ':',3
+            $timestamp, $username, $pw = $line -split ':'
             write-host "Found Password"
             $uObject = $allUsers | Where-Object Name -eq $username | Select-Object -First 1
             Write-Host $uObject
