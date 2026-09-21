@@ -607,7 +607,7 @@ while (-not $written) {
         return
     }
 
-    $timestamp = Get-Date -Format 's'
+    $timestamp = Get-Date -Format 'yyyy-MM-dd-mm.ss.ffff'
     $plainLines = foreach ($variant in $accountVariants) {
         "${timestamp}:${variant}:$($passwordMap[$variant])"
     }
