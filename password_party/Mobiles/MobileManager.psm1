@@ -245,6 +245,7 @@ $script:WindowsDeployBlock = {
             try {
                 $alreadyMember = [bool]( Get-LocalGroupMember  -Group $g  -Member $u.Name  -ErrorAction Stop)
             } catch {
+                Invoke-Step -Context "Group $g for $($u.Name)" -Action { Add-LocalGroupMember -Group $g -Member $u.Name -ErrorAction Stop}
                 # Absence is expected here.
             }
 
