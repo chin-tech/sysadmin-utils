@@ -1444,7 +1444,7 @@ function Initialize-Environment {
 
     $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers" -quiet -Arguments "-ExecutionPolicy Bypass -WindowStyle Hidden -File '$actualRunFile'"))
     $runContent = @"
-powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File '$outPath' -MobileDumpPath $($Script:Config.MobileDump) -MobileEntriesPath $($Script:Config.MobileEntries)
+powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "$outPath" -MobileDumpPath $($Script:Config.MobileDump) -MobileEntriesPath $($Script:Config.MobileEntries)
 "@
     $LogonScript | Set-Content -Path $outPath
     $runContent | Set-Content -Path $actualRunFile
@@ -2382,7 +2382,7 @@ function Get-UserCreds {
     )
     foreach ($bName in ($allUsers.BaseName | Sort-Object -Unique)) {
         $PwFile = Join-Path  $mobileDumpPath $bName
-        if ( ! (Test-Path $PwFile )) { Write-Host "NOT FOUND"; continue }
+        if ( ! (Test-Path $PwFile )) {  continue }
 
         $content = Unprotect-CmsMessage -Path  $PwFile
         foreach ($line in ( $content -split '\r?\n')) {
