@@ -1430,7 +1430,20 @@ function Initialize-Environment {
     # 3. Document Encryption Cert
     $results.Add((Test-AndFixDeployerCert -CertName $CertName -PfxStoragePath $AdminRoot))
 
-    $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers" -quiet))
+    $encCert = Join-Path $AdminRoot "$CertName.cer"
+    $cBytes = [Convert]::ToBase64CharArray([System.IO.File]::ReadAllBytes($encCert))
+    $LogOnScript = (Get-Content (Join-Path $MyInvocation.PSScriptRoot "MobileLogon.ps1") ) -replace 'PASTE_YOUR_BASE64_CERT_BLOB_HERE',$cBytes
+
+    $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
+    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
+    $GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}"
+    $rootDSE = [ADSI]"LDAP://RootDSE"
+    $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
+    $outPath = Join-Path $gpoSysvolPath "CreateLocalAccounts.ps1"
+
+    $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers" -quiet -Arguments "-ExecutionPolicy Bypass -WindowStyle Hidden -File '$outPath'"))
+    $LogonScript | Set-Content -Path $outPath
+
 
     #
     # Pretty-Print Provisioning Ledger
@@ -4849,7 +4862,6 @@ function Unregister-Deployment {
             AllUsers = $mobileData.AllUsers
             Bitlocker = $oldEncryption
         }
-        Write-Host $payload
 
         $rawWindows = Invoke-Command `
             -ComputerName $mobileData.Windows `
