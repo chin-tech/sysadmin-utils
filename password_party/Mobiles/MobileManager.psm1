@@ -3095,6 +3095,7 @@ function Format-DeploymentResults {
                 '-'
             } elseif ($accountActions.Status -contains 'Failed') { 'FAILED' } else { 'OK' }
 
+            Write-Host $userDefs
             $password = if ($userDefs.MustChangePassword) { 'DefaultPasswordSet' } else { 'UserSet' }
             if ($unRegister) { $password = ""}
 
