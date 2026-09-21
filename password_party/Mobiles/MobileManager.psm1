@@ -3211,6 +3211,7 @@ function Register-MobileDeployment {
     $mobileData.AllUsers
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     Write-Host "----------AFTER--------------"
+    $mobileData.AllUsers
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
     
 
