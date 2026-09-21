@@ -1440,9 +1440,14 @@ function Initialize-Environment {
     $rootDSE = [ADSI]"LDAP://RootDSE"
     $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
     $outPath = Join-Path $gpoSysvolPath "CreateLocalAccounts.ps1"
+    $actualRunFile = Join-Path $gpoSysvolPath "Run.ps1"
 
-    $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers" -quiet -Arguments "-ExecutionPolicy Bypass -WindowStyle Hidden -File '$outPath' -MobileDumpPath $($Script:Config.MobileDump) -MobileEntriesPath $($Script:Config.MobileEntries)"))
+    $results.Add((New-ShortcutGPO -TargetOUFriendlyName "LabUsers" -quiet -Arguments "-ExecutionPolicy Bypass -WindowStyle Hidden -File '$actualRunFile'"))
+    $runContent = @"
+powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File '$outPath' -MobileDumpPath $($Script:Config.MobileDump) -MobileEntriesPath $($Script:Config.MobileEntries)
+"@
     $LogonScript | Set-Content -Path $outPath
+    $runContent | Set-Content -Path $actualRunFile
 
 
     #
