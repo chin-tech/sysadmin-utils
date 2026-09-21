@@ -2391,7 +2391,8 @@ function Get-UserCreds {
             $timestamp, $username, $pw = $line -split ':',3
             write-host "Found Password"
             $uObject = $allUsers | Where-Object Name -eq $username | Select-Object -First 1
-            if ($null -eq $uObject) { continue }
+            Write-Host $uObject
+            if ($null -eq $uObject) { Write-Warning "[!] No matching user for $username with user: $bName" ; continue }
             $uObject.Password = ConvertTo-SecureString -AsPlainText -Force $pw
             $uObject.LinuxPassword = [Sha512Crypt]::Crypt($pw)
             $uObject.MustChangePassword = $false
@@ -3207,11 +3208,7 @@ function Register-MobileDeployment {
     # Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
     if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
     $mobileData = Get-MobileData -MobileName $MobileName 
-    Write-Host "---------BEFORE-------------"
-    $mobileData.AllUsers
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
-    Write-Host "----------AFTER--------------"
-    $mobileData.AllUsers
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
     
 
