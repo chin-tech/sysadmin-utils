@@ -536,7 +536,7 @@ $b64ToUse = if ($CertB64Override) { $CertB64Override
 }
 $b64ToUse = ($b64ToUse -replace '\s', '')  # strip whitespace/newlines from wrapped blobs
 
-if ([string]::IsNullOrWhiteSpace($b64ToUse) -or $b64ToUse -eq 'PASTE_YOUR_BASE64_CERT_BLOB_HERE') {
+if ([string]::IsNullOrWhiteSpace($b64ToUse)) {
     Write-Error "No certificate blob configured. Paste the base64 Deployer.cer content into `$CertB64 or pass -CertB64Override."
     return
 }
