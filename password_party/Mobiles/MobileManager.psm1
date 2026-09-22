@@ -1137,16 +1137,14 @@ displayName=$gpoName
                 $targetOU.Properties['gPLink'].Value = $gpoLdapPath
             }
 
-            if (-not $targetOU.Properties['gPOptions'].Value) {
-                $targetOU.Properties['gPOptions'].Value = 0
-            }
+            if (-not $targetOU.Properties['gPOptions'].Value) { $targetOU.Properties['gPOptions'].Value = 0 }
 
             $targetOU.SetInfo()
         } else {
             Write-Warning "Target OU '$TargetOUFriendlyName' not found. Link skipped."
         }
 
-        return (New-InitResult -Component 'GPO' -Status 'CREATED' -Details "Created GPO '$gpoName' : $($gpoID) - Linked to '$TargetOUFriendlyName'")
+        return (New-InitResult -Component 'GPO' -Status 'CREATED' -Details "'$gpoName' : $($gpoID) -> '$TargetOUFriendlyName'")
     } catch {
         return (New-InitResult -Component 'GPO' -Status 'FAILED' -Details "Creation failed: $($_.Exception.Message)" -Fatal)
     }
@@ -2920,10 +2918,35 @@ function Set-MobileGpoPermission {
             $secDesc.AddAccessRule($ruleRead)
             $secDesc.AddAccessRule($ruleApply)
         } else {
-            $secDesc.RemoveAccessRule($ruleRead)
-            $secDesc.RemoveAccessRule($ruleApply)
+            $rules = $secDesc.GetAccessRules(
+                $true,
+                $false,
+                [System.Security.Principal.SecurityIdentifier]
+            )
+
+            $matchingRules = @($rules | Where-Object {
+                    $rule = $_
+
+                    $isRead = $rule.ActiveDirectoryRights -eq [System.DirectoryServices.ActiveDirectoryRights]::GenericRead
+
+                    $isApply = (
+                        $rule.ActiveDirectoryRights -eq [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight -and
+                        $rule.ObjectType -eq $applyGpoGuid
+                    )
+
+                    $rule.IdentityReference.Value -eq $sid.Value -and
+                    $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                    ($isRead -or $isApply)
+                })
+
+            foreach ($rule in $matchingRules) {
+                $secDesc.RemoveAccessRuleSpecific($rule)
+            }
+
+            Write-Verbose "Removed $($matchingRules.Count) ACE(s) for '$u'."
         }
     }
+
     $gpoEntry.ObjectSecurity = $secDesc
     $gpoEntry.CommitChanges()
     $gpoEntry.RefreshCache(@('nTSecurityDescriptor'))
@@ -2956,26 +2979,22 @@ function Set-MobileGpoPermission {
     }
 
     $actionText = if ($Add) { "Added" } else { "Removed" }
-    if ($add) {
-        if ($r.apply -contains $false ) {
-            Write-Host "[!] Failed to add users to GPO" -ForegroundColor Red
-            $r | Format-Table
-        } else {
-            Write-Host "[+] $actionText users from '$MobileName' on GPO ($cleanGuid)" -ForegroundColor Green
-            $r | Format-Table
-        }
+    if ($Add) {
+        $failed = @($r | Where-Object { -not $_.Read -or -not $_.Apply })
     } else {
-        if ($r.apply -contains $true ) {
-            Write-Host "[!] Failed to remove users from GPO" -ForegroundColor Red
-            $r | Format-Table
-        } else {
-            Write-Host "[+] $actionText users from '$MobileName' on GPO ($cleanGuid)" -ForegroundColor Green
-            $r | Format-Table
-        }
+        $failed = @($r | Where-Object { $_.Read -or $_.Apply })
+    }
 
+    if ($failed.Count) {
+        Write-Warning "GPO permission operation failed for $($failed.Count) user(s)."
+        $failed | Format-Table
+    } else {
+        Write-Host '[+] GPO permissions verified.' -ForegroundColor Green
     }
 
 }
+
+
 
 
 function Format-DeploymentResults {
