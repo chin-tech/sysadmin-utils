@@ -24,11 +24,11 @@
         'Set-MobileGpoPermission',
         'Register-MobileDeployment',
         'UnRegister-Deployment',
-        'Initialize-Ssh-Environment'
         'New-MobileDeployment'
         'Write-MobileFile'
         'Set-MobileGpoPermission'
         'Set-Debug'
+        'Initialize-Environment'
     )
 
     # Cmdlets, Variables, and Aliases to export

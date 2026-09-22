@@ -22,6 +22,9 @@ param(
     [switch]$Remove,
 
 
+    [Parameter(ParameterSetName='Initialize', Mandatory=$true)]
+    [Switch]$Initialize,
+
     [Parameter(Mandatory = $false, ParameterSetName = 'UnRegisterDeployment')]
     [switch]$Archive,
 
@@ -43,6 +46,7 @@ param(
 
     [Parameter(ParameterSetName='NewMobile')]
     [switch]$New,
+
 
     # --- Optional Config Override ---
     [Parameter()]
@@ -84,23 +88,14 @@ switch ($PSCmdlet.ParameterSetName) {
         }
     }
 
-    'GPOAdd' {
-        Set-MobileGpoPermission -MobileName $Name -Add @passThru
-    }
+    'GPOAdd' { Set-MobileGpoPermission -MobileName $Name -Add @passThru }
 
-    'GPORemove' {
-        Set-MobileGpoPermission -MobileName $Name -Remove -Force:$Force @passThru
-    }
+    'GPORemove' { Set-MobileGpoPermission -MobileName $Name -Remove -Force:$Force @passThru }
 
-    'RegisterDeployment' {
-        Register-MobileDeployment -MobileName $Name @passThru
-    }
+    'RegisterDeployment' { Register-MobileDeployment -MobileName $Name @passThru }
 
-    'UnRegisterDeployment' {
-        UnRegister-Deployment -MobileName $Name @passThru
-    }
-    'NewMobile' {
-        New-MobileDeployment @passThru
+    'UnRegisterDeployment' { UnRegister-Deployment -MobileName $Name @passThru }
+    'NewMobile' { New-MobileDeployment @passThru }
+    'Initialize' {Initialize-Environment @passThru}
 
-    }
 }

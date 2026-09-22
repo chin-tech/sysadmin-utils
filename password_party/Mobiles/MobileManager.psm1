@@ -2927,7 +2927,7 @@ function Set-MobileGpoPermission {
         [System.Security.Principal.SecurityIdentifier]
     )
 
-    foreach ($name in $targetUsers) {
+    $r = foreach ($name in $targetUsers) {
         $sid = ([System.Security.Principal.NTAccount]::new($domainName, $name)).Translate(
             [System.Security.Principal.SecurityIdentifier]
         )
@@ -2948,9 +2948,26 @@ function Set-MobileGpoPermission {
         }
     }
 
-
     $actionText = if ($Add) { "Added" } else { "Removed" }
-    Write-Host "[+] $actionText users from '$MobileName' on GPO ($cleanGuid)" -ForegroundColor Green
+    if ($add) {
+        if ($r.apply -contains $false ) {
+            Write-Host "[!] Failed to add users to GPO" -ForegroundColor Red
+            $r | Format-Table
+        } else {
+            Write-Host "[+] $actionText users from '$MobileName' on GPO ($cleanGuid)" -ForegroundColor Green
+            $r | Format-Table
+        }
+    } else {
+        if ($r.apply -contains $true ) {
+            Write-Host "[!] Failed to remove users from GPO" -ForegroundColor Red
+            $r | Format-Table
+        } else {
+            Write-Host "[+] $actionText users from '$MobileName' on GPO ($cleanGuid)" -ForegroundColor Green
+            $r | Format-Table
+        }
+
+    }
+
 }
 
 
