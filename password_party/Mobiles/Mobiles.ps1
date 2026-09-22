@@ -94,7 +94,7 @@ switch ($PSCmdlet.ParameterSetName) {
 
     'RegisterDeployment' { Register-MobileDeployment -MobileName $Name @passThru }
 
-    'UnRegisterDeployment' { UnRegister-Deployment -MobileName $Name @passThru }
+    'UnRegisterDeployment' { UnRegister-Deployment -MobileName $Name -Archive:$Archive @passThru }
     'NewMobile' { New-MobileDeployment @passThru }
     'Initialize' {Initialize-Environment -Console @passThru}
 
