@@ -1022,92 +1022,93 @@ function New-ShortcutGPO {
         [switch]$Quiet
     )
 
-    $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
-    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
-    $gpoName = "Mobile Logon"
-
-    $rootDSE = [ADSI]"LDAP://RootDSE"
-    $ctx = $rootDSE.DefaultNamingContext
-    $policyContainerPath = "CN=Policies,CN=System,$ctx"
-    $targetOU_DN = "OU=$TargetOUFriendlyName,$ctx"
-    $gpoLdapPath = "[LDAP://CN=$cleanGpoID,$policyContainerPath;0]"
-    $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
-
-    #
-    # 1. Active Directory GPC Object
-    #
-    $policiesContainer = [ADSI]"LDAP://$policyContainerPath"
-    $gpoLdapUri = "LDAP://CN=$cleanGpoID,$policyContainerPath"
-
-    $isNew = $false
-    if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
-        $gpoEntry = [ADSI]$gpoLdapUri
-    } else {
-        $gpoEntry = $policiesContainer.Create("groupPolicyContainer", "CN=$cleanGpoID")
-        $isNew = $true
-    }
-
-    # Verified extension GUIDs from working GPO
-    $exactExtensionWithLogon = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
-    $exactExtension = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
-
-    $versionNumber = (1 -shl 16) # User version = 1, Computer version = 0
-
-    $gpoEntry.Put("displayName", $gpoName)
-    $gpoEntry.Put("flags", 0)
-    $gpoEntry.Put("gPCFunctionalityVersion", 2)
-    $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
-    $gpoEntry.Put("gPCUserExtensionNames", $exactExtension)
-    $gpoEntry.Put("versionNumber", $versionNumber)
-    $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
-
-    # Clone parent ACL to avoid Access Denied in GPMC
-    if ($isNew) {
-        $parentSec = $policiesContainer.Properties["ntSecurityDescriptor"].Value
-        if ($parentSec) {
-            $gpoEntry.Properties["ntSecurityDescriptor"].Value = $parentSec
-        }
-    }
-
-    $gpoEntry.SetInfo()
-
-    #
-    # 2. Build SYSVOL Directory Structure
-    #
-    $userPrefPath = Join-Path $gpoSysvolPath "User\Preferences\Shortcuts"
-    $machinePath  = Join-Path $gpoSysvolPath "Machine"
-
-    @($gpoSysvolPath, $userPrefPath, $machinePath) | ForEach-Object {
-        if (-not (Test-Path $_)) {
-            New-Item -Path $_ -ItemType Directory -Force | Out-Null
-        }
-    }
-
     try {
-        icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
-    } catch { }
+        $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
+        $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
+        $gpoName = "Mobile Logon"
 
-    #
-    # 3. gpt.ini
-    #
-    $gptIni = @"
+        $rootDSE = [ADSI]"LDAP://RootDSE"
+        $ctx = $rootDSE.DefaultNamingContext
+        $policyContainerPath = "CN=Policies,CN=System,$ctx"
+        $targetOU_DN = "OU=$TargetOUFriendlyName,$ctx"
+        $gpoLdapPath = "[LDAP://CN=$cleanGpoID,$policyContainerPath;0]"
+        $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
+
+        #
+        # 1. Active Directory GPC Object
+        #
+        $policiesContainer = [ADSI]"LDAP://$policyContainerPath"
+        $gpoLdapUri = "LDAP://CN=$cleanGpoID,$policyContainerPath"
+
+        $isNew = $false
+        if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
+            $gpoEntry = [ADSI]$gpoLdapUri
+        } else {
+            $gpoEntry = $policiesContainer.Create("groupPolicyContainer", "CN=$cleanGpoID")
+            $isNew = $true
+        }
+
+        # Verified extension GUIDs from working GPO
+        $exactExtensionWithLogon = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
+        $exactExtension = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
+
+        $versionNumber = (1 -shl 16) # User version = 1, Computer version = 0
+
+        $gpoEntry.Put("displayName", $gpoName)
+        $gpoEntry.Put("flags", 0)
+        $gpoEntry.Put("gPCFunctionalityVersion", 2)
+        $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
+        $gpoEntry.Put("gPCUserExtensionNames", $exactExtension)
+        $gpoEntry.Put("versionNumber", $versionNumber)
+        $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
+
+        # Clone parent ACL to avoid Access Denied in GPMC
+        if ($isNew) {
+            $parentSec = $policiesContainer.Properties["ntSecurityDescriptor"].Value
+            if ($parentSec) {
+                $gpoEntry.Properties["ntSecurityDescriptor"].Value = $parentSec
+            }
+        }
+
+        $gpoEntry.SetInfo()
+
+        #
+        # 2. Build SYSVOL Directory Structure
+        #
+        $userPrefPath = Join-Path $gpoSysvolPath "User\Preferences\Shortcuts"
+        $machinePath  = Join-Path $gpoSysvolPath "Machine"
+
+        @($gpoSysvolPath, $userPrefPath, $machinePath) | ForEach-Object {
+            if (-not (Test-Path $_)) {
+                New-Item -Path $_ -ItemType Directory -Force | Out-Null
+            }
+        }
+
+        try {
+            icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
+        } catch { }
+
+        #
+        # 3. gpt.ini
+        #
+        $gptIni = @"
 [General]
 Version=$versionNumber
 displayName=$gpoName
 "@
-    Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIni -Encoding Ascii
+        Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIni -Encoding Ascii
 
-    #
-    # 4. Generate Working Shortcuts.xml
-    #
-    $timeNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-    $desktopUid = [Guid]::NewGuid().ToString("B").ToUpper()
-    $startMenuUid = [Guid]::NewGuid().ToString("B").ToUpper()
+        #
+        # 4. Generate Working Shortcuts.xml
+        #
+        $timeNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+        $desktopUid = [Guid]::NewGuid().ToString("B").ToUpper()
+        $startMenuUid = [Guid]::NewGuid().ToString("B").ToUpper()
 
-    # Escape XML entities in arguments
-    $xmlEscapedArgs = [System.Security.SecurityElement]::Escape($Arguments)
+        # Escape XML entities in arguments
+        $xmlEscapedArgs = [System.Security.SecurityElement]::Escape($Arguments)
 
-    $xmlContent = @"
+        $xmlContent = @"
 <?xml version="1.0" encoding="utf-8"?>
 <Shortcuts clsid="{872ECB34-B2EC-401b-A585-D32574AA90EE}">
   <Shortcut clsid="{4F2F7C55-2790-433e-8127-0739D1CFA327}" name="$ShortcutName" status="$ShortcutName" image="1" changed="$timeNow" uid="$desktopUid" userContext="1" bypassErrors="1" removePolicy="1">
@@ -1119,34 +1120,37 @@ displayName=$gpoName
 </Shortcuts>
 "@
 
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText((Join-Path $userPrefPath "Shortcuts.xml"), $xmlContent.Trim(), $utf8NoBom)
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText((Join-Path $userPrefPath "Shortcuts.xml"), $xmlContent.Trim(), $utf8NoBom)
 
-    #
-    # 5. Link to OU
-    #
-    if ([System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
-        $targetOU = [ADSI]"LDAP://$targetOU_DN"
-        $existingLinks = $targetOU.Properties['gPLink'].Value
-        if ($existingLinks) {
-            if ($existingLinks -notlike "*$cleanGpoID*") {
-                $targetOU.Properties['gPLink'].Value = "$gpoLdapPath$existingLinks"
+        #
+        # 5. Link to OU
+        #
+        if ([System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
+            $targetOU = [ADSI]"LDAP://$targetOU_DN"
+            $existingLinks = $targetOU.Properties['gPLink'].Value
+            if ($existingLinks) {
+                if ($existingLinks -notlike "*$cleanGpoID*") {
+                    $targetOU.Properties['gPLink'].Value = "$gpoLdapPath$existingLinks"
+                }
+            } else {
+                $targetOU.Properties['gPLink'].Value = $gpoLdapPath
             }
+
+            if (-not $targetOU.Properties['gPOptions'].Value) {
+                $targetOU.Properties['gPOptions'].Value = 0
+            }
+
+            $targetOU.SetInfo()
         } else {
-            $targetOU.Properties['gPLink'].Value = $gpoLdapPath
+            Write-Warning "Target OU '$TargetOUFriendlyName' not found. Link skipped."
         }
 
-        if (-not $targetOU.Properties['gPOptions'].Value) {
-            $targetOU.Properties['gPOptions'].Value = 0
-        }
-
-        $targetOU.SetInfo()
-    } else {
-        Write-Warning "Target OU '$TargetOUFriendlyName' not found. Link skipped."
+        return (New-InitResult -Component 'GPO' -Status 'CREATED' -Details "Created clean GPO '$GpoDisplayName' : $($cleanGuid) - Linked to '$TargetOUFriendlyName'")
+    } catch {
+        return (New-InitResult -Component 'GPO' -Status 'FAILED' -Details "Creation failed: $($_.Exception.Message)" -Fatal)
     }
 
-    if ($quiet) { return }
-    Write-Host "[+] Successfully created and populated Shortcut GPO ($cleanGpoID)" -ForegroundColor Green
 }
 
 function New-CustomGPO {
@@ -1230,8 +1234,11 @@ displayName=$GpoDisplayName
     }
 
     $targetOU.SetInfo()
+    # if (-not $quiet) {
     Write-Host "[+] Created clean GPO '$GpoDisplayName' ($cleanGuid) and linked to '$TargetOUFriendlyName'." -ForegroundColor Green
     Write-Host "[+] Ready for editing via GPMC." -ForegroundColor DarkGray
+    # }
+
 }
 
 
@@ -1469,7 +1476,7 @@ powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "$outPath" -Mob
         foreach ($r in $results) {
             $color = $colorMap[$r.Status]
             Write-Host ("  {0,-20} " -f $r.Component) -NoNewline
-            Write-Host ("[{0,-8}]" -f $r.Status) -ForegroundColor $color -NoNewline
+            Write-Host ("{0,-8}" -f "[$($r.Status)]") -ForegroundColor $color -NoNewline
             Write-Host (" {0}" -f $r.Details)
         }
         Write-Host ""
