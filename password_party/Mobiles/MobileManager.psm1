@@ -1506,88 +1506,6 @@ function New-DeployerCertificate {
 
 
 
-# function Initialize-Ssh-Environment {
-#     [CmdletBinding()]
-#     param(
-#         [string]$keyPath = $Script:Config.SSHKeyPath,
-#         [string]$nfsHome = $Script:Config.NfsHome
-#     )
-#     # r = remote ; l = local
-#     $nfsSSH = Join-Path  $nfsHome '.ssh'
-#     $localSSh = Join-Path $env:UserProfile ".ssh"
-#     $rAuthorized = Join-Path $nfsSSH 'authorized_keys'
-#
-#     @($nfsSSH, $localSSH) | Where-Object { -not (Test-Path $_ ) } | ForEach-Object {
-#         New-Item -ItemType Directory -Path $_ -Force | Out-Null
-#     }
-#
-#     if ([string]::IsNullOrWhiteSpace($keyPath) -or $keyPath.EndsWith('\')) {
-#         throw "SSH KEY PATH IS INVALID! -- '$sshKeyPath'  -- CHECK SSH KEY"
-#     }
-#
-#
-#     icacls.exe $nfsSSH /inheritance:r /T |Out-Null
-#     icacls.exe $nfsSSH /grant:r "$($env:USERNAME):(R)" /T |out-null
-#
-#
-#     icacls.exe $localSSH /inheritance:r |Out-Null
-#     icacls.exe $localSSH /grant:r "$($env:USERNAME):(R)" /T | Out-Null
-#
-#     if (-not (Test-Path $keyPath)) {
-#         ssh-keygen -f "$keyPath" -C '""' -N '""' -t ecdsa -q
-#
-#     }
-#
-#     icacls.exe $keyPath /inheritance:r |Out-Null
-#     icacls.exe $keyPath /grant:r "$($env:USERNAME):(R)"| Out-Null
-#     $pubKey = ssh-keygen -yf $keyPath
-#     if (-not (Test-Path $rAuthorized)) { New-Item -Type File -Path $rAuthorized -Force | Out-Null
-#     }
-#     if (-not (Select-String -Pattern $pubKey -Path $rAuthorized -ErrorAction SIlentlyContinue)) {
-#         $pubKey | Add-Content -Encoding UTF8 -Path $rAuthorized
-#         icacls.exe $rAuthorized /inheritance:r |Out-Null
-#         icacls.exe $rAuthorized /grant:r "$($env:USERNAME):(R)"| Out-Null
-#     }
-#
-#
-# }
-#
-#
-#
-# function Initialize-Functionality {
-#     [CmdletBinding()]
-#     param(
-#         [Parameter()]
-#         [string]$sshKeyPath = $script:Config.SshKeyPath,
-#         [string]$nfsHome = $script:Config.nfsHome,
-#         [string]$adminRoot = $script:Config.AdminRoot,
-#         [string]$certName = $script:Config.certName
-#
-#     )
-#
-#     Initialize-Ssh-Environment  -nfsHome $nfsHome -keyPath $sshKeyPath
-#
-#     # 2. Ensure Document Encryption Certificate Exists in CurrentUser\My
-#     $existingCert = Get-ChildItem -Path Cert:\CurrentUser\My | 
-#         Where-Object { $_.Subject -like '*CN=MobileDeployer*' -or $_.Subject -like "*$($certName)*" }
-#
-#     if (-not $existingCert) {
-#         $pfxFileName = "$($certName).pfx"
-#         $pfxFullPath = Join-Path $cfg.AdminRoot $pfxFileName
-#         # $securePass  = ConvertTo-SecureString -AsPlainText -Force $cfg.DefaultPass
-#         $securePass = Read-Host -AsSecureString -Prompt "[!] The decryption certificate isn't in your cert store. Please enter the administrative password to import it "
-#
-#         if (Test-Path $pfxFullPath) {
-#             Import-PfxCertificate -FilePath $pfxFullPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePass | Out-Null
-#             Write-Host "[+] Imported existing deployer certificate from: $pfxFullPath" -ForegroundColor Green
-#         } else {
-#             # Generates PFX/CER in the target directory and automatically adds to Cert:\CurrentUser\My
-#             New-DeployerCertificate -certPass $securePass -outPath $pfxFullPath
-#             Write-Host "[+] Generated and installed new deployment certificate in: $($pfxFullPath)" -ForegroundColor Green
-#         }
-#     }
-# }
-#
 
 function Get-WindowsTask-LogArchiver {
     return {
@@ -2885,8 +2803,8 @@ function Set-MobileGpoPermission {
         [Parameter(Mandatory = $true, Position = 0)]
         [string]$MobileName,
 
-        [Parameter(Mandatory = $true)]
-        [string]$GpoID,
+        [Parameter()]
+        [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
 
         [Parameter(Mandatory = $true, ParameterSetName = 'Add')]
         [switch]$Add,
@@ -2901,7 +2819,7 @@ function Set-MobileGpoPermission {
         [PSCustomObject]$Config
     )
 
-    $cfg = Get-MobileConfig $Config
+    # $cfg = Get-MobileConfig $Config
 
     # Standardize GPO GUID format: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
     $cleanGuid = if ($GpoID -match '^{[0-9a-fA-F-]+}$') { $GpoID 
