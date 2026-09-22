@@ -2828,6 +2828,7 @@ function Set-MobileGpoPermission {
     $rootDSE       = [ADSI]"LDAP://RootDSE"
     $namingContext = $rootDSE.defaultNamingContext
     $gpoPath       = "LDAP://CN=$cleanGuid,CN=Policies,CN=System,$namingContext"
+    $currentDomain = ([SYstem.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name
     
     $gpoEntry = [System.DirectoryServices.DirectoryEntry]::new($gpoPath)
     if (-not $gpoEntry.Path) {
@@ -2876,6 +2877,7 @@ function Set-MobileGpoPermission {
             }
         }
 
+        $gpoEntry.ObjectSecurity = $secDesc
         $gpoEntry.CommitChanges()
         Write-Host "[+] Force removed $removedCount GpoRead / Apply ACEs from GPO ($cleanGuid)" -ForegroundColor Yellow
         return
@@ -2883,11 +2885,12 @@ function Set-MobileGpoPermission {
 
     $mobileData  = Get-MobileData -MobileName $MobileName 
     $targetUsers = if ($Add) { $mobileData.AllUsers | Select-Object BaseName } else { $mobileData.MobileUsers | Select-Object BaseName }
+    $targetUsers = @($targetUsers.BaseName | Sort-Object -uNique)
     foreach ($u in $targetUsers) {
         $name = $u.BaseName
         # Write-Host "...Adding $($name)"
         try {
-            $account = [System.Security.Principal.NTAccount]::new($name)
+            $account = [System.Security.Principal.NTAccount]::new($currentDomain,  $name)
             $sid     = $account.Translate([System.Security.Principal.SecurityIdentifier])
         } catch {
             Write-Warning "Could not resolve SID for user: $($name)"
@@ -2915,8 +2918,37 @@ function Set-MobileGpoPermission {
             $secDesc.RemoveAccessRule($ruleApply)
         }
     }
-
+    $gpoEntry = $secDesc
     $gpoEntry.CommitChanges()
+    $gpoEntry.RefreshCache(@('nTSecurityDescriptor'))
+
+    $rules = $gpoEntry.ObjectSecurity.GetAccessRules(
+        $true,
+        $false,
+        [System.Security.Principal.SecurityIdentifier]
+    )
+
+    foreach ($name in $targetUsers) {
+        $sid = ([System.Security.Principal.NTAccount]::new($domainName, $name)).Translate(
+            [System.Security.Principal.SecurityIdentifier]
+        )
+
+        $userRules = @($rules | Where-Object { $_.IdentityReference -eq $sid })
+
+        [PSCustomObject]@{
+            User  = $name
+            Read  = [bool]@($userRules | Where-Object {
+                    $_.AccessControlType -eq 'Allow' -and
+                    ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericRead)
+                }).Count
+            Apply = [bool]@($userRules | Where-Object {
+                    $_.AccessControlType -eq 'Allow' -and
+                    $_.ObjectType -eq $applyGpoGuid -and
+                    ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight)
+                }).Count
+        }
+    }
+
 
     $actionText = if ($Add) { "Added" } else { "Removed" }
     Write-Host "[+] $actionText users from '$MobileName' on GPO ($cleanGuid)" -ForegroundColor Green
