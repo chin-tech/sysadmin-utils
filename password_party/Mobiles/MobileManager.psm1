@@ -2887,7 +2887,7 @@ function Set-MobileGpoPermission {
     # STANDARD ADD / REMOVE
     # -------------------------------------------------------------
     $mobileData  = Get-MobileData -MobileName $MobileName 
-    $targetUsers = if ($Add) { $mobileData.AllUsers | Select-Object -ExpandProperty BaseName } else { $mobileData.MobileUsers | Select-Object -ExpandProperty BaseName }
+    $targetUsers = if ($Add ) { $mobileData.AllUsers | Select-Object -ExpandProperty BaseName } else { $mobileData.MobileUsers | Select-Object -ExpandProperty UserName }
     $targetUsers = @($targetUsers | Sort-Object -Unique)
 
     foreach ($u in $targetUsers) {
