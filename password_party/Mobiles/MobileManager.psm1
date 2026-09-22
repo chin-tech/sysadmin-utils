@@ -1146,7 +1146,7 @@ displayName=$gpoName
             Write-Warning "Target OU '$TargetOUFriendlyName' not found. Link skipped."
         }
 
-        return (New-InitResult -Component 'GPO' -Status 'CREATED' -Details "Created clean GPO '$GpoDisplayName' : $($cleanGuid) - Linked to '$TargetOUFriendlyName'")
+        return (New-InitResult -Component 'GPO' -Status 'CREATED' -Details "Created GPO '$gpoName' : $($gpoID) - Linked to '$TargetOUFriendlyName'")
     } catch {
         return (New-InitResult -Component 'GPO' -Status 'FAILED' -Details "Creation failed: $($_.Exception.Message)" -Fatal)
     }
@@ -1476,7 +1476,7 @@ powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "$outPath" -Mob
         foreach ($r in $results) {
             $color = $colorMap[$r.Status]
             Write-Host ("  {0,-20} " -f $r.Component) -NoNewline
-            Write-Host ("{0,-8}" -f "[$($r.Status)]") -ForegroundColor $color -NoNewline
+            Write-Host ("{0,-8}" -f "[ $($r.Status) ]") -ForegroundColor $color -NoNewline
             Write-Host (" {0}" -f $r.Details)
         }
         Write-Host ""
