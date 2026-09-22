@@ -2815,16 +2815,14 @@ function Set-MobileGpoPermission {
         [Parameter(ParameterSetName = 'Remove')]
         [switch]$Force,
 
-        [Parameter()]
-        [PSCustomObject]$Config
+        # [Parameter()]
+        # [PSCustomObject]$Config
     )
 
     # $cfg = Get-MobileConfig $Config
 
     # Standardize GPO GUID format: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
-    $cleanGuid = if ($GpoID -match '^{[0-9a-fA-F-]+}$') { $GpoID 
-    } else { "{$GpoID}" 
-    }
+    $cleanGuid = if ($GpoID -match '^{[0-9a-fA-F-]+}$') { $GpoID } else { "{$GpoID}" }
 
     # Bind to GPO container in AD
     $rootDSE       = [ADSI]"LDAP://RootDSE"
@@ -2853,9 +2851,7 @@ function Set-MobileGpoPermission {
             $sid = $rule.IdentityReference.Value
             
             # Skip well-known built-in/service identities (NT AUTHORITY, SYSTEM, etc.)
-            if ($sid -match '^S-1-5-(18|19|20|32-544)') {
-                continue
-            }
+            if ($sid -match '^S-1-5-(18|19|20|32-544)') { continue }
 
             # Check if this rule is a domain administrative group by RID
             $isProtectedAdmin = $false
@@ -2886,11 +2882,9 @@ function Set-MobileGpoPermission {
     }
 
     $mobileData  = Get-MobileData -MobileName $MobileName -Config $cfg
-    $targetUsers = if ($Add) { $mobileData.AllUsers 
-    } else { $mobileData.MobileUsers 
-    }
-
+    $targetUsers = if ($Add) { $mobileData.AllUsers } else { $mobileData.MobileUsers }
     foreach ($u in $targetUsers) {
+        Write-Host "...Adding $($u.Name)"
         try {
             $account = [System.Security.Principal.NTAccount]::new($u.Name)
             $sid     = $account.Translate([System.Security.Principal.SecurityIdentifier])
@@ -2923,9 +2917,7 @@ function Set-MobileGpoPermission {
 
     $gpoEntry.CommitChanges()
 
-    $actionText = if ($Add) { "Added" 
-    } else { "Removed" 
-    }
+    $actionText = if ($Add) { "Added" } else { "Removed" }
     Write-Host "[+] $actionText users from '$MobileName' on GPO ($cleanGuid)" -ForegroundColor Green
 }
 
