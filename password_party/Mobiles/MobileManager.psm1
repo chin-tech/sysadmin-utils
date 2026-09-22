@@ -2819,21 +2819,16 @@ function Set-MobileGpoPermission {
 
         [Parameter(ParameterSetName = 'Remove')]
         [switch]$Force
-
-        # [Parameter()]
-        # [PSCustomObject]$Config
     )
 
-    # $cfg = Get-MobileConfig $Config
-
-    # Standardize GPO GUID format: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
-    $cleanGuid = if ($GpoID -match '^{[0-9a-fA-F-]+}$') { $GpoID } else { "{$GpoID}" }
+    # Standardize GPO GUID format
+    $cleanGuid = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID } else { "{$GpoID}" }
 
     # Bind to GPO container in AD
     $rootDSE       = [ADSI]"LDAP://RootDSE"
     $namingContext = $rootDSE.defaultNamingContext
     $gpoPath       = "LDAP://CN=$cleanGuid,CN=Policies,CN=System,$namingContext"
-    $currentDomain = ([SYstem.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name
+    $currentDomain = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name
     
     $gpoEntry = [System.DirectoryServices.DirectoryEntry]::new($gpoPath)
     if (-not $gpoEntry.Path) {
@@ -2844,14 +2839,17 @@ function Set-MobileGpoPermission {
     $secDesc      = $gpoEntry.ObjectSecurity
     $applyGpoGuid = [Guid]"edacfc86-b327-11d2-9701-00c04fd91ab0"
 
+    # Common read flag in AD (AD maps GenericRead to ReadProperty (16) + ListContents (4))
+    $readRightsMask = [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty -bor 
+    [System.DirectoryServices.ActiveDirectoryRights]::GenericRead
+
+    # -------------------------------------------------------------
+    # FORCE REMOVE: Strip all non-admin Apply/Read ACEs
+    # -------------------------------------------------------------
     if ($Force -and $Remove) {
-        # Get only explicit Access Control Entries (exclude inherited container ACLs)
         $rules = $secDesc.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])
         $removedCount = 0
-
-        # Protected well-known administrative SIDs (Domain Admins, Enterprise Admins, SYSTEM, etc.)
-        # Domain Admins ends in -512, Enterprise Admins in -519, Domain Controllers in -516
-        $adminRids = @(512, 516, 519)
+        $adminRids    = @(512, 516, 519) # Domain Admins, DCs, Enterprise Admins
 
         foreach ($rule in $rules) {
             $sid = $rule.IdentityReference.Value
@@ -2859,7 +2857,7 @@ function Set-MobileGpoPermission {
             # Skip well-known built-in/service identities (NT AUTHORITY, SYSTEM, etc.)
             if ($sid -match '^S-1-5-(18|19|20|32-544)') { continue }
 
-            # Check if this rule is a domain administrative group by RID
+            # Skip Domain Administrative groups
             $isProtectedAdmin = $false
             foreach ($rid in $adminRids) {
                 if ($sid -match "-$rid$") {
@@ -2867,16 +2865,13 @@ function Set-MobileGpoPermission {
                     break
                 }
             }
+            if ($isProtectedAdmin) { continue }
 
-            if ($isProtectedAdmin) {
-                continue
-            }
+            # Check if ACE grants Read or Apply GPO
+            $isRead  = ($rule.ActiveDirectoryRights.value__ -band $readRightsMask.value__) -ne 0
+            $isApply = ($rule.ObjectType -eq $applyGpoGuid)
 
-            # Target only GpoRead (GenericRead) or ExtendedRight (Apply Group Policy)
-            $isReadOrApply = ($rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericRead) -or
-            ($rule.ObjectType -eq $applyGpoGuid)
-
-            if ($isReadOrApply) {
+            if ($isRead -or $isApply) {
                 $secDesc.RemoveAccessRuleSpecific($rule) | Out-Null
                 $removedCount++
             }
@@ -2888,97 +2883,93 @@ function Set-MobileGpoPermission {
         return
     }
 
+    # -------------------------------------------------------------
+    # STANDARD ADD / REMOVE
+    # -------------------------------------------------------------
     $mobileData  = Get-MobileData -MobileName $MobileName 
-    $targetUsers = if ($Add) { $mobileData.AllUsers | Select-Object BaseName } else { $mobileData.MobileUsers | Select-Object BaseName }
-    $targetUsers = @($targetUsers.BaseName | Sort-Object -uNique)
+    $targetUsers = if ($Add) { $mobileData.AllUsers | Select-Object -ExpandProperty BaseName } else { $mobileData.MobileUsers | Select-Object -ExpandProperty BaseName }
+    $targetUsers = @($targetUsers | Sort-Object -Unique)
+
     foreach ($u in $targetUsers) {
-        # Write-Host "...Adding $($name)"
         try {
-            $account = [System.Security.Principal.NTAccount]::new($currentDomain,  $u)
+            $account = [System.Security.Principal.NTAccount]::new($currentDomain, $u)
             $sid     = $account.Translate([System.Security.Principal.SecurityIdentifier])
         } catch {
             Write-Warning "Could not resolve SID for user: $($u)"
             continue
         }
 
-        $ruleRead = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
-            $sid,
-            [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-
-        $ruleApply = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
-            $sid,
-            [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
-            [System.Security.AccessControl.AccessControlType]::Allow,
-            $applyGpoGuid
-        )
-
         if ($Add) {
+            $ruleRead = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+                $sid,
+                [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+
+            $ruleApply = [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
+                $sid,
+                [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+                [System.Security.AccessControl.AccessControlType]::Allow,
+                $applyGpoGuid
+            )
+
             $secDesc.AddAccessRule($ruleRead)
             $secDesc.AddAccessRule($ruleApply)
         } else {
-            $rules = $secDesc.GetAccessRules(
-                $true,
-                $false,
-                [System.Security.Principal.SecurityIdentifier]
-            )
-
+            # Find and remove any ACE belonging to this SID that grants Read or Apply
+            $rules = $secDesc.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])
             $matchingRules = @($rules | Where-Object {
-                    $rule = $_
-
-                    $isRead = $rule.ActiveDirectoryRights -eq [System.DirectoryServices.ActiveDirectoryRights]::GenericRead
-
-                    $isApply = (
-                        $rule.ActiveDirectoryRights -eq [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight -and
-                        $rule.ObjectType -eq $applyGpoGuid
+                    $_.IdentityReference.Value -eq $sid.Value -and
+                    $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                    (
+                        (($_.ActiveDirectoryRights.value__ -band $readRightsMask.value__) -ne 0) -or
+                        ($_.ObjectType -eq $applyGpoGuid)
                     )
-
-                    $rule.IdentityReference.Value -eq $sid.Value -and
-                    $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-                    ($isRead -or $isApply)
                 })
 
             foreach ($rule in $matchingRules) {
-                $secDesc.RemoveAccessRuleSpecific($rule)
+                # RemoveAccessRuleSpecific reliably handles exact ACE matching
+                $secDesc.RemoveAccessRuleSpecific($rule) | Out-Null
             }
 
             Write-Verbose "Removed $($matchingRules.Count) ACE(s) for '$u'."
         }
     }
 
+    # Commit DACL updates
     $gpoEntry.ObjectSecurity = $secDesc
     $gpoEntry.CommitChanges()
     $gpoEntry.RefreshCache(@('nTSecurityDescriptor'))
 
-    $rules = $gpoEntry.ObjectSecurity.GetAccessRules(
-        $true,
-        $false,
-        [System.Security.Principal.SecurityIdentifier]
-    )
+    # -------------------------------------------------------------
+    # VERIFICATION
+    # -------------------------------------------------------------
+    $rules = $gpoEntry.ObjectSecurity.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])
 
     $r = foreach ($name in $targetUsers) {
-        $sid = ([System.Security.Principal.NTAccount]::new($domainName, $name)).Translate(
-            [System.Security.Principal.SecurityIdentifier]
-        )
+        try {
+            $sid = ([System.Security.Principal.NTAccount]::new($currentDomain, $name)).Translate(
+                [System.Security.Principal.SecurityIdentifier]
+            )
+        } catch {
+            continue
+        }
 
-        $userRules = @($rules | Where-Object { $_.IdentityReference -eq $sid })
+        $userRules = @($rules | Where-Object { $_.IdentityReference.Value -eq $sid.Value })
 
         [PSCustomObject]@{
             User  = $name
             Read  = [bool]@($userRules | Where-Object {
                     $_.AccessControlType -eq 'Allow' -and
-                    ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericRead)
+                    (($_.ActiveDirectoryRights.value__ -band $readRightsMask.value__) -ne 0)
                 }).Count
             Apply = [bool]@($userRules | Where-Object {
                     $_.AccessControlType -eq 'Allow' -and
-                    $_.ObjectType -eq $applyGpoGuid -and
-                    ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight)
+                    $_.ObjectType -eq $applyGpoGuid
                 }).Count
         }
     }
 
-    $actionText = if ($Add) { "Added" } else { "Removed" }
     if ($Add) {
         $failed = @($r | Where-Object { -not $_.Read -or -not $_.Apply })
     } else {
@@ -2986,12 +2977,11 @@ function Set-MobileGpoPermission {
     }
 
     if ($failed.Count) {
-        Write-Warning "GPO permission operation failed for $($failed.Count) user(s)."
-        $failed | Format-Table
+        Write-Warning "GPO permission operation incomplete or failed for $($failed.Count) user(s)."
+        $failed | Format-Table -AutoSize
     } else {
-        Write-Host '[+] GPO permissions verified.' -ForegroundColor Green
+        Write-Host "[+] GPO permissions verified successfully for operation ($($PSCmdlet.ParameterSetName))." -ForegroundColor Green
     }
-
 }
 
 
