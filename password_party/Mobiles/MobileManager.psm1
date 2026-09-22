@@ -2881,7 +2881,7 @@ function Set-MobileGpoPermission {
         return
     }
 
-    $mobileData  = Get-MobileData -MobileName $MobileName -Config $cfg
+    $mobileData  = Get-MobileData -MobileName $MobileName 
     $targetUsers = if ($Add) { $mobileData.AllUsers } else { $mobileData.MobileUsers }
     foreach ($u in $targetUsers) {
         Write-Host "...Adding $($u.Name)"
