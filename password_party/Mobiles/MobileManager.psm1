@@ -2813,7 +2813,7 @@ function Set-MobileGpoPermission {
         [switch]$Remove,
 
         [Parameter(ParameterSetName = 'Remove')]
-        [switch]$Force,
+        [switch]$Force
 
         # [Parameter()]
         # [PSCustomObject]$Config
