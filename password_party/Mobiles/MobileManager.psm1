@@ -2884,12 +2884,13 @@ function Set-MobileGpoPermission {
     $mobileData  = Get-MobileData -MobileName $MobileName 
     $targetUsers = if ($Add) { $mobileData.AllUsers | Select-Object BaseName } else { $mobileData.MobileUsers | Select-Object BaseName }
     foreach ($u in $targetUsers) {
-        Write-Host "...Adding $($u)"
+        $name = $u.BaseName
+        # Write-Host "...Adding $($name)"
         try {
-            $account = [System.Security.Principal.NTAccount]::new($u)
+            $account = [System.Security.Principal.NTAccount]::new($name)
             $sid     = $account.Translate([System.Security.Principal.SecurityIdentifier])
         } catch {
-            Write-Warning "Could not resolve SID for user: $($u)"
+            Write-Warning "Could not resolve SID for user: $($name)"
             continue
         }
 
