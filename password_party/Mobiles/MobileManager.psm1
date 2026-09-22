@@ -2917,7 +2917,7 @@ function Set-MobileGpoPermission {
             $secDesc.RemoveAccessRule($ruleApply)
         }
     }
-    $gpoEntry = $secDesc
+    $gpoEntry.ObjectSecurity = $secDesc
     $gpoEntry.CommitChanges()
     $gpoEntry.RefreshCache(@('nTSecurityDescriptor'))
 
