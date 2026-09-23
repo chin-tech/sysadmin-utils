@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# /etc/kernel/install.d/40-nvidia-kmod.install
+#
+# Arguments passed by kernel-install on RHEL 8.10:
+#   $1 = Operation: "add" or "remove"
+#   $2 = Target Kernel Release (e.g. 4.18.0-553.el8_10.x86_64)
+#   $3 = Boot Directory
+#   $4 = Kernel Image Path (e.g. /boot/vmlinuz-4.18.0-553.el8_10.x86_64)
+
+set -o pipefail
+
+COMMAND="$1"
+TARGET_KVER="$2"
+LOG_FILE="/var/log/nvidia-kernel-install.log"
+INSTALLER_BIN="/opt/nvidia/nvidia-driver.run"
+
+exec >> "${LOG_FILE}" 2>&1
+
+# Only run when a new kernel is being added
+if [[ "${COMMAND}" != "add" ]]; then
+    exit 0
+fi
+
+echo "======================================================================"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Triggered for target kernel: ${TARGET_KVER}"
+
+# Guard: Ensure the installer bundle exists
+if [[ ! -f "${INSTALLER_BIN}" ]]; then
+    echo "[!] ERROR: NVIDIA installer not found at ${INSTALLER_BIN}. Skipping."
+    exit 0
+fi
+
+# Guard: Ensure matching kernel-devel / build tree exists
+KBUILD_DIR="/lib/modules/${TARGET_KVER}/build"
+if [[ ! -d "${KBUILD_DIR}" ]]; then
+    echo "[!] WARNING: Kernel header directory '${KBUILD_DIR}' not found."
+    echo "[!] Install headers: dnf install -y kernel-devel-${TARGET_KVER}"
+    exit 0
+fi
+
+# Skip compilation if modules are already present for this kernel
+if [[ -f "/lib/modules/${TARGET_KVER}/extra/nvidia.ko" ]] || \
+   [[ -f "/lib/modules/${TARGET_KVER}/kernel/drivers/video/nvidia.ko" ]]; then
+    echo "[*] NVIDIA kernel module is already compiled for ${TARGET_KVER}. Exiting."
+    exit 0
+fi
+
+echo "[*] Compiling NVIDIA kernel modules for ${TARGET_KVER}..."
+
+# NVIDIA installer flags:
+#   -s, --silent: Suppress UI
+#   -K, --kernel-module-only: Only compile and drop kernel modules (leaves userspace libs alone)
+#   -k, --kernel-name: Explicitly point compiler to target kernel release
+#   --no-backup: Skip backing up X config
+#   --no-runpath: Prevent modifying system shared library path
+"${INSTALLER_BIN}" \
+    --silent \
+    --kernel-module-only \
+    --kernel-name="${TARGET_KVER}" \
+    --no-backup \
+    --no-runpath
+
+INSTALL_EXIT=$?
+
+if [[ ${INSTALL_EXIT} -eq 0 ]]; then
+    echo "[+] Successfully compiled NVIDIA modules for ${TARGET_KVER}."
+
+    # Update module dependency map for the target kernel
+    depmod -a "${TARGET_KVER}"
+
+    # Because this hook runs at priority 40, 50-dracut.install will run next
+    # and automatically bundle the newly built modules into the target initramfs.
+    echo "[+] Done. dracut will now generate the initramfs."
+else
+    echo "[!] ERROR: NVIDIA installer compilation failed with exit code ${INSTALL_EXIT}."
+    exit ${INSTALL_EXIT}
+fi
+
+exit 0
