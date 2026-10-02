@@ -84,6 +84,12 @@ EOF
 
 fi
 
+if grep -q 'resume=' /proc/cmdline; then
+   swap_uuid=$(grep -oP 'resume=\K.+?\s')
+   grubby --update=ALL --remove-args="resume=$swap_uuid rd.luks.uuid=$swap_uuid"
+   grubby --update=ALL --args="noresume"
+fi
+
 if [[ $dracutNeedsRebuild = 1 ]]; then
    dracut -f --regenerate-all
 fi

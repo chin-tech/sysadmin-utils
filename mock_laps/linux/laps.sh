@@ -9,6 +9,12 @@ PREFIX="prefix"
 echo -n $PREFIX > $lapsdir/P
 head -c 50 /dev/urandom > $lapsdir/k
 echo $admin_pw_b64 | base64 -d | openssl enc -aes-256-cbc -k $lapsdir/k -iter 256  -out e
+openssl genpkey -algorithm RSA -pkeyopt rsa_pkey_bits:2048 -out K
+openssl rsa -inkey K -pubout -out P
+openssl pkeyutl -encrypt -in PW -inkey P -pubin -out E
+
+
+
 
 cat << 'EOF' > $lapsdir/rotate && chmod +x $lapsdir/rotate
 #!/usr/bin/env bash
