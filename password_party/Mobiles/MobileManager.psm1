@@ -2626,6 +2626,7 @@ function Format-HostCollector {
             @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
             @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
             @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
+            @{ Header = 'IVANTI CORE'; Getter = { param($r) if ($r.Success -and $r.Summary.IvantiCoreServer) { $r.Summary.IvantiCoreServer } else { '-' } } }
             @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
             @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion) { $r.Summary.AdminRotateVersion } else { '-' } } }
             @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount) { $r.Summary.PackageCount } else { '-' } } }
@@ -3371,6 +3372,58 @@ function Get-DiskSpace {
 
 }
 
+function Get-WindowsCollector-Registry {
+    [CmdletBinding()]
+    param()
+    return @'
+function Read-MobileRegistryKey {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $values = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
+        [PSCustomObject]@{ Path = $Path; Status = 'Found'; Values = $values; Error = $null }
+    } catch {
+        $missing = $_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound
+        [PSCustomObject]@{
+            Path = $Path
+            Status = if ($missing) { 'Missing' } else { 'Error' }
+            Values = $null
+            Error = if ($missing) { $null } else { $_.Exception.Message }
+        }
+    }
+}
+'@
+}
+
+function Get-WindowsCollector-Symantec {
+    [CmdletBinding()]
+    param()
+    return @'
+function Get-SymantecInformation {
+    # Broadcom article 181033: native path for 14.3 RU5+, WOW6432Node for older x64 agents.
+    $registrations = @(foreach ($path in @(
+        'HKLM:\SOFTWARE\Symantec\Symantec Endpoint Protection\CurrentVersion\Public-Opstate'
+        'HKLM:\SOFTWARE\WOW6432Node\Symantec\Symantec Endpoint Protection\CurrentVersion\Public-Opstate'
+    )) { Read-MobileRegistryKey -Path $path })
+    $found = @($registrations | Where-Object Status -eq 'Found')
+    $errors = @($registrations | Where-Object Status -eq 'Error')
+    $definitions = $found | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_.Values.LatestVirusDefsDate)
+    } | Select-Object -First 1
+
+    [PSCustomObject]@{
+        Status = if ($definitions) { 'Collected' } elseif ($errors.Count) { 'CollectionFailed' }
+            elseif ($found.Count) { 'DefinitionsUnavailable' } else { 'NotDetected' }
+        # Preserve the vendor value; do not guess a date format or time zone.
+        DefinitionDate = if ($definitions) { $definitions.Values.LatestVirusDefsDate } else { $null }
+        DefinitionRevision = if ($definitions) { $definitions.Values.LatestVirusDefsRevision } else { $null }
+        SourcePath = if ($definitions) { $definitions.Path } else { $null }
+        Registrations = $registrations
+        Failures = @($errors | ForEach-Object { "$($_.Path): $($_.Error)" })
+    }
+}
+'@
+}
+
 function Get-WindowsCollector-Ivanti {
     [CmdletBinding()]
     param()
@@ -3380,37 +3433,55 @@ function Get-IvantiInformation {
     $paths = @(
         'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
         'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
-        'HKLM:\SOFTWARE\Wow6432Node\LANDesk\Inventory'
+        'HKLM:\SOFTWARE\WOW6432Node\LANDesk\Inventory'
         'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
     )
+    $registrations = @(foreach ($path in $paths) { Read-MobileRegistryKey -Path $path })
+    # Ivanti Endpoint Manager: Client connectivity / Core information.
+    $coreRegistrations = @(foreach ($path in @(
+        'HKLM:\SOFTWARE\WOW6432Node\Intel\LANDesk\LDWM'
+        'HKLM:\SOFTWARE\Intel\LANDesk\LDWM'
+    )) { Read-MobileRegistryKey -Path $path })
+    $core = $coreRegistrations | Where-Object {
+        $_.Status -eq 'Found' -and -not [string]::IsNullOrWhiteSpace([string]$_.Values.CoreServer)
+    } | Select-Object -First 1
 
-    $registrations = @(foreach ($path in $paths) {
-        $item = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
-        if ($item) {
-            [PSCustomObject]@{
-                Path    = $path
-                Version = $item.Version
-            }
-        }
-    })
+    $failures = [System.Collections.Generic.List[string]]::new()
+    foreach ($registration in (@($registrations) + @($coreRegistrations))) {
+        if ($registration.Status -eq 'Error') { $failures.Add("$($registration.Path): $($registration.Error)") }
+    }
+    $services = @()
+    $servicesCollected = $false
+    try {
+        $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
+            $_.Name -match '^(?:LANDesk|Ivanti)' -or $_.DisplayName -match 'Ivanti|LANDesk'
+        } | Select-Object Name, DisplayName, State, StartMode)
+        $servicesCollected = $true
+    } catch { $failures.Add("Services: $($_.Exception.Message)") }
 
-    $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
-        $_.Name -match '^(?:LANDesk|Ivanti)' -or $_.DisplayName -match 'Ivanti|LANDesk'
-    } | Select-Object Name, DisplayName, State, StartMode)
-
-    $version = @($registrations | Where-Object Version | Select-Object -First 1 -ExpandProperty Version)
+    $version = $registrations | Where-Object { $_.Status -eq 'Found' -and $_.Values.Version } |
+        Select-Object -First 1
     $automatic = @($services | Where-Object StartMode -eq 'Auto')
     $stopped = @($automatic | Where-Object State -ne 'Running')
+    $detected = (@($registrations + $coreRegistrations | Where-Object Status -eq 'Found').Count -gt 0 -or $services.Count -gt 0)
 
     [PSCustomObject]@{
-        Installed              = ($registrations.Count -gt 0 -or $services.Count -gt 0)
-        Version                = if ($version.Count) { $version[0] } else { $null }
+        Status                 = if ($failures.Count) { 'Partial' } elseif ($detected) { 'Collected' } else { 'NotDetected' }
+        Installed              = if ($detected) { $true } elseif ($failures.Count) { $null } else { $false }
+        Version                = if ($version) { $version.Values.Version } else { $null }
+        ConfiguredCoreServer   = if ($core) { $core.Values.CoreServer } else { $null }
+        CoreServerSourcePath   = if ($core) { $core.Path } else { $null }
+        CoreServerStatus       = if ($core) { 'Collected' }
+            elseif (@($coreRegistrations | Where-Object Status -eq 'Error').Count) { 'CollectionFailed' }
+            else { 'Unavailable' }
         Services               = $services
-        AutomaticServicesReady = if (-not $services.Count) { $null } else { $stopped.Count -eq 0 }
+        AutomaticServicesReady = if (-not $servicesCollected -or -not $automatic.Count) { $null } else { $stopped.Count -eq 0 }
         PolicyStatus           = $null
         LastPolicySync         = $null
         LastSecurityScan       = $null
         Registrations          = $registrations
+        CoreRegistrations      = $coreRegistrations
+        Failures               = $failures.ToArray()
     }
 }
 '@
@@ -3455,6 +3526,8 @@ function Get-WindowsInformationBlock {
     $parts = [System.Collections.Generic.List[string]]::new()
 
     # 1. Inject Child Functions
+    $parts.Add((Get-WindowsCollector-Registry))
+    $parts.Add((Get-WindowsCollector-Symantec))
     $parts.Add((Get-WindowsCollector-DiskSpace))
     $parts.Add((Get-WindowsCollector-Ivanti))
     $parts.Add((Get-WindowsCollector-SecurityUpdates))
@@ -3494,9 +3567,6 @@ $packages = @(
         Sort-Object DisplayName -Unique
 )
 
-# Symantec AV Definitions
-$symantecAvDefs = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Wow6432Node\Symantec\Symantec Endpoint Protection\AV\Storages\Definitions\VirusDefs' -ErrorAction SilentlyContinue).DefSetVersion
-
 # LAPS Scheduled Task Check
 $adminRotateScriptVersion = $null
 if (Get-ScheduledTask -TaskName 'ADMIN-LAPS' -ErrorAction SilentlyContinue) {
@@ -3521,6 +3591,7 @@ $licenseStatusMap = @{
 $activationStatus = if ($null -ne $activation) { $licenseStatusMap[[int]$activation] } else { 'Unknown' }
 
 # Execute Modular Collectors
+$symantecInfo = Get-SymantecInformation
 $diskInfo    = Get-DiskSpace
 $ivantiInfo  = Get-IvantiInformation
 $updateInfo  = Get-SecurityUpdateInformation
@@ -3537,8 +3608,11 @@ $systemDisk  = $diskInfo.Volumes | Where-Object Drive -eq $systemDrive | Select-
         Cores               = $cores
         PackageCount        = $packages.Count
         AdminRotateVersion  = $adminRotateScriptVersion
-        AVDefs              = $symantecAvDefs
+        AVDefs              = $symantecInfo.DefinitionDate
+        AVDefsRevision      = $symantecInfo.DefinitionRevision
+        AVDefsStatus        = $symantecInfo.Status
         IvantiVersion       = $ivantiInfo.Version
+        IvantiCoreServer    = $ivantiInfo.ConfiguredCoreServer
         IvantiServicesReady = $ivantiInfo.AutomaticServicesReady
         License             = $activationStatus
         LastUpdate          = $updateInfo.LastUpdate
@@ -3551,6 +3625,7 @@ $systemDisk  = $diskInfo.Volumes | Where-Object Drive -eq $systemDrive | Select-
         Updates  = $updateInfo.UpdateHistory
         Disks    = $diskInfo.Volumes
         Ivanti   = $ivantiInfo
+        Symantec = $symantecInfo
     }
 }
 '@)
