@@ -2624,7 +2624,7 @@ function Format-HostCollector {
             @{ Header = 'HOST';    Getter = { param($r) $r.HostName.ToUpper() } }
             @{ Header = 'OS';      Getter = { param($r) $r.Platform } }
             @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
-            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { [DateTime]::Parse($r.Summary.AVDefs).ToString('YY/MM/dd') } else { '-' } } }
+            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
             @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
             @{ Header = 'IVANTI CORE'; Getter = { param($r) if ($r.Success -and $r.Summary.IvantiCoreServer) { $r.Summary.IvantiCoreServer } else { '-' } } }
             @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
@@ -3683,7 +3683,7 @@ cores_value="$(nproc)"
 os=$(. /etc/os-release && echo "${ID^^}-${VERSION_ID}")
 kernel_value="$(uname -r)"
 
-clamav_value="$(clamscan -V 2>/dev/null | awk -F'/' '{print $NF}' | xargs -I{} date -d "{}" +'%d/%m/%Y' 2>/dev/null)"
+clamav_value="$(clamscan -V 2>/dev/null | awk -F'/' '{print $NF}' | xargs -I{} date -d "{}" +'%Y/%m/%d' 2>/dev/null)"
 
 last_update_value="$(
     (yum history list 2>/dev/null || dnf history list 2>/dev/null) |
