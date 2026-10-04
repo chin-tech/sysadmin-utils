@@ -2624,7 +2624,7 @@ function Format-HostCollector {
             @{ Header = 'HOST';    Getter = { param($r) $r.HostName.ToUpper() } }
             @{ Header = 'OS';      Getter = { param($r) $r.Platform } }
             @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
-            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
+            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { [DateTime]::Parse($r.Summary.AVDefs).ToString('YY/MM/dd') } else { '-' } } }
             @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
             @{ Header = 'IVANTI CORE'; Getter = { param($r) if ($r.Success -and $r.Summary.IvantiCoreServer) { $r.Summary.IvantiCoreServer } else { '-' } } }
             @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
