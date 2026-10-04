@@ -26,8 +26,7 @@
         'UnRegister-Deployment',
         'New-MobileDeployment'
         'Write-MobileFile'
-        'Set-MobileGpoPermission'
-        'Set-Debug'
+        'Set-MobileConfig'
         'Initialize-Environment'
     )
 

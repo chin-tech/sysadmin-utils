@@ -40,6 +40,13 @@ param(
     [Parameter(ParameterSetName = 'Info')]
     [switch]$Full,
 
+    [Parameter(ParameterSetName = 'RegisterDeployment')]
+    [switch]$Disjoin,
+
+    # Prepared keytab credential for Linux departure; never a plaintext password.
+    [Parameter(ParameterSetName = 'RegisterDeployment')]
+    [string]$LinuxDisjoinKeytab,
+
     # --- Force Switch (GPO Remove Only) ---
     [Parameter(ParameterSetName = 'GPORemove')]
     [switch]$Force,
@@ -59,19 +66,19 @@ param(
 # Import module from local directory
 $modulePath = Join-Path $PSScriptRoot 'MobileManager.psd1'
 Import-Module $modulePath -Force
-$overrideFile = "cfg.psd1"
-$ConfigOverRide = if (Test-Path $overrideFile) {
-    Import-PowerShellDataFile -Path $overrideFile
-} else {
-    $null
+$overrideFile = Join-Path $PSScriptRoot 'cfg.psd1'
+$overrides = @{}
+if (Test-Path -LiteralPath $overrideFile) {
+    $fileConfig = Import-PowerShellDataFile -Path $overrideFile
+    foreach ($key in $fileConfig.Keys) { $overrides[$key] = $fileConfig[$key] }
 }
-
+if ($ConfigOverride) {
+    foreach ($key in $ConfigOverride.Keys) { $overrides[$key] = $ConfigOverride[$key] }
+}
+Set-MobileConfig -Overrides $overrides
 
 $passThru = @{}
-if ($ConfigOverride) {
-    $passThru['Config'] = $ConfigOverride
-}
-if ($PSBoundParameters.ContainsKey('Debug')) {
+if ($enableDebug -or $PSBoundParameters.ContainsKey('Debug')) {
     $passThru['Debug'] = $true
 }
 
@@ -92,7 +99,7 @@ switch ($PSCmdlet.ParameterSetName) {
 
     'GPORemove' { Set-MobileGpoPermission -MobileName $Name -Remove -Force:$Force @passThru }
 
-    'RegisterDeployment' { Register-MobileDeployment -MobileName $Name @passThru }
+    'RegisterDeployment' { Register-MobileDeployment -MobileName $Name -Disjoin:$Disjoin -LinuxDisjoinKeytab $LinuxDisjoinKeytab @passThru }
 
     'UnRegisterDeployment' { UnRegister-Deployment -MobileName $Name -Archive:$Archive @passThru }
     'NewMobile' { New-MobileDeployment @passThru }

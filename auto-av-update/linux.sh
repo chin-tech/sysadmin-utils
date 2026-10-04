@@ -10,7 +10,7 @@ lsusb
 
 # Apply rule to usbguard (also add HID for good measure)
 
-sed -i -e '/aallow id "abcd:1234"' -e '/aallow with interface equals { 03:*:* }' /etc/usbguard/rules.conf
+sed -i -e '1aallow id "abcd:1234"' -e '2aallow with interface equals { 03:*:* }' /etc/usbguard/rules.conf
 
 VENDOR="abcd"
 PRODUCT="1234"

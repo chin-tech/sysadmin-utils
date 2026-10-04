@@ -15,19 +15,20 @@ if ($rawCfg.PSData.DefaultConfig) {
 
 $Script:DefaultConfig = $manifestCfg
 
-$adminRoot = $PSScriptRoot
+$adminRoot = if ($manifestCfg.adminRoot) { $manifestCfg.adminRoot } else { $PSScriptRoot }
 $nfsRoot   = if ($manifestCfg.nfsHomeRoot) { 
     $manifestCfg.nfsHomeRoot 
 } else { 
     "C:\Temp\Mobiles" 
 } # Or appropriate fallback path
 $mobileRoot = Join-Path $nfsRoot ".mobiles"
+$sshName = if ($manifestCfg.sshKeyName) { $manifestCfg.sshKeyName } else { "deployer" }
 $script:Config = [PSCustomObject]@{
     nfsHomeRoot        = $nfsRoot
     AdminRoot          = $adminRoot
     MobileRoot         = $mobileRoot
     GpoID              = $manifestCfg.GpoID
-    SshKeyName         = $manifestCfg.sshKey
+    SshKeyName         = $sshName
     CertName           = $manifestCfg.CertName
     fallbackPass       = $manifestCfg.fallbackPass
     curLuks            = $manifestCfg.curLuks
@@ -37,7 +38,7 @@ $script:Config = [PSCustomObject]@{
     mobileDefaultUsers = (Join-Path $mobileRoot '.default')
     MobileDump         = (Join-Path $mobileRoot '.dump')
     MobileDeployments  = (Join-Path $mobileRoot '.deployments')
-    SSHKeyPath         = Join-Path (Join-Path $nfsRoot $env:USERNAME) ".ssh\Deployer"
+    SSHKeyPath         = Join-Path (Join-Path (Join-Path $nfsRoot $env:USERNAME) ".ssh") $sshName
 }
 
 
@@ -303,10 +304,29 @@ $script:WindowsDeployBlock = {
     # Domain
     #
     if ($payload.DisJoin) {
-
-        $success = Invoke-Step  -Context 'Domain Disjoin'  -Action { Remove-Computer  -WorkGroupName $payload.MobileName  -Force  -Restart:$false  -ErrorAction Stop }
-
-        Add-Action  -Category 'Domain'  -Name 'Disjoin'  -Status $(if ($success) { 'Changed' } else { 'Failed' })
+        foreach ($u in $payload.AllUsers) {
+            $ready = Invoke-Step -Context "Local access '$($u.Name)'" -Action {
+                $localUser = Get-LocalUser -Name $u.Name -ErrorAction Stop
+                if (-not $localUser -or -not $localUser.Enabled) {
+                    throw 'Expected local account is missing or disabled.'
+                }
+                foreach ($g in $u.WindowsGroups) {
+                    $members = @(Get-LocalGroupMember -Group $g -ErrorAction Stop)
+                    if ($localUser.SID.Value -notin @($members | ForEach-Object { $_.SID.Value })) {
+                        throw "Expected membership in '$g' is missing."
+                    }
+                }
+            }
+            Add-Action -Category 'LocalAccess' -Name $u.Name -Status $(if ($ready) { 'OK' } else { 'Failed' })
+        }
+        if ($failures.Count -gt 0) {
+            Add-Action -Category 'Domain' -Name 'Disjoin' -Status 'Skipped' -Details 'Deployment prerequisites failed; machine remains on the domain.'
+        } else {
+            $success = Invoke-Step -Context 'Domain Disjoin' -Action {
+                Remove-Computer -WorkGroupName $payload.MobileName -Force -Restart:$false -ErrorAction Stop
+            }
+            Add-Action -Category 'Domain' -Name 'Disjoin' -Status $(if ($success) { 'Changed' } else { 'Failed' })
+        }
     }
 
     [PSCustomObject]@{
@@ -501,36 +521,48 @@ function ConvertTo-Base64 {
 
 
 
-function Get-MobileConfig {
+function Set-MobileConfig {
     [CmdletBinding()]
-    param(
-        [Parameter()]
-        [object]$CustomConfig
-    )
+    param([Parameter(Mandatory)][AllowEmptyCollection()][hashtable]$Overrides)
 
     $merged = @{}
-
-    # Copy defaults from the base script Config
-    if ($script:Config) {
-        foreach ($prop in $script:Config.PSObject.Properties) {
-            $merged[$prop.Name] = $prop.Value
+    foreach ($property in $script:Config.PSObject.Properties) {
+        $merged[$property.Name] = $property.Value
+    }
+    foreach ($key in $Overrides.Keys) {
+        if (-not $merged.ContainsKey($key)) { throw "Unknown mobile configuration key '$key'." }
+        if ([string]::IsNullOrWhiteSpace([string]$Overrides[$key])) {
+            throw "Mobile configuration '$key' cannot be empty."
         }
+        $merged[$key] = $Overrides[$key]
     }
 
-    # Overlay user-provided configs (supports Hashtable, PSCustomObject, or IDictionary)
-    if ($CustomConfig) {
-        if ($CustomConfig -is [System.Collections.IDictionary]) {
-            foreach ($k in $CustomConfig.Keys) {
-                $merged[$k] = $CustomConfig[$k]
-            }
-        } else {
-            foreach ($prop in $CustomConfig.PSObject.Properties) {
-                $merged[$prop.Name] = $prop.Value
+    # Recompute descendants only when their parent changed; explicit paths win.
+    if ($Overrides.ContainsKey('nfsHomeRoot')) {
+        if (-not $Overrides.ContainsKey('NfsHome')) {
+            $merged.NfsHome = Join-Path $merged.nfsHomeRoot $env:USERNAME
+        }
+        if (-not $Overrides.ContainsKey('MobileRoot')) {
+            $merged.MobileRoot = Join-Path $merged.nfsHomeRoot '.mobiles'
+        }
+    }
+    if ($Overrides.ContainsKey('nfsHomeRoot') -or $Overrides.ContainsKey('MobileRoot')) {
+        foreach ($child in @{ MobileEntries = 'entries'; mobileDefaultUsers = '.default'; MobileDump = '.dump'; MobileDeployments = '.deployments' }.GetEnumerator()) {
+            if (-not $Overrides.ContainsKey($child.Key)) {
+                $merged[$child.Key] = Join-Path $merged.MobileRoot $child.Value
             }
         }
     }
-
-    return [PSCustomObject]$merged
+    if ($Overrides.ContainsKey('nfsHomeRoot') -or $Overrides.ContainsKey('NfsHome') -or $Overrides.ContainsKey('SshKeyName')) {
+        if (-not $Overrides.ContainsKey('SSHKeyPath')) {
+            $merged.SSHKeyPath = Join-Path (Join-Path $merged.NfsHome '.ssh') $merged.SshKeyName
+        }
+    }
+    $parsedGuid = [guid]::Empty
+    if (-not [guid]::TryParse([string]$merged.GpoID, [ref]$parsedGuid)) {
+        throw 'GpoID must be a valid GUID.'
+    }
+    $script:Config = [PSCustomObject]$merged
 }
 
 # --- Private Helper Functions (Not Exported) ---
@@ -1000,7 +1032,7 @@ function New-ShortcutGPO {
         [string]$TargetOUFriendlyName,
 
         [Parameter()]
-        [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
+        [string]$GpoID = $script:Config.GpoID,
 
         [Parameter()]
         [string]$ShortcutName = "LocalAccountCreator",
@@ -1158,7 +1190,7 @@ function New-CustomGPO {
         [string]$TargetOUFriendlyName,
 
         [Parameter()]
-        [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
+        [string]$GpoID = $script:Config.GpoID,
 
         [Parameter()]
         [string]$GpoDisplayName = "Mobile Logon"
@@ -1438,7 +1470,7 @@ function Initialize-Environment {
     $cBytes = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($encCert))
     $LogOnScript = (Get-Content (Join-Path $MyInvocation.PSScriptRoot "MobileLogon.ps1") ) -replace 'PASTE_YOUR_BASE64_CERT_BLOB_HERE',$cBytes
 
-    $GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}"
+    $GpoID = $script:Config.GpoID
     $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
     $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
     $rootDSE = [ADSI]"LDAP://RootDSE"
@@ -2118,33 +2150,33 @@ fi
 
 
 function New-LinuxTask-LeaveDomain {
-    param($b64Ktab)
+    param([Parameter(Mandatory)][string]$b64Ktab)
+    if ($b64Ktab -notmatch '^[A-Za-z0-9+/]+={0,2}$') { throw 'Invalid base64 keytab.' }
 
-    $decodeTab = "@
-echo -n '$b64Ktab' | base64 -d > /tmp/k
-dzdo mv /tmp/k /root/kTab
-dzdo kinit -k -t /root/kTab
-which adleave &> /dev/null
-if [[ `$? -ne 0 ]]; then
-    record_action 'DomainDisjoin' '-' 'Failed'
-    record_failure 'DomainDisjoin failed due to adleave not existing'
+    return @"
+# Task: Domain Departure (only after provisioning and local account verification)
+if (( `${#failures[@]} > 0 )); then
+    record_action 'DomainDisjoin' '-' 'Skipped'
 else
-
-    if dzdo adleave -y; then
-         record_action 'DomainDisjoin' 'Left' 'Success'
-     else
-         record_action 'DomainDisjoin' 'Stay' 'Failure'
-         record_failure 'Couldn't disjoin from domain....'
+    keytab=`$(mktemp)
+    if [[ -z "`$keytab" ]]; then
+        record_failure 'Could not create temporary keytab'
+    elif ! printf '%s' '$b64Ktab' | base64 -d > "`$keytab"; then
+        record_failure 'Could not decode domain departure keytab'
+    elif ! dzdo kinit -k -t "`$keytab"; then
+        record_failure 'Could not authenticate domain departure'
+    elif ! command -v adleave >/dev/null 2>&1; then
+        record_failure 'Domain departure requires adleave'
+    elif dzdo adleave; then
+        record_action 'DomainDisjoin' 'Left' 'Success'
+    else
+        record_failure 'Could not disjoin from domain'
     fi
+    if [[ -n "`$keytab" ]]; then rm -f -- "`$keytab"; fi
+    if (( `${#failures[@]} > 0 )); then record_action 'DomainDisjoin' '-' 'Failed'; fi
 fi
- @"
-
-    return $decodeTab
-
+"@
 }
-
-
-
 
 function Get-LinuxDeployScript {
     [CmdletBinding()]
@@ -2169,7 +2201,7 @@ function Get-LinuxDeployScript {
     $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName)) {
         $group.Group |
             Where-Object { $null -ne $_.LinuxAccountType } |
-            Sort-Object { $script:GroupMetadata[$_.GroupType].LinuxPriority } -Descending |
+            Sort-Object { $script:GroupMetadata[$_.GroupType].Priority } -Descending |
             Select-Object -First 1
     }
 
@@ -2247,9 +2279,30 @@ jq -n \
 
     if (-not $SkipLuks) { $tasks.Add((New-LinuxTask-Luks  -CurrentPass $script:Config.curLuks  -NewPin $script:Config.encryptionPin)) }
 
-    if ($Disjoin) { $tasks.Add((New-LinuxTask-LeaveDomain -b64Ktab $b64kt))}
-
     if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) }
+
+    if ($Disjoin) {
+        if (-not $linuxUsers) { throw 'Domain departure requires at least one Linux account.' }
+        foreach ($u in $linuxUsers) {
+            $name = ConvertTo-BashArgument $u.LinuxName
+            $tasks.Add(@"
+# Verify the account is local, rather than merely resolvable through the domain.
+if awk -F: -v user=$name '`$1 == user { found=1 } END { exit !found }' /etc/passwd; then
+    record_action 'LocalAccess' $name 'Success'
+else
+    record_failure 'Expected local account $($u.LinuxName) is missing'
+fi
+"@)
+            if ($u.LinuxAccountType -eq [LinuxAccountType]::Wheel) {
+                $tasks.Add(@"
+if ! id -nG $name | tr ' ' '\n' | grep -qx wheel; then
+    record_failure 'Expected wheel membership for $($u.LinuxName) is missing'
+fi
+"@)
+            }
+        }
+        $tasks.Add((New-LinuxTask-LeaveDomain -b64Ktab $b64kt))
+    }
 
     # 4. Standardized JSON Output emitter
     $tasks.Add($footer)
@@ -2336,35 +2389,25 @@ function Get-UserCreds {
 ## MOBILE RETRIEVAL
 
 function Get-MobileData {
-    [CmdletBinding(DefaultParameterSetName = 'ExplicitPaths')]
+    [CmdletBinding()]
     param(
         [Parameter(Position = 0)]
         [string]$MobileName,
         
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [Parameter()]
         [ValidateNotNullOrEmpty()]
         [string]$defaultUserpath = $Script:Config.mobileDefaultUsers,
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [Parameter()]
         [ValidateNotNullOrEmpty()]
         [string]$mobileEntriesPath = $Script:Config.MobileEntries,
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [Parameter()]
         [ValidateNotNullOrEmpty()]
-        [string]$fallbackPass = $Script:Config.fallbackPass,
-        
-        [Parameter(Mandatory = $true, ParameterSetName = 'Config')]
-        [PSCustomObject]$Config
+        [string]$fallbackPass = $Script:Config.fallbackPass
 
     )
 
 
 
-
-    if ($PSCmdlet.ParameterSetName -eq 'Config') {
-        $cfg = Get-MobileConfig $Config
-        $defaultUserpath = $cfg.mobileDefaultUsers
-        $mobileEntriesPath = $cfg.MobileEntries
-        $fallbackPass = $cfg.fallbackPass
-    }
 
     $userPathExists = if (-not [string]::IsNullOrWhiteSpace($defaultUserpath)) { 
         Test-Path $defaultUserpath
@@ -2383,7 +2426,6 @@ function Get-MobileData {
     [MobileName] = $mobileName
     [defaultUserPath] = $defaultUserpath  ; Path Exists = $($userPathExists)
     [MobileEntriesPath] = $mobileEntriesPath ; Path Exists = $ $mobileEntriesExist)
-    [fallbackPass] = $fallbackPass  
     =====
  @" 
 
@@ -2391,7 +2433,7 @@ function Get-MobileData {
         Write-Error "[!] Ensure proper directory setup"
         Write-Warning "--- ${defaultUserPath}:${userPathExists}"
         Write-Warning "--- ${mobileEntriesPath}:${mobileEntriesExist}"
-        exit 1
+        throw "Mobile definition directories are unavailable."
     }
 
     $result = [PsCustomObject]@{
@@ -2411,8 +2453,11 @@ function Get-MobileData {
     if ([string]::IsNullOrWhiteSpace($MobileName)) {
         return [PSCustomObject]$result
     }
+    if ($MobileName -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*$' -or $MobileName.EndsWith('.')) {
+        throw 'Mobile name must be a simple filename using letters, digits, dots, underscores, or hyphens.'
+    }
     ## Default users
-    $result.DefaultUsers = Get-ChildItem -Force -Path $defaultUserpath | Get-Content | ConvertFrom-CSV 
+    $result.DefaultUsers = @(Get-ChildItem -File -Force -LiteralPath $defaultUserpath | Get-Content | ConvertFrom-Csv)
     Write-Debug " default user parsing: $($result.DefaultUsers)"
 
 
@@ -2461,7 +2506,7 @@ function Get-MobileData {
                         } else {
                             @()
                         }
-                        Name = $_.name
+                        Name = if ($_.fullname) { $_.fullname } else { $_.name }
                     }
                 }
         )
@@ -2479,6 +2524,7 @@ function Get-MobileData {
     $allUsers = [System.Collections.Generic.List[object]]::new()
 
     foreach ($u in $tmp) {
+        if ([string]::IsNullOrWhiteSpace($u.Username)) { throw 'Mobile user rows require a username.' }
         $grps = Set-Groups $u.Groups
         Write-Debug "$($u.Username) -- $($grps)"
         foreach ($grp in $grps) {
@@ -2647,54 +2693,37 @@ function Format-HostCollector {
 
 
 function Get-MobileOverview {
-    [CmdletBinding(DefaultParameterSetName = 'ExplicitPaths')]
+    [CmdletBinding()]
     param(
         [Parameter(Position = 0)]
         [string]$MobileName,
 
-        [Parameter(ParameterSetName = 'Config')]
-        [AllowNull()]
-        [object]$Config,
-
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [Parameter()]
         [string]$defaultUsersPath = $Script:Config.mobileDefaultUsers,
 
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [Parameter()]
         [string]$mobileEntriesPath = $Script:Config.MobileEntries,
 
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [Parameter()]
         [string]$fallBackPass = $Script:Config.fallbackPass,
 
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [Parameter()]
         [string]$nfsHome = $Script:Config.NfsHome,
 
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [Parameter()]
         [string]$mobileDumpPath = $Script:Config.MobileDump,
 
-        [Parameter(ParameterSetName = 'ExplicitPaths')]
+        [Parameter()]
         [string]$sshKeyPath = $Script:Config.SSHKeyPath,
 
         [Parameter()]
         [switch]$Full
     )
 
-    # 1. Resolve Active Paths Based on Parameter Set
-    if ($PSCmdlet.ParameterSetName -eq 'Config') {
-        $cfg = Get-MobileConfig $Config
-        $defaultUsersPath  = $cfg.mobileDefaultUsers
-        $mobileEntriesPath = $cfg.MobileEntries
-        $fallBackPass      = $cfg.fallbackPass
-        $nfsHome           = $cfg.NfsHome
-        $sshKeyPath        = $cfg.SSHKeyPath
-        $mobileDumpPath    = $cfg.MobileDump
-
-        $data = Get-MobileData -MobileName $MobileName -Config $cfg
-    } else {
-        $data = Get-MobileData -MobileName $MobileName `
-            -defaultUserpath $defaultUsersPath `
-            -mobileEntriesPath $mobileEntriesPath `
-            -fallbackPass $fallBackPass
-    }
+    $data = Get-MobileData -MobileName $MobileName `
+        -defaultUserpath $defaultUsersPath `
+        -mobileEntriesPath $mobileEntriesPath `
+        -fallbackPass $fallBackPass
 
     $width = 76
 
@@ -2809,7 +2838,7 @@ function Set-MobileGpoPermission {
         [string]$MobileName,
 
         [Parameter()]
-        [string]$GpoID = "{00000000-7E5A-C0DE-7E5A-000000000000}",
+        [string]$GpoID = $script:Config.GpoID,
 
         [Parameter(Mandatory = $true, ParameterSetName = 'Add')]
         [switch]$Add,
@@ -3186,13 +3215,16 @@ function Register-MobileDeployment {
         [string]$oldEncryption = $Script:Config.curLuks,
         [string]$mobileDump    = $Script:Config.mobileDump,
         [string]$nfsHome       = $Script:Config.NfsHome,
-        [switch]$Disjoin
+        [switch]$Disjoin,
+        [string]$LinuxDisjoinKeytab
     )
 
-    # $cfg = Get-MobileConfig $Config
-    # Initialize-Functionality -sshKeyPath $sshKeyPath -nfsHome $nfsHome -adminRoot $adminRoot  -certName $certName
+    $mobileData = Get-MobileData -MobileName $MobileName
+    if ($Disjoin -and $mobileData.Linux.Count -gt 0 -and
+        $LinuxDisjoinKeytab -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
+        throw 'Linux domain departure requires a prepared base64 keytab via -LinuxDisjoinKeytab.'
+    }
     if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
-    $mobileData = Get-MobileData -MobileName $MobileName 
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump 
     $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
     
@@ -3207,12 +3239,15 @@ function Register-MobileDeployment {
     }
 
     $winErrors = [System.Collections.Generic.List[object]]::new()
-    $rawWindows = Invoke-Command `
-        -ComputerName $mobileData.Windows `
-        -ScriptBlock $Script:WindowsDeployBlock `
-        -ArgumentList $windowsPayload `
-        -ErrorVariable winErrors `
-        -ErrorAction SilentlyContinue
+    $rawWindows = @()
+    if (@($mobileData.Windows).Count -gt 0) {
+        $rawWindows = Invoke-Command `
+            -ComputerName $mobileData.Windows `
+            -ScriptBlock $Script:WindowsDeployBlock `
+            -ArgumentList $windowsPayload `
+            -ErrorVariable winErrors `
+            -ErrorAction SilentlyContinue
+    }
 
 
     $winResults = @(
@@ -3263,14 +3298,11 @@ function Register-MobileDeployment {
     $linRes = @()
     $linResults = @()
     if ($mobileData.Linux.Count -gt 0) {
-        $curDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
-        $DC = $curDomain.FindDomainController().Name
         $linSplat = @{ allUsers = $mobileData.AllUsers }
         if ($disjoin) {
-            $linSplat['disjoin'] = $Disjoin
-            $linSplat['b64kt'] = New-RemoteKeytabBase64 -DomainController $DC -Principal $env:USERNAME -SecurePassword  (ConvertTo-SecureString -AsPlainText -Force $secretPass)
+            $linSplat['disjoin'] = $true
+            $linSplat['b64kt'] = $LinuxDisjoinKeytab
         }
-        # $linuxDeploy = Get-LinuxDeployScript -allUsers $mobileData.AllUsers -Disjoin:$Disjoin 
         $linuxDeploy = Get-LinuxDeployScript @linSplat
         $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $sshKeyPath
     
@@ -4535,10 +4567,11 @@ function Write-MobileFile {
         [string]$mobilesPath   = $script:Config.MobileEntries
     )
 
-    Write-Host $Script:Config.Keys
-    Write-Host $newMobile.MobileName
-    Write-Host $mobilesPath
-    $outPath = Join-Path $Script:Config.MobileEntries $newMobile.MobileName
+    if ($newMobile.MobileName -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*$' -or
+        $newMobile.MobileName.EndsWith('.')) {
+        throw 'Mobile name must be a simple filename using letters, digits, dots, underscores, or hyphens.'
+    }
+    $outPath = Join-Path $mobilesPath $newMobile.MobileName
     Write-Host "[+] Mobile getting written to $outpath"
     $lines = [System.Collections.Generic.List[string]]::new()
 
@@ -4560,9 +4593,12 @@ function Write-MobileFile {
 
     # [users]
     $lines.Add('[users]')
-    $lines.Add('username,groups,fullname')
-    foreach ($u in $newMobile.Users) {
-        $lines.Add("$($u.username),$($u.groups),$($u.fullname)")
+    if (@($newMobile.Users).Count -gt 0) {
+        foreach ($row in ($newMobile.Users | Select-Object username, groups, fullname | ConvertTo-Csv -NoTypeInformation)) {
+            $lines.Add($row)
+        }
+    } else {
+        $lines.Add('username,groups,fullname')
     }
 
     # Write out without BOM issues or extra blank lines
@@ -4732,7 +4768,7 @@ function Get-LinuxUnregisterScript {
         $group.Group |
             Where-Object { $null -ne $_.LinuxAccountType } |
             Sort-Object {
-                $script:GroupMetadata[$_.GroupType].LinuxPriority
+                $script:GroupMetadata[$_.GroupType].Priority
             } -Descending |
             Select-Object -First 1
     }
