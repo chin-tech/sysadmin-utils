@@ -34,6 +34,7 @@ $script:Config = [PSCustomObject]@{
     fallbackPass       = $manifestCfg.fallbackPass
     curLuks            = $manifestCfg.curLuks
     encryptionPin      = $manifestCfg.encryptionPin
+    mobileOU           = $manifestCfg.MobileOU
     NfsHome            = (Join-Path $nfsRoot $env:USERNAME)
     MobileEntries      = (Join-Path $mobileRoot 'entries')
     mobileDefaultUsers = (Join-Path $mobileRoot '.default')
