@@ -47,6 +47,15 @@ param(
     [Parameter(ParameterSetName = 'RegisterDeployment')]
     [string]$LinuxDisjoinKeytab,
 
+    [Parameter(ParameterSetName = 'RegisterDeployment')]
+    [string]$DomainController,
+
+    [Parameter(ParameterSetName = 'RegisterDeployment')]
+    [string]$DomainPrincipal,
+
+    [Parameter(ParameterSetName = 'RegisterDeployment')]
+    [int]$DomainKeyVersion = 0,
+
     # --- Force Switch (GPO Remove Only) ---
     [Parameter(ParameterSetName = 'GPORemove')]
     [switch]$Force,
@@ -99,7 +108,7 @@ switch ($PSCmdlet.ParameterSetName) {
 
     'GPORemove' { Set-MobileGpoPermission -MobileName $Name -Remove -Force:$Force @passThru }
 
-    'RegisterDeployment' { Register-MobileDeployment -MobileName $Name -Disjoin:$Disjoin -LinuxDisjoinKeytab $LinuxDisjoinKeytab @passThru }
+    'RegisterDeployment' { Register-MobileDeployment -MobileName $Name -Disjoin:$Disjoin -LinuxDisjoinKeytab $LinuxDisjoinKeytab -DomainController $DomainController -DomainPrincipal $DomainPrincipal -DomainKeyVersion $DomainKeyVersion @passThru }
 
     'UnRegisterDeployment' { UnRegister-Deployment -MobileName $Name -Archive:$Archive @passThru }
     'NewMobile' { New-MobileDeployment @passThru }

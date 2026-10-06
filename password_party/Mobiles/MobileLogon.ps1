@@ -8,8 +8,8 @@
 
 .DESCRIPTION
     This is the "client-side" half of the deployer credential flow:
-      1. New-DeployerCertificate (elsewhere) creates a DocumentEncryptionCert
-         and exports Deployer.pfx (private key) + Deployer.cer (public key).
+      1. Test-AndFixDeployerCert resolves or creates a DocumentEncryptionCert
+         and returns its public certificate as base64 for embedding here.
       2. THIS script only needs the public cert (embedded below as base64)
          -- it encrypts with Protect-CmsMessage and never touches the
          private key.

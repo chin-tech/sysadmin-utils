@@ -43,6 +43,7 @@
                 sshKeyName     = 'deployer'
                 certName       = 'deployer'
                 fallbackPass    = 'MeowMeow123!@#'
+                mobileOU        = 'Labusers' 
                 curLuks         = 'defaultLuks123!@#'
                 encryptionPin     = 'defaultPin123!@#'
                 adminRoot = "C:\TEMP"

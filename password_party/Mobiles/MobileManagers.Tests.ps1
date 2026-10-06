@@ -160,19 +160,4 @@ Describe 'Start-MobileDeployment' {
     }
 }
 
-Describe 'New-DeployerCertificate' {
-    BeforeAll {
-        Mock -CommandName New-SelfSignedCertificate -ModuleName MobileManager -MockWith {
-            [PSCustomObject]@{ Thumbprint = 'FAKE' }
-        }
-        Mock -CommandName Export-PFXCertificate -ModuleName MobileManager -MockWith { }
-        Mock -CommandName Export-Certificate -ModuleName MobileManager -MockWith { }
-    }
-
-    It 'does not throw when certPass is supplied as SecureString' {
-        {
-            New-DeployerCertificate -certPass (ConvertTo-SecureString 'x' -AsPlainText -Force) `
-                -outPath $TestDrive
-        } | Should -Not -Throw
-    }
-}
+# Certificate provisioning is covered by tests/Verify-DeployerCertificate.ps1.
