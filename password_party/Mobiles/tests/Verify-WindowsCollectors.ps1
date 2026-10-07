@@ -7,7 +7,8 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot -Parent) 'MobileManager.psm1'), [ref]$tokens, [ref]$issues)
 if ($issues.Count) { throw ($issues.Message -join "`n") }
 $names = @('Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
-    'Get-WindowsInformationBlock', 'Get-WindowsCollector-DiskSpace', 'Get-WindowsCollector-SecurityUpdates')
+    'Get-WindowsInformationBlock', 'Get-WindowsCollector-DiskSpace', 'Get-WindowsCollector-SecurityUpdates',
+    'New-WindowsPostTask-NetworkSharing', 'New-WindowsPostTask-UserRights', 'Get-PostDeployScript')
 $definitions = $ast.FindAll({ param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
 }, $false) | ForEach-Object { $_.Extent.Text }
@@ -84,6 +85,25 @@ try {
         [System.Management.Automation.Language.Parser]::ParseInput($block.ToString(), [ref]$tokens, [ref]$errors) | Out-Null
         Assert ($errors.Count -eq 0) 'Composed Windows collector failed to parse'
         Assert ($block.ToString().Contains('IvantiCoreServer') -and $block.ToString().Contains('AVDefsRevision')) 'Composed summary omitted new telemetry'
+        # Optional post-deployment fragments must compose into executable PowerShell.
+        $payloads = @(
+            New-WindowsPostTask-NetworkSharing
+            New-WindowsPostTask-NetworkSharing -DriveLetters C, D
+            foreach ($sharing in @($false, $true)) {
+                foreach ($linux in @($false, $true)) {
+                    New-WindowsPostTask-UserRights -Sharing:$sharing -HasLinux:$linux
+                    foreach ($rights in @($false, $true)) {
+                        Get-PostDeployScript -Sharing:$sharing -HasLinux:$linux -UserRights:$rights
+                    }
+                }
+            }
+        )
+        foreach ($payload in $payloads) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseInput($payload, [ref]$tokens, [ref]$errors) | Out-Null
+            Assert ($errors.Count -eq 0) 'Generated post-deployment payload failed to parse'
+        }
         'PASS: SEP native/legacy values, missing/denied keys, Ivanti core server, partial service failures, and composed script syntax.'
     }
 } finally { Remove-Module $module -ErrorAction SilentlyContinue }

@@ -306,7 +306,7 @@ function Invoke-Linux {
 
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = "ssh"
-            $psi.Arguments = "-i `"$key`" -o UpdateHostKeys=no -o BatchMode=yes -o StrictHostKeyChecking=no $target `"bash -s --`""
+            $psi.Arguments = "-i `"$key`" -o UpdateHostKeys=no -o BatchMode=yes -o StrictHostKeyChecking=no -q $target `"bash -s --`""
             $psi.RedirectStandardInput = $true
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
@@ -735,16 +735,10 @@ function Find-ADComputerMatch {
     $pMatches = foreach ($res in $results) {
         $props = $res.Properties
         [PSCustomObject]@{
-            Name            = if ($props.Contains('name')) { $props['name'][0]
-            } else { ''
-            }
-            DnsHostName     = if ($props.Contains('dnshostname')) { $props['dnshostname'][0]
-            } else { ''
-            }
-            OperatingSystem = if ($props.Contains('operatingsystem')) { $props['operatingsystem'][0]
-            } else { ''
-            }
-            DisplayText     = "$($props['name'][0]) ($($props['operatingsystem'][0]))"
+            Name            = if ($props.Contains('name')) { $props['name'][0] } else { '' }
+            DnsHostName     = if ($props.Contains('dnshostname')) { $props['dnshostname'][0] } else { '' }
+            OperatingSystem = if ($props.Contains('operatingsystem')) { $props['operatingsystem'][0] } else { '' }
+            DisplayText     = "$($props['name'][0]) ($($props['operatingsystem'][0]))" 
         }
     }
 
@@ -1972,6 +1966,9 @@ function New-MobileDeployment {
 
 #region Windows provisioning and cleanup
 
+# Literal PowerShell payloads use scriptblocks for editor highlighting and parse checks.
+# Convert them to text only when assembling scripts or passing them to remote/task APIs.
+
 function Get-WindowsTask-LogArchiver {
     return {
         $system = Get-CimInstance -ClassName Win32_ComputerSystem
@@ -2017,64 +2014,61 @@ function New-WindowsPostTask-NetworkSharing {
         (($DriveLetters | ForEach-Object { "'$_'" }) -join ',') +
         ')'
     } else {
-        @'
-$driveList = @(
-    Get-PSDrive -PSProvider FileSystem |
-        Select-Object -ExpandProperty Name
-)
-'@
+        ({
+            $driveList = @(
+                Get-PSDrive -PSProvider FileSystem |
+                    Select-Object -ExpandProperty Name
+            )
+        }).ToString()
     }
 
-    return  $driveInit + @'
-# Task: Network Sharing
+    return  $driveInit + ({
+            # Task: Network Sharing
 
 
-try {
-    Enable-NetFirewallRule `
-        -DisplayGroup 'File and Printer Sharing' `
-        -ErrorAction Stop
-
-    $failedShares = @()
-
-    foreach ($d in $driveList) {
-        $path = "${d}:\"
-
-        if (-not (Test-Path $path)) {
-            $failedShares += "$path does not exist"
-            continue
-        }
-
-        if (-not (Get-SmbShare -Name $d -ErrorAction SilentlyContinue)) {
             try {
-                New-SmbShare `
-                    -Name $d `
-                    -Path $path `
-                    -FullAccess 'Authenticated Users','mobile-smb-access' `
-                    -ErrorAction Stop |
-                    Out-Null
-            }
-            catch {
-                $failedShares += "$d : $($_.Exception.Message)"
-            }
-        }
-    }
+                Enable-NetFirewallRule `
+                    -DisplayGroup 'File and Printer Sharing' `
+                    -ErrorAction Stop
 
-    if ($failedShares.Count -eq 0) {
-        record_action 'NetworkSharing' 'SMB' 'Success'
-    }
-    else {
-        record_action 'NetworkSharing' 'SMB' 'Failed'
+                $failedShares = @()
 
-        foreach ($failure in $failedShares) {
-            record_failure "Network sharing: $failure"
-        }
-    }
-}
-catch {
-    record_action 'NetworkSharing' 'SMB' 'Failed'
-    record_failure "Network sharing failed: $($_.Exception.Message)"
-}
-'@
+                foreach ($d in $driveList) {
+                    $path = "${d}:\"
+
+                    if (-not (Test-Path $path)) {
+                        $failedShares += "$path does not exist"
+                        continue
+                    }
+
+                    if (-not (Get-SmbShare -Name $d -ErrorAction SilentlyContinue)) {
+                        try {
+                            New-SmbShare `
+                                -Name $d `
+                                -Path $path `
+                                -FullAccess 'Authenticated Users','mobile-smb-access' `
+                                -ErrorAction Stop |
+                                Out-Null
+                        } catch {
+                            $failedShares += "$d : $($_.Exception.Message)"
+                        }
+                    }
+                }
+
+                if ($failedShares.Count -eq 0) {
+                    record_action 'NetworkSharing' 'SMB' 'Success'
+                } else {
+                    record_action 'NetworkSharing' 'SMB' 'Failed'
+
+                    foreach ($failure in $failedShares) {
+                        record_failure "Network sharing: $failure"
+                    }
+                }
+            } catch {
+                record_action 'NetworkSharing' 'SMB' 'Failed'
+                record_failure "Network sharing failed: $($_.Exception.Message)"
+            }
+        }).ToString()
 }
 
 function New-WindowsPostTask-UserRights {
@@ -2087,130 +2081,127 @@ function New-WindowsPostTask-UserRights {
     $sharingSetup = ''
 
     if ($Sharing -and $HasLinux) {
-        $sharingSetup = @'
-$smbPass = ConvertTo-SecureString 'SupeSecretSMBP@ssw0rd99' -AsPlainText -Force
+        $sharingSetup = ({
+                $smbPass = ConvertTo-SecureString 'SupeSecretSMBP@ssw0rd99' -AsPlainText -Force
 
-if (-not (Get-LocalUser -Name 'mobile-smb-access' -ErrorAction SilentlyContinue)) {
-    New-LocalUser `
-        -Name 'mobile-smb-access' `
-        -Password $smbPass |
-        Out-Null
-}
-
-$sharingSid = (Get-LocalUser -Name 'mobile-smb-access').Sid.Value
-
-'@
-    }
-
-    return $sharingSetup + @'
-# Task: User Rights
-
-
-
-$tmpSec = Join-Path -Path $env:TEMP -ChildPath 'sec_export.inf'
-$tmpDB  = Join-Path -Path $env:TEMP -ChildPath 'sec_temp.sdb'
-
-secedit /export /cfg $tmpSec /areas USER_RIGHTS /quiet
-
-$objUser = [System.Security.Principal.NTAccount]'Authenticated Users'
-$objSid  = $objUser.Translate( [System.Security.Principal.SecurityIdentifier]).Value
-
-$rights = @(
-    'SeInteractiveLogonRight',
-    'SeRemoteInteractiveLogonRight',
-    'SeNetworkLogonRight'
-)
-
-$denyRights = @(
-    'SeDenyInteractiveLogonRight',
-    'SeDenyRemoteInteractiveLogonRight',
-    'SeDenyBatchLogonRight',
-    'SeDenyServiceLogonRight'
-)
-
-$cfg = Get-Content -Path $tmpSec -Raw -Encoding Unicode
-
-# Ensure the [Privilege Rights] header exists
-if ($cfg -notmatch '(?m)^\[Privilege Rights\]') { $cfg += "`r`n[Privilege Rights]`r`n" }
-
-function Add-PrivilegeRight {
-    param(
-        [string]$ConfigText,
-        [string]$RightName,
-        [string]$RawSid
-    )
-
-    $secSid = "*$RawSid"
-    $pattern = "(?m)^(\s*$([regex]::Escape($RightName))\s*=\s*)([^\r\n]*)"
-
-    $matchResult = [regex]::Match($ConfigText, $pattern)
-
-    if ($matchResult.Success) {
-
-        $existingSids = @( $matchResult.Groups[2].Value.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-
-        if ($secSid -notin $existingSids) {
-
-            $newValues = @($existingSids + $secSid) -join ','
-
-            $ConfigText = [regex]::Replace(
-                $ConfigText,
-                $pattern,
-                {
-                    param($match)
-                    $match.Groups[1].Value + $newValues
+                if (-not (Get-LocalUser -Name 'mobile-smb-access' -ErrorAction SilentlyContinue)) {
+                    New-LocalUser `
+                        -Name 'mobile-smb-access' `
+                        -Password $smbPass |
+                        Out-Null
                 }
+
+                $sharingSid = (Get-LocalUser -Name 'mobile-smb-access').Sid.Value
+            }).ToString()
+    }
+
+    return $sharingSetup + {
+        # Task: User Rights
+
+
+
+        $tmpSec = Join-Path -Path $env:TEMP -ChildPath 'sec_export.inf'
+        $tmpDB  = Join-Path -Path $env:TEMP -ChildPath 'sec_temp.sdb'
+
+        secedit /export /cfg $tmpSec /areas USER_RIGHTS /quiet
+
+        $objUser = [System.Security.Principal.NTAccount]'Authenticated Users'
+        $objSid  = $objUser.Translate( [System.Security.Principal.SecurityIdentifier]).Value
+
+        $rights = @(
+            'SeInteractiveLogonRight',
+            'SeRemoteInteractiveLogonRight',
+            'SeNetworkLogonRight'
+        )
+
+        $denyRights = @(
+            'SeDenyInteractiveLogonRight',
+            'SeDenyRemoteInteractiveLogonRight',
+            'SeDenyBatchLogonRight',
+            'SeDenyServiceLogonRight'
+        )
+
+        $cfg = Get-Content -Path $tmpSec -Raw -Encoding Unicode
+
+        # Ensure the [Privilege Rights] header exists
+        if ($cfg -notmatch '(?m)^\[Privilege Rights\]') { $cfg += "`r`n[Privilege Rights]`r`n" }
+
+        function Add-PrivilegeRight {
+            param(
+                [string]$ConfigText,
+                [string]$RightName,
+                [string]$RawSid
             )
+
+            $secSid = "*$RawSid"
+            $pattern = "(?m)^(\s*$([regex]::Escape($RightName))\s*=\s*)([^\r\n]*)"
+
+            $matchResult = [regex]::Match($ConfigText, $pattern)
+
+            if ($matchResult.Success) {
+
+                $existingSids = @( $matchResult.Groups[2].Value.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+                if ($secSid -notin $existingSids) {
+
+                    $newValues = @($existingSids + $secSid) -join ','
+
+                    $ConfigText = [regex]::Replace(
+                        $ConfigText,
+                        $pattern,
+                        {
+                            param($match)
+                            $match.Groups[1].Value + $newValues
+                        }
+                    )
+                }
+            } else {
+                $ConfigText = $ConfigText -replace `
+                    '(?m)^\[Privilege Rights\]', `
+                    "[Privilege Rights]`r`n$RightName = $secSid"
+            }
+
+            return $ConfigText
         }
-    }
-    else {
-        $ConfigText = $ConfigText -replace `
-            '(?m)^\[Privilege Rights\]', `
-            "[Privilege Rights]`r`n$RightName = $secSid"
-    }
 
-    return $ConfigText
-}
+        # 1. Apply grant rights
+        foreach ($r in $rights) {
+            $cfg = Add-PrivilegeRight `
+                -ConfigText $cfg `
+                -RightName $r `
+                -RawSid $objSid
+        }
 
-# 1. Apply grant rights
-foreach ($r in $rights) {
-    $cfg = Add-PrivilegeRight `
-        -ConfigText $cfg `
-        -RightName $r `
-        -RawSid $objSid
-}
+        # 2. Apply deny rights
+        if ($sharingSid) {
+            foreach ($r in $denyRights) {
+                $cfg = Add-PrivilegeRight `
+                    -ConfigText $cfg `
+                    -RightName $r `
+                    -RawSid $sharingSid
+            }
+        }
 
-# 2. Apply deny rights
-if ($sharingSid) {
-    foreach ($r in $denyRights) {
-        $cfg = Add-PrivilegeRight `
-            -ConfigText $cfg `
-            -RightName $r `
-            -RawSid $sharingSid
-    }
-}
+        # Write configuration
+        $cfg | Set-Content -Path $tmpSec -Encoding Unicode
 
-# Write configuration
-$cfg | Set-Content -Path $tmpSec -Encoding Unicode
+        # Apply configuration
+        secedit /configure `
+            /db $tmpDB `
+            /cfg $tmpSec `
+            /areas USER_RIGHTS `
+            /quiet
 
-# Apply configuration
-secedit /configure `
-    /db $tmpDB `
-    /cfg $tmpSec `
-    /areas USER_RIGHTS `
-    /quiet
+        if ($LASTEXITCODE -eq 0) {
+            record_action 'UserRights' 'LocalSecurityPolicy' 'Success'
+        } else {
+            record_action 'UserRights' 'LocalSecurityPolicy' 'Failed'
+            record_failure "User rights configuration failed: exit code $LASTEXITCODE"
+        }
 
-if ($LASTEXITCODE -eq 0) {
-    record_action 'UserRights' 'LocalSecurityPolicy' 'Success'
-}
-else {
-    record_action 'UserRights' 'LocalSecurityPolicy' 'Failed'
-    record_failure "User rights configuration failed: exit code $LASTEXITCODE"
-}
-
-# Cleanup
-Remove-Item -Path $tmpSec, $tmpDB -Force -ErrorAction SilentlyContinue
-'@
+        # Cleanup
+        Remove-Item -Path $tmpSec, $tmpDB -Force -ErrorAction SilentlyContinue
+    }.ToString()
 }
 
 function Get-PostDeployScript {
@@ -2225,52 +2216,52 @@ function Get-PostDeployScript {
 
     $tasks = [System.Collections.Generic.List[string]]::new()
 
-    $tasks.Add(@'
-# ==================
-# Automated Post-Deployment
-# ==================
+    $tasks.Add(({
+                # ==================
+                # Automated Post-Deployment
+                # ==================
 
-$actions = [System.Collections.Generic.List[object]]::new()
-$failures = [System.Collections.Generic.List[string]]::new()
+                $actions = [System.Collections.Generic.List[object]]::new()
+                $failures = [System.Collections.Generic.List[string]]::new()
 
-function record_action {
-    param(
-        [string]$Category,
-        [string]$Name,
-        [string]$Status,
-        $Details = $null
-    )
+                function record_action {
+                    param(
+                        [string]$Category,
+                        [string]$Name,
+                        [string]$Status,
+                        $Details = $null
+                    )
 
-    $actions.Add([PSCustomObject]@{
-        Category = $Category
-        Name     = $Name
-        Status   = $Status
-        Details  = $Details
-    })
-}
+                    $actions.Add([PSCustomObject]@{
+                            Category = $Category
+                            Name     = $Name
+                            Status   = $Status
+                            Details  = $Details
+                        })
+                }
 
-function record_failure {
-    param([string]$Message)
+                function record_failure {
+                    param([string]$Message)
 
-    $failures.Add($Message)
-}
-'@)
+                    $failures.Add($Message)
+                }
+            }).ToString())
 
     if ($UserRights) { $tasks.Add( (New-WindowsPostTask-UserRights  -Sharing:$Sharing  -HasLinux:$HasLinux)) }
 
     if ($Sharing) { $tasks.Add( (New-WindowsPostTask-NetworkSharing  -DriveLetters $DriveLetters)) }
 
-    $tasks.Add(@'
-"[ Post Deployment Ran - $(Get-Date) ]" |
-    Out-File C:\Post-Deploy.info
+    $tasks.Add(({
+                "[ Post Deployment Ran - $(Get-Date) ]" |
+                    Out-File C:\Post-Deploy.info
 
-[PSCustomObject]@{
-    Platform = 'Windows'
-    Success  = ($failures.Count -eq 0)
-    Actions  = $actions.ToArray()
-    Failures = $failures.ToArray()
-} | Export-CLIXML C:\Post-Deployment.xml
-'@)
+                [PSCustomObject]@{
+                    Platform = 'Windows'
+                    Success  = ($failures.Count -eq 0)
+                    Actions  = $actions.ToArray()
+                    Failures = $failures.ToArray()
+                } | Export-CLIXML C:\Post-Deployment.xml
+            }).ToString())
 
     return ($tasks -join "`n`n")
 }
@@ -3253,178 +3244,178 @@ jq -n \
 function Get-WindowsCollector-Registry {
     [CmdletBinding()]
     param()
-    return @'
-function Read-MobileRegistryKey {
-    param([Parameter(Mandatory)][string]$Path)
-    try {
-        $values = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
-        [PSCustomObject]@{ Path = $Path; Status = 'Found'; Values = $values; Error = $null }
-    } catch {
-        $missing = $_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound
-        [PSCustomObject]@{
-            Path = $Path
-            Status = if ($missing) { 'Missing' } else { 'Error' }
-            Values = $null
-            Error = if ($missing) { $null } else { $_.Exception.Message }
-        }
-    }
-}
-'@
+    return ({
+            function Read-MobileRegistryKey {
+                param([Parameter(Mandatory)][string]$Path)
+                try {
+                    $values = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
+                    [PSCustomObject]@{ Path = $Path; Status = 'Found'; Values = $values; Error = $null }
+                } catch {
+                    $missing = $_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound
+                    [PSCustomObject]@{
+                        Path = $Path
+                        Status = if ($missing) { 'Missing' } else { 'Error' }
+                        Values = $null
+                        Error = if ($missing) { $null } else { $_.Exception.Message }
+                    }
+                }
+            }
+        }).ToString()
 }
 
 function Get-WindowsCollector-DiskSpace {
     [CmdletBinding()]
     param()
 
-    return @'
-function Get-DiskSpace {
-    param([int]$MinimumFreeGB = 20, [int]$MinimumFreePercent = 10)
+    return ({
+            function Get-DiskSpace {
+                param([int]$MinimumFreeGB = 20, [int]$MinimumFreePercent = 10)
 
-    $volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' -ErrorAction Stop | ForEach-Object {
-        $freeGB = [math]::Round($_.FreeSpace / 1GB, 2)
-        $totalGB = [math]::Round($_.Size / 1GB, 2)
-        $freePercent = if ($_.Size -gt 0) { [math]::Round(100 * $_.FreeSpace / $_.Size, 1) } else { 0 }
+                $volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' -ErrorAction Stop | ForEach-Object {
+                        $freeGB = [math]::Round($_.FreeSpace / 1GB, 2)
+                        $totalGB = [math]::Round($_.Size / 1GB, 2)
+                        $freePercent = if ($_.Size -gt 0) { [math]::Round(100 * $_.FreeSpace / $_.Size, 1) } else { 0 }
 
-        [PSCustomObject]@{
-            Drive       = $_.DeviceID
-            TotalGB     = $totalGB
-            FreeGB      = $freeGB
-            FreePercent = $freePercent
-            LowSpace    = ($freeGB -lt $MinimumFreeGB -or $freePercent -lt $MinimumFreePercent)
-        }
-    })
+                        [PSCustomObject]@{
+                            Drive       = $_.DeviceID
+                            TotalGB     = $totalGB
+                            FreeGB      = $freeGB
+                            FreePercent = $freePercent
+                            LowSpace    = ($freeGB -lt $MinimumFreeGB -or $freePercent -lt $MinimumFreePercent)
+                        }
+                    })
 
-    return [PSCustomObject]@{
-        Volumes = $volumes
-        LowSpace = @($volumes | Where-Object LowSpace).Count -gt 0
-    }
-}
-'@
+                return [PSCustomObject]@{
+                    Volumes = $volumes
+                    LowSpace = @($volumes | Where-Object LowSpace).Count -gt 0
+                }
+            }
+        }).ToString()
 
 }
 
 function Get-WindowsCollector-Symantec {
     [CmdletBinding()]
     param()
-    return @'
-function Get-SymantecInformation {
-    # Broadcom article 181033: native path for 14.3 RU5+, WOW6432Node for older x64 agents.
-    $registrations = @(foreach ($path in @(
-        'HKLM:\SOFTWARE\Symantec\Symantec Endpoint Protection\CurrentVersion\Public-Opstate'
-        'HKLM:\SOFTWARE\WOW6432Node\Symantec\Symantec Endpoint Protection\CurrentVersion\Public-Opstate'
-    )) { Read-MobileRegistryKey -Path $path })
-    $found = @($registrations | Where-Object Status -eq 'Found')
-    $errors = @($registrations | Where-Object Status -eq 'Error')
-    $definitions = $found | Where-Object {
-        -not [string]::IsNullOrWhiteSpace([string]$_.Values.LatestVirusDefsDate)
-    } | Select-Object -First 1
+    return ({
+            function Get-SymantecInformation {
+                # Broadcom article 181033: native path for 14.3 RU5+, WOW6432Node for older x64 agents.
+                $registrations = @(foreach ($path in @(
+                            'HKLM:\SOFTWARE\Symantec\Symantec Endpoint Protection\CurrentVersion\Public-Opstate'
+                            'HKLM:\SOFTWARE\WOW6432Node\Symantec\Symantec Endpoint Protection\CurrentVersion\Public-Opstate'
+                        )) { Read-MobileRegistryKey -Path $path })
+                $found = @($registrations | Where-Object Status -eq 'Found')
+                $errors = @($registrations | Where-Object Status -eq 'Error')
+                $definitions = $found | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace([string]$_.Values.LatestVirusDefsDate)
+                } | Select-Object -First 1
 
-    [PSCustomObject]@{
-        Status = if ($definitions) { 'Collected' } elseif ($errors.Count) { 'CollectionFailed' }
-            elseif ($found.Count) { 'DefinitionsUnavailable' } else { 'NotDetected' }
-        # Preserve the vendor value; do not guess a date format or time zone.
-        DefinitionDate = if ($definitions) { $definitions.Values.LatestVirusDefsDate } else { $null }
-        DefinitionRevision = if ($definitions) { $definitions.Values.LatestVirusDefsRevision } else { $null }
-        SourcePath = if ($definitions) { $definitions.Path } else { $null }
-        Registrations = $registrations
-        Failures = @($errors | ForEach-Object { "$($_.Path): $($_.Error)" })
-    }
-}
-'@
+                [PSCustomObject]@{
+                    Status = if ($definitions) { 'Collected' } elseif ($errors.Count) { 'CollectionFailed' }
+                    elseif ($found.Count) { 'DefinitionsUnavailable' } else { 'NotDetected' }
+                    # Preserve the vendor value; do not guess a date format or time zone.
+                    DefinitionDate = if ($definitions) { $definitions.Values.LatestVirusDefsDate } else { $null }
+                    DefinitionRevision = if ($definitions) { $definitions.Values.LatestVirusDefsRevision } else { $null }
+                    SourcePath = if ($definitions) { $definitions.Path } else { $null }
+                    Registrations = $registrations
+                    Failures = @($errors | ForEach-Object { "$($_.Path): $($_.Error)" })
+                }
+            }
+        }).ToString()
 }
 
 function Get-WindowsCollector-Ivanti {
     [CmdletBinding()]
     param()
 
-    return @'
-function Get-IvantiInformation {
-    $paths = @(
-        'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
-        'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
-        'HKLM:\SOFTWARE\WOW6432Node\LANDesk\Inventory'
-        'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
-    )
-    $registrations = @(foreach ($path in $paths) { Read-MobileRegistryKey -Path $path })
-    # Ivanti Endpoint Manager: Client connectivity / Core information.
-    $coreRegistrations = @(foreach ($path in @(
-        'HKLM:\SOFTWARE\WOW6432Node\Intel\LANDesk\LDWM'
-        'HKLM:\SOFTWARE\Intel\LANDesk\LDWM'
-    )) { Read-MobileRegistryKey -Path $path })
-    $core = $coreRegistrations | Where-Object {
-        $_.Status -eq 'Found' -and -not [string]::IsNullOrWhiteSpace([string]$_.Values.CoreServer)
-    } | Select-Object -First 1
+    return ({
+            function Get-IvantiInformation {
+                $paths = @(
+                    'HKLM:\SOFTWARE\LANDesk\ManagementSuite\WinClient'
+                    'HKLM:\SOFTWARE\WOW6432Node\LANDesk\ManagementSuite\WinClient'
+                    'HKLM:\SOFTWARE\WOW6432Node\LANDesk\Inventory'
+                    'HKLM:\SOFTWARE\Ivanti\Endpoint Manager'
+                )
+                $registrations = @(foreach ($path in $paths) { Read-MobileRegistryKey -Path $path })
+                # Ivanti Endpoint Manager: Client connectivity / Core information.
+                $coreRegistrations = @(foreach ($path in @(
+                            'HKLM:\SOFTWARE\WOW6432Node\Intel\LANDesk\LDWM'
+                            'HKLM:\SOFTWARE\Intel\LANDesk\LDWM'
+                        )) { Read-MobileRegistryKey -Path $path })
+                $core = $coreRegistrations | Where-Object {
+                    $_.Status -eq 'Found' -and -not [string]::IsNullOrWhiteSpace([string]$_.Values.CoreServer)
+                } | Select-Object -First 1
 
-    $failures = [System.Collections.Generic.List[string]]::new()
-    foreach ($registration in (@($registrations) + @($coreRegistrations))) {
-        if ($registration.Status -eq 'Error') { $failures.Add("$($registration.Path): $($registration.Error)") }
-    }
-    $services = @()
-    $servicesCollected = $false
-    try {
-        $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
-            $_.Name -match '^(?:LANDesk|Ivanti)' -or $_.DisplayName -match 'Ivanti|LANDesk'
-        } | Select-Object Name, DisplayName, State, StartMode)
-        $servicesCollected = $true
-    } catch { $failures.Add("Services: $($_.Exception.Message)") }
+                $failures = [System.Collections.Generic.List[string]]::new()
+                foreach ($registration in (@($registrations) + @($coreRegistrations))) {
+                    if ($registration.Status -eq 'Error') { $failures.Add("$($registration.Path): $($registration.Error)") }
+                }
+                $services = @()
+                $servicesCollected = $false
+                try {
+                    $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
+                            $_.Name -match '^(?:LANDesk|Ivanti)' -or $_.DisplayName -match 'Ivanti|LANDesk'
+                        } | Select-Object Name, DisplayName, State, StartMode)
+                    $servicesCollected = $true
+                } catch { $failures.Add("Services: $($_.Exception.Message)") }
 
-    $version = $registrations | Where-Object { $_.Status -eq 'Found' -and $_.Values.Version } |
-        Select-Object -First 1
-    $automatic = @($services | Where-Object StartMode -eq 'Auto')
-    $stopped = @($automatic | Where-Object State -ne 'Running')
-    $detected = (@($registrations + $coreRegistrations | Where-Object Status -eq 'Found').Count -gt 0 -or $services.Count -gt 0)
+                $version = $registrations | Where-Object { $_.Status -eq 'Found' -and $_.Values.Version } |
+                    Select-Object -First 1
+                $automatic = @($services | Where-Object StartMode -eq 'Auto')
+                $stopped = @($automatic | Where-Object State -ne 'Running')
+                $detected = (@($registrations + $coreRegistrations | Where-Object Status -eq 'Found').Count -gt 0 -or $services.Count -gt 0)
 
-    [PSCustomObject]@{
-        Status                 = if ($failures.Count) { 'Partial' } elseif ($detected) { 'Collected' } else { 'NotDetected' }
-        Installed              = if ($detected) { $true } elseif ($failures.Count) { $null } else { $false }
-        Version                = if ($version) { $version.Values.Version } else { $null }
-        ConfiguredCoreServer   = if ($core) { $core.Values.CoreServer } else { $null }
-        CoreServerSourcePath   = if ($core) { $core.Path } else { $null }
-        CoreServerStatus       = if ($core) { 'Collected' }
-            elseif (@($coreRegistrations | Where-Object Status -eq 'Error').Count) { 'CollectionFailed' }
-            else { 'Unavailable' }
-        Services               = $services
-        AutomaticServicesReady = if (-not $servicesCollected -or -not $automatic.Count) { $null } else { $stopped.Count -eq 0 }
-        PolicyStatus           = $null
-        LastPolicySync         = $null
-        LastSecurityScan       = $null
-        Registrations          = $registrations
-        CoreRegistrations      = $coreRegistrations
-        Failures               = $failures.ToArray()
-    }
-}
-'@
+                [PSCustomObject]@{
+                    Status                 = if ($failures.Count) { 'Partial' } elseif ($detected) { 'Collected' } else { 'NotDetected' }
+                    Installed              = if ($detected) { $true } elseif ($failures.Count) { $null } else { $false }
+                    Version                = if ($version) { $version.Values.Version } else { $null }
+                    ConfiguredCoreServer   = if ($core) { $core.Values.CoreServer } else { $null }
+                    CoreServerSourcePath   = if ($core) { $core.Path } else { $null }
+                    CoreServerStatus       = if ($core) { 'Collected' }
+                    elseif (@($coreRegistrations | Where-Object Status -eq 'Error').Count) { 'CollectionFailed' }
+                    else { 'Unavailable' }
+                    Services               = $services
+                    AutomaticServicesReady = if (-not $servicesCollected -or -not $automatic.Count) { $null } else { $stopped.Count -eq 0 }
+                    PolicyStatus           = $null
+                    LastPolicySync         = $null
+                    LastSecurityScan       = $null
+                    Registrations          = $registrations
+                    CoreRegistrations      = $coreRegistrations
+                    Failures               = $failures.ToArray()
+                }
+            }
+        }).ToString()
 }
 
 function Get-WindowsCollector-SecurityUpdates {
     [CmdletBinding()]
     param()
 
-    return @'
-function Get-SecurityUpdateInformation {
-    $session = New-Object -ComObject Microsoft.Update.Session
-    $searcher = $session.CreateUpdateSearcher()
-    $count = $searcher.GetTotalHistoryCount()
+    return ({
+            function Get-SecurityUpdateInformation {
+                $session = New-Object -ComObject Microsoft.Update.Session
+                $searcher = $session.CreateUpdateSearcher()
+                $count = $searcher.GetTotalHistoryCount()
 
-    $history = if ($count -gt 0) {
-        @($searcher.QueryHistory(0, [math]::Min($count, 100)) |
-            Where-Object { $_.ResultCode -eq 2 -and $_.Title -match 'Security|Cumulative|KB\d+' } |
-            Select-Object Title, Date, ResultCode)
-    } else {
-        @()
-    }
+                $history = if ($count -gt 0) {
+                    @($searcher.QueryHistory(0, [math]::Min($count, 100)) |
+                            Where-Object { $_.ResultCode -eq 2 -and $_.Title -match 'Security|Cumulative|KB\d+' } |
+                            Select-Object Title, Date, ResultCode)
+                } else {
+                    @()
+                }
 
-    $hotfixes = @(Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending |
-        Select-Object HotFixID, Description, InstalledOn)
+                $hotfixes = @(Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending |
+                        Select-Object HotFixID, Description, InstalledOn)
 
-    [PSCustomObject]@{
-        LastRelevantUpdate = $history | Sort-Object Date -Descending | Select-Object -First 1
-        UpdateHistory = $history
-        InstalledHotfixes = $hotfixes
-        IvantiPatchCompliance = 'Unknown'
-    }
-}
-'@
+                [PSCustomObject]@{
+                    LastRelevantUpdate = $history | Sort-Object Date -Descending | Select-Object -First 1
+                    UpdateHistory = $history
+                    InstalledHotfixes = $hotfixes
+                    IvantiPatchCompliance = 'Unknown'
+                }
+            }
+        }).ToString()
 }
 
 function Get-WindowsInformationBlock {
@@ -3441,102 +3432,102 @@ function Get-WindowsInformationBlock {
     $parts.Add((Get-WindowsCollector-SecurityUpdates))
 
     # 2. Add System Baseline & Aggregator Script
-    $parts.Add(@'
-# OS Build to Friendly Name Mapping
-$osInfo = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion'
-$kernelString = "$($osInfo.LCUVer)"
+    $parts.Add(({
+                # OS Build to Friendly Name Mapping
+                $osInfo = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion'
+                $kernelString = "$($osInfo.LCUVer)"
 
-function Get-WinVersion {
-    param([int]$buildNumber)
-    $map = @{
-        2600  = "WINXP";    3790  = "WINXP64"; 6002  = "WINVISTA"; 7601  = "WIN7"
-        9200  = "WIN8";     9600  = "WIN8.1";  10240 = "WIN10-1507"; 10586 = "WIN10-1511"
-        14393 = "WIN10-1607"; 15063 = "WIN10-1703"; 16299 = "WIN10-1709"; 17134 = "WIN10-1803"
-        17763 = "WIN10-1809"; 18362 = "WIN10-1903"; 18363 = "WIN10-1909"; 19041 = "WIN10-2004"
-        19042 = "WIN10-20H2"; 19043 = "WIN10-21H1"; 19044 = "WIN10-21H2"; 19045 = "WIN10-22H2"
-        22000 = "WIN11-21H2"; 22621 = "WIN11-22H2"; 22631 = "WIN11-23H2"; 26100 = "WIN11-24H2"
-        26200 = "WIN11-25H2"; 28000 = "WIN11-26H1"; 26300 = "WIN11-26H2"
-    }
-    if ($map.ContainsKey($buildNumber)) { "$($map[$buildNumber])-$buildNumber" } else { "WIN-UNK-$buildNumber" }
-}
+                function Get-WinVersion {
+                    param([int]$buildNumber)
+                    $map = @{
+                        2600  = "WINXP";    3790  = "WINXP64"; 6002  = "WINVISTA"; 7601  = "WIN7"
+                        9200  = "WIN8";     9600  = "WIN8.1";  10240 = "WIN10-1507"; 10586 = "WIN10-1511"
+                        14393 = "WIN10-1607"; 15063 = "WIN10-1703"; 16299 = "WIN10-1709"; 17134 = "WIN10-1803"
+                        17763 = "WIN10-1809"; 18362 = "WIN10-1903"; 18363 = "WIN10-1909"; 19041 = "WIN10-2004"
+                        19042 = "WIN10-20H2"; 19043 = "WIN10-21H1"; 19044 = "WIN10-21H2"; 19045 = "WIN10-22H2"
+                        22000 = "WIN11-21H2"; 22621 = "WIN11-22H2"; 22631 = "WIN11-23H2"; 26100 = "WIN11-24H2"
+                        26200 = "WIN11-25H2"; 28000 = "WIN11-26H1"; 26300 = "WIN11-26H2"
+                    }
+                    if ($map.ContainsKey($buildNumber)) { "$($map[$buildNumber])-$buildNumber" } else { "WIN-UNK-$buildNumber" }
+                }
 
-$osString = Get-WinVersion ([int]$osInfo.CurrentBuildNumber)
-$cores = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property NumberOfCores -Sum).Sum
+                $osString = Get-WinVersion ([int]$osInfo.CurrentBuildNumber)
+                $cores = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property NumberOfCores -Sum).Sum
 
-# Software Inventory
-$packages = @(
-    Get-ItemProperty @(
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    ) -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
-        Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
-        Sort-Object DisplayName -Unique
-)
+                # Software Inventory
+                $packages = @(
+                    Get-ItemProperty @(
+                        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                    ) -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
+                        Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
+                        Sort-Object DisplayName -Unique
+                )
 
-# LAPS Scheduled Task Check
-$adminRotateScriptVersion = $null
-if (Get-ScheduledTask -TaskName 'ADMIN-LAPS' -ErrorAction SilentlyContinue) {
-    $xml = schtasks /query /tn ADMIN-LAPS /xml 2>$null
-    $versionMatch = ($xml | Select-String -Pattern '<Version>(.*?)</Version>').Matches
-    if ($versionMatch.Count) {
-        $adminRotateScriptVersion = $versionMatch[0].Groups[1].Value
-    } else {
-        $adminRotateScriptVersion = "Present"
-    }
-}
+                # LAPS Scheduled Task Check
+                $adminRotateScriptVersion = $null
+                if (Get-ScheduledTask -TaskName 'ADMIN-LAPS' -ErrorAction SilentlyContinue) {
+                    $xml = schtasks /query /tn ADMIN-LAPS /xml 2>$null
+                    $versionMatch = ($xml | Select-String -Pattern '<Version>(.*?)</Version>').Matches
+                    if ($versionMatch.Count) {
+                        $adminRotateScriptVersion = $versionMatch[0].Groups[1].Value
+                    } else {
+                        $adminRotateScriptVersion = "Present"
+                    }
+                }
 
-# License Activation Check
-$activation = Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" -ErrorAction SilentlyContinue |
-    Where-Object PartialProductKey |
-    Select-Object -First 1 -ExpandProperty LicenseStatus
+                # License Activation Check
+                $activation = Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" -ErrorAction SilentlyContinue |
+                    Where-Object PartialProductKey |
+                    Select-Object -First 1 -ExpandProperty LicenseStatus
 
-$licenseStatusMap = @{
-    0 = 'Unlicensed'; 1 = 'Licensed'; 2 = 'OOB Grace'; 3 = 'OOT Grace'
-    4 = 'Non-Genuine Grace'; 5 = 'Notification'; 6 = 'Extended Grace'
-}
-$activationStatus = if ($null -ne $activation) { $licenseStatusMap[[int]$activation] } else { 'Unknown' }
+                $licenseStatusMap = @{
+                    0 = 'Unlicensed'; 1 = 'Licensed'; 2 = 'OOB Grace'; 3 = 'OOT Grace'
+                    4 = 'Non-Genuine Grace'; 5 = 'Notification'; 6 = 'Extended Grace'
+                }
+                $activationStatus = if ($null -ne $activation) { $licenseStatusMap[[int]$activation] } else { 'Unknown' }
 
-# Execute Modular Collectors
-$symantecInfo = Get-SymantecInformation
-$diskInfo    = Get-DiskSpace
-$ivantiInfo  = Get-IvantiInformation
-$updateInfo  = Get-SecurityUpdateInformation
+                # Execute Modular Collectors
+                $symantecInfo = Get-SymantecInformation
+                $diskInfo    = Get-DiskSpace
+                $ivantiInfo  = Get-IvantiInformation
+                $updateInfo  = Get-SecurityUpdateInformation
 
-$systemDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
-$systemDisk  = $diskInfo.Volumes | Where-Object Drive -eq $systemDrive | Select-Object -First 1
+                $systemDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+                $systemDisk  = $diskInfo.Volumes | Where-Object Drive -eq $systemDrive | Select-Object -First 1
 
-[PSCustomObject]@{
-    HostName = $env:COMPUTERNAME
-    Platform = $osString
+                [PSCustomObject]@{
+                    HostName = $env:COMPUTERNAME
+                    Platform = $osString
 
-    Summary = [PSCustomObject]@{
-        Kernel              = $kernelString
-        Cores               = $cores
-        PackageCount        = $packages.Count
-        AdminRotateVersion  = $adminRotateScriptVersion
-        AVDefs              = $symantecInfo.DefinitionDate
-        AVDefsRevision      = $symantecInfo.DefinitionRevision
-        AVDefsStatus        = $symantecInfo.Status
-        IvantiVersion       = $ivantiInfo.Version
-        IvantiCoreServer    = $ivantiInfo.ConfiguredCoreServer
-        IvantiServicesReady = $ivantiInfo.AutomaticServicesReady
-        License             = $activationStatus
-        LastUpdate          = $updateInfo.LastUpdate
-        DiskFreeGB          = $systemDisk.FreeGB
-        DiskLow             = $diskInfo.LowSpace
-    }
+                    Summary = [PSCustomObject]@{
+                        Kernel              = $kernelString
+                        Cores               = $cores
+                        PackageCount        = $packages.Count
+                        AdminRotateVersion  = $adminRotateScriptVersion
+                        AVDefs              = $symantecInfo.DefinitionDate
+                        AVDefsRevision      = $symantecInfo.DefinitionRevision
+                        AVDefsStatus        = $symantecInfo.Status
+                        IvantiVersion       = $ivantiInfo.Version
+                        IvantiCoreServer    = $ivantiInfo.ConfiguredCoreServer
+                        IvantiServicesReady = $ivantiInfo.AutomaticServicesReady
+                        License             = $activationStatus
+                        LastUpdate          = $updateInfo.LastUpdate
+                        DiskFreeGB          = $systemDisk.FreeGB
+                        DiskLow             = $diskInfo.LowSpace
+                    }
 
-    Details = [PSCustomObject]@{
-        Packages = $packages
-        Updates  = $updateInfo.UpdateHistory
-        Disks    = $diskInfo.Volumes
-        Ivanti   = $ivantiInfo
-        Symantec = $symantecInfo
-    }
-}
-'@)
+                    Details = [PSCustomObject]@{
+                        Packages = $packages
+                        Updates  = $updateInfo.UpdateHistory
+                        Disks    = $diskInfo.Volumes
+                        Ivanti   = $ivantiInfo
+                        Symantec = $symantecInfo
+                    }
+                }
+            }).ToString())
 
     return [scriptblock]::Create($parts -join "`n`n")
 }
