@@ -35,6 +35,7 @@ $script:Config = [PSCustomObject]@{
     curLuks            = $manifestCfg.curLuks
     encryptionPin      = $manifestCfg.encryptionPin
     mobileOU           = $manifestCfg.MobileOU
+    DeploymentTasks    = $manifestCfg.DeploymentTasks
     NfsHome            = (Join-Path $nfsRoot $env:USERNAME)
     MobileEntries      = (Join-Path $mobileRoot 'entries')
     mobileDefaultUsers = (Join-Path $mobileRoot '.default')
@@ -796,6 +797,58 @@ function Find-ADUserMatch {
 
 #region Runtime configuration
 
+# Supported names are mapped to existing implementations, never invoked as arbitrary commands.
+$script:DeploymentTaskCatalog = @{
+    Windows = @{
+        Provisioning = @('Users', 'PasswordExpiry', 'Groups', 'BitLocker')
+        Scheduled = @('LogArchiver', 'PostDeploy')
+        PostDeployment = @('UserRights', 'NetworkSharing')
+    }
+    Linux = @{ Provisioning = @('CreateDirectory', 'LogService', 'Luks', 'AddUsers') }
+}
+
+function Test-DeploymentTaskPlan {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Plan)
+    foreach ($platform in $Plan.Keys) {
+        if (-not $script:DeploymentTaskCatalog.ContainsKey($platform)) { throw "Unknown deployment platform '$platform'." }
+    }
+    foreach ($platform in $script:DeploymentTaskCatalog.Keys) {
+        if (-not $Plan.Contains($platform) -or $Plan[$platform] -isnot [System.Collections.IDictionary]) {
+            throw "DeploymentTasks.$platform must be a task-phase dictionary."
+        }
+        foreach ($phase in $Plan[$platform].Keys) {
+            if (-not $script:DeploymentTaskCatalog[$platform].ContainsKey($phase)) { throw "Unknown deployment phase '$platform.$phase'." }
+        }
+        foreach ($phase in $script:DeploymentTaskCatalog[$platform].Keys) {
+            if (-not $Plan[$platform].Contains($phase) -or $null -eq $Plan[$platform][$phase]) {
+                throw "DeploymentTasks.$platform.$phase must be a list (use @() to disable all tasks)."
+            }
+            $seen = @{}
+            foreach ($task in @($Plan[$platform][$phase])) {
+                if ($task -isnot [string] -or $task -notin $script:DeploymentTaskCatalog[$platform][$phase]) {
+                    throw "Unknown deployment task '$task' in $platform.$phase."
+                }
+                if ($seen.ContainsKey($task)) { throw "Duplicate deployment task '$task' in $platform.$phase." }
+                $seen[$task] = $true
+            }
+        }
+    }
+}
+
+function Get-DeploymentTaskSelection {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Platform, [Parameter(Mandatory)][string]$Phase)
+    Test-DeploymentTaskPlan -Plan $script:Config.DeploymentTasks
+    if (-not $script:DeploymentTaskCatalog.ContainsKey($Platform) -or
+        -not $script:DeploymentTaskCatalog[$Platform].ContainsKey($Phase)) {
+        throw "Unknown deployment phase '$Platform.$Phase'."
+    }
+    # Keep dependency order stable while allowing any supported task to be omitted.
+    $script:DeploymentTaskCatalog[$Platform][$Phase] |
+        Where-Object { $_ -in @($script:Config.DeploymentTasks[$Platform][$Phase]) }
+}
+
 function Set-MobileConfig {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyCollection()][hashtable]$Overrides)
@@ -806,7 +859,9 @@ function Set-MobileConfig {
     }
     foreach ($key in $Overrides.Keys) {
         if (-not $merged.ContainsKey($key)) { throw "Unknown mobile configuration key '$key'." }
-        if ([string]::IsNullOrWhiteSpace([string]$Overrides[$key])) {
+        if ($key -eq 'DeploymentTasks') {
+            Test-DeploymentTaskPlan -Plan $Overrides[$key]
+        } elseif ([string]::IsNullOrWhiteSpace([string]$Overrides[$key])) {
             throw "Mobile configuration '$key' cannot be empty."
         }
         $merged[$key] = $Overrides[$key]
@@ -2214,6 +2269,9 @@ function Get-PostDeployScript {
         [string[]]$DriveLetters
     )
 
+    $selected = @(Get-DeploymentTaskSelection -Platform Windows -Phase PostDeployment)
+    if (-not $PSBoundParameters.ContainsKey('UserRights')) { $UserRights = 'UserRights' -in $selected }
+    if (-not $PSBoundParameters.ContainsKey('Sharing')) { $Sharing = 'NetworkSharing' -in $selected }
     $tasks = [System.Collections.Generic.List[string]]::new()
 
     $tasks.Add(({
@@ -2272,34 +2330,32 @@ function Get-TaskData {
         [bool]$hasLinux
     )
 
+    $selected = @(Get-DeploymentTaskSelection -Platform Windows -Phase Scheduled)
+    $postTasks = @(Get-DeploymentTaskSelection -Platform Windows -Phase PostDeployment)
     $taskData = @()
-    $disjoinData = Get-PostDeployScript -userRights -Sharing -hasLinux:$hasLinux
-    # $disjoinB64 = ConvertTo-Base64 $disjoinData
-    $bootTrigger = @{
-        Type = [TaskTriggerType]::Boot
-        Delay = 'PT1M'
+    foreach ($task in $selected) {
+        switch ($task) {
+            'LogArchiver' {
+                $trigger = @{
+                    Type = [TaskTriggerType]::Weekly
+                    DaysOfWeek = 1
+                    StartBoundary = (Get-Date '00:00:00').AddDays(1).ToString('s')
+                }
+                $xml = New-TaskXML -Description 'Mobile Auto Log Archiver' -Author '[Mobile Administration]' `
+                    -Execute 'powershell.exe' -ToEncode (Get-WindowsTask-LogArchiver).ToString() -TriggerConfigs @($trigger)
+                $taskData += [PSCustomObject]@{ TaskName = 'Mobile-LogArchiver'; TaskXml = $xml }
+            }
+            'PostDeploy' {
+                # Do not register an otherwise empty post-deployment task.
+                if ($postTasks.Count -eq 0) { continue }
+                $scriptText = Get-PostDeployScript -HasLinux:$hasLinux
+                $trigger = @{ Type = [TaskTriggerType]::Boot; Delay = 'PT1M' }
+                $xml = New-TaskXML -Description 'Runs after deployment' -Author '[Mobile Administration]' `
+                    -Execute 'powershell.exe' -ToEncode $scriptText -TriggerConfigs @($trigger)
+                $taskData += [PSCustomObject]@{ TaskName = 'Mobile-DisjoinTask'; TaskXml = $xml }
+            }
+        }
     }
-    $weeklyTrigger = @{
-        Type = [TaskTriggerType]::Weekly
-        DaysOfWeek = 1
-        StartBoundary = (Get-Date "00:00:00").AddDays(1).ToString('s')
-    }
-
-
-    $domainDisjoinTask = New-TaskXML -Description 'Runs once after domain disjoin' `
-        -Author '[Mobile Administration]' -Execute 'powershell.exe' `
-        -ToEncode $disjoinData `
-        -TriggerConfigs @($bootTrigger)
-    # -Arguments "-NoProfile -ExecutionPolicyBypass -Encoded $disjoinB64" `
-
-
-    $logCollect = New-TaskXML -Description 'Mobile Auto Log Archiver' `
-        -Author '[Mobile Administration]' -Execute 'powershell.exe' `
-        -ToEncode (Get-WindowsTask-LogArchiver).ToString() -TriggerConfigs @($weeklyTrigger)
-
-    $taskData += @([PsCustomObject]@{Taskname = "Mobile-LogArchiver"; TaskXml = $logCollect})
-    $taskData += @([PsCustomObject]@{Taskname = "Mobile-DisjoinTask"; TaskXml = $domainDisjoinTask})
-
     return $taskData
 }
 
@@ -2351,7 +2407,8 @@ $script:WindowsDeployBlock = {
         }
     }
 
-    if (-not $payload.AllUsers -or $payload.AllUsers.Count -eq 0) {
+    if (('Users' -in $payload.ProvisioningTasks -or $payload.DisJoin) -and
+        (-not $payload.AllUsers -or $payload.AllUsers.Count -eq 0)) {
         $failures.Add('No users provided in payload')
     }
 
@@ -2360,35 +2417,37 @@ $script:WindowsDeployBlock = {
     #
     foreach ($u in $payload.AllUsers) {
 
-        $uParams = @{
-            Name        = $u.Name
-            FullName    = $u.FullName
-            Password    = $u.Password
-            Description = $u.Description
-            ErrorAction = 'Stop'
-        }
-        $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
-
-        if ($existing) {
-            Add-Action  -Category 'User'  -Name $u.Name  -Status 'Existed'
-
-            if ( Invoke-Step  -Context "User '$($u.Name)'"  -Action { Set-LocalUser @uParams }) { Add-Action  -Category 'User'  -Name $u.Name  -Status 'Idempotentized'  }
-            else {
-                Add-Action  -Category 'User'  -Name $u.Name  -Status 'Failed'
+        if ('Users' -in $payload.ProvisioningTasks) {
+            $uParams = @{
+                Name        = $u.Name
+                FullName    = $u.FullName
+                Password    = $u.Password
+                Description = $u.Description
+                ErrorAction = 'Stop'
             }
-        } else {
+            $existing = Get-LocalUser -Name $u.Name -ErrorAction SilentlyContinue
 
-            if ( Invoke-Step  -Context "User '$($u.Name)'"  -Action { New-LocalUser @uParams }) {
-                Add-Action  -Category 'User'  -Name $u.Name  -Status 'Created'
+            if ($existing) {
+                Add-Action  -Category 'User'  -Name $u.Name  -Status 'Existed'
+
+                if ( Invoke-Step  -Context "User '$($u.Name)'"  -Action { Set-LocalUser @uParams }) { Add-Action  -Category 'User'  -Name $u.Name  -Status 'Idempotentized'  }
+                else {
+                    Add-Action  -Category 'User'  -Name $u.Name  -Status 'Failed'
+                }
             } else {
-                Add-Action  -Category 'User'  -Name $u.Name  -Status 'Failed'
+
+                if ( Invoke-Step  -Context "User '$($u.Name)'"  -Action { New-LocalUser @uParams }) {
+                    Add-Action  -Category 'User'  -Name $u.Name  -Status 'Created'
+                } else {
+                    Add-Action  -Category 'User'  -Name $u.Name  -Status 'Failed'
+                }
             }
         }
 
         #
         # Password expiration
         #
-        if ($u.MustChangePassword) {
+        if ('PasswordExpiry' -in $payload.ProvisioningTasks -and $u.MustChangePassword) {
 
             $success = Invoke-Step  -Context "Password expiry '$($u.Name)'"  -Action { $adsiUser = [ADSI]"WinNT://./$($u.Name),user"; $adsiUser.PasswordExpired = 1; $adsiUser.SetInfo() }
 
@@ -2398,24 +2457,26 @@ $script:WindowsDeployBlock = {
         #
         # Groups
         #
-        foreach ($g in $u.WindowsGroups) {
-            $actionName = "$($u.Name):$g"
-            $groupStatus = 'Failed'
+        if ('Groups' -in $payload.ProvisioningTasks) {
+            foreach ($g in $u.WindowsGroups) {
+                $actionName = "$($u.Name):$g"
+                $groupStatus = 'Failed'
 
-            $success = Invoke-Step -Context "Group '$g' for '$($u.Name)'" -Action {
-                if (-not (Get-LocalGroup -Name $g -ErrorAction SilentlyContinue)) {
-                    New-LocalGroup -Name $g -ErrorAction Stop | Out-Null
+                $success = Invoke-Step -Context "Group '$g' for '$($u.Name)'" -Action {
+                    if (-not (Get-LocalGroup -Name $g -ErrorAction SilentlyContinue)) {
+                        New-LocalGroup -Name $g -ErrorAction Stop | Out-Null
+                    }
+
+                    $localUser = Get-LocalUser -Name $u.Name -ErrorAction Stop
+                    $members = @(Get-LocalGroupMember -Group $g -ErrorAction Stop)
+
+                    if ($localUser.SID.Value -notin @($members | ForEach-Object { $_.SID.Value })) {
+                        Add-LocalGroupMember -Group $g -Member "$($env:COMPUTERNAME)\$($u.Name)" -ErrorAction Stop
+                    }
                 }
 
-                $localUser = Get-LocalUser -Name $u.Name -ErrorAction Stop
-                $members = @(Get-LocalGroupMember -Group $g -ErrorAction Stop)
-
-                if ($localUser.SID.Value -notin @($members | ForEach-Object { $_.SID.Value })) {
-                    Add-LocalGroupMember -Group $g -Member "$($env:COMPUTERNAME)\$($u.Name)" -ErrorAction Stop
-                }
+                Add-Action -Category 'Privilege' -Name $actionName -Status $(if ($success) { 'OK' } else { 'Failed' })
             }
-
-            Add-Action -Category 'Privilege' -Name $actionName -Status $(if ($success) { 'OK' } else { 'Failed' })
         }
     }
 
@@ -2437,28 +2498,30 @@ $script:WindowsDeployBlock = {
     #
     # BitLocker
     #
-    $drives = @( Get-BitLockerVolume | Where-Object VolumeType -eq 'OperatingSystem')
+    if ('BitLocker' -in $payload.ProvisioningTasks) {
+        $drives = @( Get-BitLockerVolume | Where-Object VolumeType -eq 'OperatingSystem')
 
-    $tpm = Get-Tpm
+        $tpm = Get-Tpm
 
-    foreach ($drive in $drives) {
+        foreach ($drive in $drives) {
 
-        $bitLockerParams = @{
-            MountPoint  = $drive.MountPoint
-            ErrorAction = 'Stop'
+            $bitLockerParams = @{
+                MountPoint  = $drive.MountPoint
+                ErrorAction = 'Stop'
+            }
+
+            if ($tpm.IsPresent -and $tpm.IsEnabled) {
+                $bitLockerParams.TpmAndPinProtector = $true
+                $bitLockerParams.Pin = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
+            } else {
+                $bitLockerParams.PasswordProtector = $true
+                $bitLockerParams.Password = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
+            }
+
+            $success = Invoke-Step  -Context "BitLocker '$($drive.MountPoint)'"  -Action { Enable-BitLocker @bitLockerParams }
+
+            Add-Action  -Category 'DiskEncryption'  -Name $drive.MountPoint  -Status $(if ($success) { 'Changed' } else { 'Failed' })
         }
-
-        if ($tpm.IsPresent -and $tpm.IsEnabled) {
-            $bitLockerParams.TpmAndPinProtector = $true
-            $bitLockerParams.Pin = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
-        } else {
-            $bitLockerParams.PasswordProtector = $true
-            $bitLockerParams.Password = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
-        }
-
-        $success = Invoke-Step  -Context "BitLocker '$($drive.MountPoint)'"  -Action { Enable-BitLocker @bitLockerParams }
-
-        Add-Action  -Category 'DiskEncryption'  -Name $drive.MountPoint  -Status $(if ($success) { 'Changed' } else { 'Failed' })
     }
 
     #
@@ -2948,17 +3011,18 @@ jq -n \
     }'
 '@
 
-    # 3. Assemble tasks pipeline dynamically
+    # 3. Assemble optional tasks in dependency order from the manifest selection.
+    $selected = @(Get-DeploymentTaskSelection -Platform Linux -Phase Provisioning)
     $tasks = [System.Collections.Generic.List[string]]::new()
     $tasks.Add($header)
-
-    $tasks.Add((New-LinuxTask-CreateDirectory -Path '/mobiles/home'))
-
-    if (-not $SkipLogrotate) { $tasks.Add((New-LinuxTask-AddLogService )) }
-
-    if (-not $SkipLuks) { $tasks.Add((New-LinuxTask-Luks  -CurrentPass $script:Config.curLuks  -NewPin $script:Config.encryptionPin)) }
-
-    if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) }
+    foreach ($task in $selected) {
+        switch ($task) {
+            'CreateDirectory' { $tasks.Add((New-LinuxTask-CreateDirectory -Path '/mobiles/home')) }
+            'LogService' { if (-not $SkipLogrotate) { $tasks.Add((New-LinuxTask-AddLogService)) } }
+            'Luks' { if (-not $SkipLuks) { $tasks.Add((New-LinuxTask-Luks -CurrentPass $script:Config.curLuks -NewPin $script:Config.encryptionPin)) } }
+            'AddUsers' { if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) } }
+        }
+    }
 
     if ($Disjoin) {
         if (-not $linuxUsers) { throw 'Domain departure requires at least one Linux account.' }
@@ -4601,6 +4665,7 @@ function Register-MobileDeployment {
         [int]$DomainKeyVersion = 0
     )
 
+    $provisioningTasks = @(Get-DeploymentTaskSelection -Platform Windows -Phase Provisioning)
     $mobileData = Get-MobileData -MobileName $MobileName
     if ($Disjoin -and $mobileData.Linux.Count -gt 0) {
         $LinuxDisjoinKeytab = Resolve-LinuxDisjoinKeytab -Keytab $LinuxDisjoinKeytab `
@@ -4608,7 +4673,10 @@ function Register-MobileDeployment {
     }
     if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
     $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump
-    $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0)
+    $taskData = @()
+    if (@($mobileData.Windows).Count -gt 0) {
+        $taskData = @(Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0))
+    }
 
 
     $windowsPayload = [PSCustomObject]@{
@@ -4617,6 +4685,7 @@ function Register-MobileDeployment {
         MobileName = $MobileName
         Disjoin = $disJoin
         Bitlocker = $defaultPin
+        ProvisioningTasks = $provisioningTasks
 
     }
 
@@ -4740,7 +4809,10 @@ function Unregister-Deployment {
         [switch]$archive
     )
     $mobileData = Get-MobileData -MobileName $MobileName
-    $taskData = Get-TaskData -hasLinux:$($mobileData.Linux.Length -gt 0)
+    $taskData = @(
+        [PSCustomObject]@{ TaskName = 'Mobile-LogArchiver' }
+        [PSCustomObject]@{ TaskName = 'Mobile-DisjoinTask' }
+    )
     $winErrors = [System.Collections.Generic.List[object]]::new()
 
     $winResults = @()

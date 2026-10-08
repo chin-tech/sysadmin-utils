@@ -11,13 +11,13 @@ $issues = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$issues)
 if ($issues.Count) { throw ($issues.Message -join "`n") }
-$names = @('Set-MobileConfig', 'Write-MobileFile', 'Get-MobileData', 'Set-Groups',
+$names = @('Test-DeploymentTaskPlan', 'Get-DeploymentTaskSelection', 'Set-MobileConfig', 'Write-MobileFile', 'Get-MobileData', 'Set-Groups',
     'Resolve-GroupType', 'Get-LinuxDeployScript', 'New-LinuxTask-LeaveDomain', 'ConvertTo-BashArgument')
 $parts = @($ast.FindAll({ param($node)
     ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names) -or
     ($node -is [System.Management.Automation.Language.TypeDefinitionAst] -and $node.Name -in @('GroupType', 'LinuxAccountType')) -or
     ($node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-        $node.Left.Extent.Text -in @('$script:GroupMetadata', '$script:WindowsDeployBlock'))
+        $node.Left.Extent.Text -in @('$script:GroupMetadata', '$script:WindowsDeployBlock', '$script:DeploymentTaskCatalog'))
 }, $false) | ForEach-Object { $_.Extent.Text })
 $testModule = New-Module -ScriptBlock ([scriptblock]::Create($parts -join "`n"))
 try {
@@ -29,6 +29,7 @@ try {
             MobileEntries = "$fixture/entries"; mobileDefaultUsers = "$fixture/default"
             MobileDump = "$fixture/dump"; MobileDeployments = "$fixture/deployments"
             SshKeyName = 'deployer'; SSHKeyPath = "$fixture/key"; GpoID = [guid]::Empty.ToString()
+            DeploymentTasks = (Import-PowerShellDataFile (Join-Path $root 'MobileManager.psd1')).PrivateData.PSData.DefaultConfig.DeploymentTasks
             fallbackPass = 'fixture-only'; curLuks = 'fixture-only'; encryptionPin = 'fixture-only'
         }
         Set-MobileConfig @{ MobileRoot = "$fixture/new-root"; MobileDump = "$fixture/explicit-dump" }
@@ -40,6 +41,24 @@ try {
         $rejected = $false
         try { Set-MobileConfig @{ GpoID = 'invalid' } } catch { $rejected = $true }
         Assert ($rejected -and [object]::ReferenceEquals($previous, $script:Config)) 'Invalid configuration changed module state'
+
+        # Task selections reject invalid edits and preserve canonical execution order.
+        $plan = (Import-PowerShellDataFile (Join-Path $root 'MobileManager.psd1')).PrivateData.PSData.DefaultConfig.DeploymentTasks
+        $plan.Windows.Provisioning = @('BitLocker', 'Users')
+        Set-MobileConfig @{ DeploymentTasks = $plan }
+        Assert ((@(Get-DeploymentTaskSelection Windows Provisioning) -join ',') -eq 'Users,BitLocker') 'Task selection did not preserve dependency order'
+        $invalid = (Import-PowerShellDataFile (Join-Path $root 'MobileManager.psd1')).PrivateData.PSData.DefaultConfig.DeploymentTasks
+        $invalid.Linux.Provisioning = @('UnknownTask')
+        $previous = $script:Config
+        $rejected = $false
+        try { Set-MobileConfig @{ DeploymentTasks = $invalid } } catch { $rejected = $true }
+        Assert ($rejected -and [object]::ReferenceEquals($previous, $script:Config)) 'Invalid task plan changed configuration'
+        $invalid.Linux.Provisioning = @('Luks', 'Luks')
+        $rejected = $false
+        try { Test-DeploymentTaskPlan $invalid } catch { $rejected = $true }
+        Assert $rejected 'Duplicate tasks were accepted'
+        $plan = (Import-PowerShellDataFile (Join-Path $root 'MobileManager.psd1')).PrivateData.PSData.DefaultConfig.DeploymentTasks
+        Set-MobileConfig @{ DeploymentTasks = $plan }
 
         # Stub only dependencies outside the definition reader/writer.
         function Get-UserFullName($UserName, $FullName) { $FullName }
@@ -72,17 +91,18 @@ legacy,,Legacy User
             if ($script:mode -eq 'missing') { if ($ErrorActionPreference -eq 'Stop') { throw 'Missing' }; return }
             [pscustomobject]@{ Enabled = ($script:mode -ne 'disabled'); SID = [pscustomobject]@{ Value = 'fixture-sid' } }
         }
-        function Set-LocalUser { [CmdletBinding()] param($Name, $FullName, $Password, $Description) }
+        function Set-LocalUser { [CmdletBinding()] param($Name, $FullName, $Password, $Description) $script:userWrites++ }
         function New-LocalUser { [CmdletBinding()] param($Name, $FullName, $Password, $Description) throw 'Creation failed' }
         function Get-LocalGroup { [CmdletBinding()] param($Name) [pscustomobject]@{ Name = $Name } }
         function Get-LocalGroupMember { [CmdletBinding()] param($Group)
             if ($script:mode -ne 'membership') { [pscustomobject]@{ SID = [pscustomobject]@{ Value = 'fixture-sid' } } }
         }
         function Add-LocalGroupMember { [CmdletBinding()] param($Group, $Member) }
-        function Get-BitLockerVolume { }
+        function Get-BitLockerVolume { $script:encryptionQueries++ }
         function Get-Tpm { [pscustomobject]@{ IsPresent = $false; IsEnabled = $false } }
         function Remove-Computer { [CmdletBinding()] param($WorkGroupName, [switch]$Force, $Restart) $script:departures++ }
         $payload = [pscustomobject]@{
+            ProvisioningTasks = @('Users', 'PasswordExpiry', 'Groups', 'BitLocker')
             MobileName = 'fixture'; Disjoin = $true; TaskData = @()
             AllUsers = @([pscustomobject]@{ Name = 'alice.local'; FullName = 'Alice'; Password = $null
                 Description = 'Fixture'; MustChangePassword = $false; WindowsGroups = @('Users') })
@@ -94,6 +114,19 @@ legacy,,Legacy User
             Assert ($script:departures -eq $(if ($mode -eq 'ready') { 1 } else { 0 })) "Incorrect disjoin behavior: $mode"
             Assert ($result.Success -eq ($mode -eq 'ready')) "Incorrect success result: $mode"
         }
+
+        # Disabled provisioning must not run, but departure still checks existing accounts.
+        $payload.ProvisioningTasks = @()
+        $script:mode = 'ready'
+        $script:departures = 0
+        $script:userWrites = 0
+        $script:encryptionQueries = 0
+        $result = & $script:WindowsDeployBlock $payload
+        Assert ($script:userWrites -eq 0 -and $script:encryptionQueries -eq 0 -and $script:departures -eq 1) 'Disabled Windows provisioning ran or valid departure was blocked'
+        $script:mode = 'missing'
+        $script:departures = 0
+        $result = & $script:WindowsDeployBlock $payload
+        Assert ($script:departures -eq 0 -and -not $result.Success) 'Disabling provisioning bypassed mandatory verification'
 
         function New-LinuxTask-CreateDirectory { '# create directory' }
         function New-LinuxTask-AddUsers { param($Users, $HomeBase) '# account creation marker' }
@@ -117,6 +150,9 @@ dzdo() { exit 11; }
             $output = & bash $guardPath
             Assert ($LASTEXITCODE -eq 0 -and $output -eq 'Skipped') 'Linux failure did not block domain departure'
         }
+        $script:Config.DeploymentTasks.Linux.Provisioning = @()
+        $linux = Get-LinuxDeployScript -AllUsers $data.AllUsers -Disjoin -b64kt 'YWJj'
+        Assert (-not $linux.Contains('# account creation marker') -and $linux.Contains('# Verify the account') -and $linux.Contains('# Task: Domain Departure')) 'Empty Linux plan bypassed verification or included disabled provisioning'
         'PASS: configuration, definition round trips, Windows readiness gates, and Linux departure ordering/gate.'
     } $fixture $root
 } finally {

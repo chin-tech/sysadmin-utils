@@ -49,6 +49,19 @@
                 adminRoot = "C:\TEMP"
                 nfsHomeRoot   = "C:\TEMP\"
 
+                # Remove names to disable optional tasks. Execution uses the safe
+                # order defined by the module, regardless of list order here.
+                DeploymentTasks = @{
+                    Windows = @{
+                        Provisioning = @('Users', 'PasswordExpiry', 'Groups', 'BitLocker')
+                        Scheduled = @('LogArchiver', 'PostDeploy')
+                        PostDeployment = @('UserRights', 'NetworkSharing')
+                    }
+                    Linux = @{
+                        Provisioning = @('CreateDirectory', 'LogService', 'Luks', 'AddUsers')
+                    }
+                }
+
             }
         }
     }

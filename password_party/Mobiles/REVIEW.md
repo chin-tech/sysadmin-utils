@@ -43,3 +43,26 @@ Removed unused internal helpers: `ConvertFrom-Base64`, `Repair-GpoPermissions`, 
 Validation: all four focused offline verification scripts pass. The module imports through its manifest, every declared public function remains exported, and retained function bodies match their previous implementations after trailing-whitespace normalization and removal of the obsolete commented support-ACL call. The legacy Pester suite still targets older interfaces elsewhere and was not run.
 
 Literal PowerShell payload fragments now use `{ ... }` scriptblocks with `.ToString()` at the script-text boundary, so editors and PowerShell's parser can inspect their syntax. Bash here-strings and interpolated `@"` templates remain strings. Twenty generated payload variants were compared before/after and retain identical code tokens. The Windows collector checks also parse optional post-deployment combinations offline.
+
+Deployment task selection now lives in `MobileManager.psd1` under `PrivateData.PSData.DefaultConfig.DeploymentTasks`:
+
+```powershell
+DeploymentTasks = @{
+    Windows = @{
+        Provisioning = @('Users', 'PasswordExpiry', 'Groups', 'BitLocker')
+        Scheduled = @('LogArchiver', 'PostDeploy')
+        PostDeployment = @('UserRights', 'NetworkSharing')
+    }
+    Linux = @{
+        Provisioning = @('CreateDirectory', 'LogService', 'Luks', 'AddUsers')
+    }
+}
+```
+
+Remove a name to omit that step, or set an entire list to `@()`. Keep the platform and phase dictionaries present. Reload the module after editing the manifest (`Mobiles.ps1` already imports with `-Force`). Defaults retain the existing deployment steps. Supported task names map to existing implementations; introducing a new task requires updating the module's catalog and implementation as well as the manifest.
+
+Selections execute in the module's canonical order, preserving account creation before privilege assignment and Linux directory creation before user creation. Unknown platforms/phases/task names and duplicate names are rejected. A `DeploymentTasks` override replaces the entire plan, so supply all its platform/phase dictionaries. Explicit `Get-PostDeployScript` switches can override its configured selection for direct callers; Linux `-SkipLuks` and `-SkipLogrotate` still suppress selected steps.
+
+`Scheduled.PostDeploy` controls registration of the existing `Mobile-DisjoinTask` boot task; `PostDeployment` controls its generated contents. An empty post-deployment list omits that scheduled task. Windows provisioning selection travels in the remote payload. Linux-only deployments no longer construct Windows task XML. Cleanup removes all known managed scheduled tasks regardless of the current selection, allowing a mobile deployed under an earlier plan to be cleaned up.
+
+Local account verification and domain departure gating remain mandatory when `-Disjoin` is requested, even if account creation or group assignment is disabled. Such a deployment needs the expected accounts and memberships to exist already. Domain departure remains opt-in and is not a configurable optional task. Offline checks cover selection ordering, invalid plans, disabled provisioning and scheduled/post-deployment tasks, and verification with provisioning disabled. Live platform integration remains unverified.

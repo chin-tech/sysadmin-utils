@@ -6,15 +6,19 @@ $issues = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot -Parent) 'MobileManager.psm1'), [ref]$tokens, [ref]$issues)
 if ($issues.Count) { throw ($issues.Message -join "`n") }
-$names = @('Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
+$names = @('Test-DeploymentTaskPlan', 'Get-DeploymentTaskSelection', 'Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
     'Get-WindowsInformationBlock', 'Get-WindowsCollector-DiskSpace', 'Get-WindowsCollector-SecurityUpdates',
-    'New-WindowsPostTask-NetworkSharing', 'New-WindowsPostTask-UserRights', 'Get-PostDeployScript')
+    'Get-TaskData', 'New-WindowsPostTask-NetworkSharing', 'New-WindowsPostTask-UserRights', 'Get-PostDeployScript')
 $definitions = $ast.FindAll({ param($node)
-    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names
+    ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names) -or
+    ($node -is [System.Management.Automation.Language.TypeDefinitionAst] -and $node.Name -eq 'TaskTriggerType') -or
+    ($node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$script:DeploymentTaskCatalog')
 }, $false) | ForEach-Object { $_.Extent.Text }
 $module = New-Module -ScriptBlock ([scriptblock]::Create($definitions -join "`n"))
 try {
     & $module {
+        param($taskPlan)
+        $script:Config = [pscustomobject]@{ DeploymentTasks = $taskPlan }
         function Assert($condition, $message) { if (-not $condition) { throw $message } }
         . ([scriptblock]::Create((Get-WindowsCollector-Registry)))
         . ([scriptblock]::Create((Get-WindowsCollector-Symantec)))
@@ -104,6 +108,17 @@ try {
             [System.Management.Automation.Language.Parser]::ParseInput($payload, [ref]$tokens, [ref]$errors) | Out-Null
             Assert ($errors.Count -eq 0) 'Generated post-deployment payload failed to parse'
         }
+        function New-TaskXML { param($Description, $Author, $Execute, $ToEncode, $TriggerConfigs) 'fixture-xml' }
+        function Get-WindowsTask-LogArchiver { { 'fixture log archiver' } }
+        $scheduled = @(Get-TaskData -hasLinux:$false)
+        Assert (($scheduled.TaskName -join ',') -eq 'Mobile-LogArchiver,Mobile-DisjoinTask') 'Default scheduled selection changed'
+        $script:Config.DeploymentTasks.Windows.PostDeployment = @()
+        $postScript = Get-PostDeployScript
+        Assert (-not $postScript.Contains('secedit') -and -not $postScript.Contains('New-SmbShare')) 'Disabled post-deployment tasks were assembled'
+        $scheduled = @(Get-TaskData -hasLinux:$false)
+        Assert ($scheduled.Count -eq 1 -and $scheduled[0].TaskName -eq 'Mobile-LogArchiver') 'Empty post-deployment selection registered an empty task'
+        $script:Config.DeploymentTasks.Windows.Scheduled = @()
+        Assert (@(Get-TaskData -hasLinux:$false).Count -eq 0) 'Disabled scheduled tasks were registered'
         'PASS: SEP native/legacy values, missing/denied keys, Ivanti core server, partial service failures, and composed script syntax.'
-    }
+    } (Import-PowerShellDataFile (Join-Path (Split-Path $PSScriptRoot -Parent) 'MobileManager.psd1')).PrivateData.PSData.DefaultConfig.DeploymentTasks
 } finally { Remove-Module $module -ErrorAction SilentlyContinue }
