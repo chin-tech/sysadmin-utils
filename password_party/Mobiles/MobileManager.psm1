@@ -2019,6 +2019,193 @@ function New-MobileDeployment {
 
 #endregion
 
+#region Procedure hooks and audit logs
+
+function Get-MobileProcedureHooks {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out')][string]$Procedure,
+        [string]$ScriptsRoot = (Join-Path $PSScriptRoot 'Scripts')
+    )
+    $path = Join-Path $ScriptsRoot $Procedure
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    foreach ($file in (Get-ChildItem -LiteralPath $path -File -ErrorAction Stop | Sort-Object Name)) {
+        if ($file.Extension -notin @('.ps1', '.sh')) { continue }
+        $content = [IO.File]::ReadAllText($file.FullName).TrimStart([char]0xFEFF)
+        if ($file.Extension -eq '.sh') { $content = $content.Replace("`r`n", "`n") }
+        if ($file.Extension -eq '.ps1') {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw "Hook '$($file.Name)' is invalid PowerShell: $($errors.Message -join '; ')" }
+        }
+        $bytes = [Text.Encoding]::UTF8.GetBytes($content)
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $hash = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+        finally { $sha.Dispose() }
+        [PSCustomObject]@{
+            Name = $file.Name
+            Platform = if ($file.Extension -eq '.ps1') { 'Windows' } else { 'Linux' }
+            Sha256 = $hash
+            ContentBase64 = [Convert]::ToBase64String($bytes)
+        }
+    }
+}
+
+function Write-MobileRunEvent {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Run, [Parameter(Mandatory)][string]$Event, $Data)
+    $record = [PSCustomObject]@{
+        TimestampUtc = [datetime]::UtcNow.ToString('o')
+        RunId = $Run.Id
+        MobileName = $Run.MobileName
+        Procedure = $Run.Procedure
+        Event = $Event
+        Data = $Data
+    }
+    $record | ConvertTo-Json -Depth 20 -Compress | Add-Content -LiteralPath $Run.Path -Encoding UTF8 -ErrorAction Stop
+}
+
+function New-MobileRunLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')][string]$MobileName,
+        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out')][string]$Procedure,
+        [string]$LogRoot = $script:Config.MobileDeployments
+    )
+    New-Item -ItemType Directory -Path $LogRoot -Force -ErrorAction Stop | Out-Null
+    $id = [guid]::NewGuid().ToString('N')
+    $run = [PSCustomObject]@{
+        Id = $id; MobileName = $MobileName; Procedure = $Procedure
+        Path = Join-Path $LogRoot ("{0}-{1}-{2}-{3}.jsonl" -f [datetime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'), $MobileName, $Procedure, $id)
+    }
+    # Fail before provisioning if the audit destination cannot be written.
+    Write-MobileRunEvent -Run $run -Event 'RunStarted' -Data @{ Operator = "$env:USERDOMAIN\$env:USERNAME" }
+    return $run
+}
+
+function Get-WindowsProcedureHookRunner {
+    [CmdletBinding()]
+    param()
+    return {
+        param([array]$Hooks, [string]$MobileName, [string]$Procedure, [string]$RunId)
+        $actions = [System.Collections.Generic.List[object]]::new()
+        $failures = [System.Collections.Generic.List[string]]::new()
+        foreach ($hook in $Hooks) {
+            $started = [datetime]::UtcNow.ToString('o')
+            $directory = Join-Path ([IO.Path]::GetTempPath()) ('mobile-hook-' + [guid]::NewGuid().ToString('N'))
+            $process = $null
+            $exitCode = $null; $stdout = ''; $stderr = ''; $hookSucceeded = $false
+            try {
+                New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
+                $scriptPath = Join-Path $directory 'hook.ps1'
+                $launcherPath = Join-Path $directory 'launch.ps1'
+                $content = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($hook.ContentBase64))
+                [IO.File]::WriteAllText($scriptPath, $content, [Text.UTF8Encoding]::new($true))
+                $launcher = {
+                    $ErrorActionPreference = 'Stop'
+                    try {
+                        & $args[0]
+                        if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }
+                    } catch { Write-Error -ErrorRecord $_ -ErrorAction Continue; exit 1 }
+                }
+                [IO.File]::WriteAllText($launcherPath, $launcher.ToString(), [Text.UTF8Encoding]::new($true))
+                $info = [Diagnostics.ProcessStartInfo]::new()
+                $info.FileName = (Get-Process -Id $PID -ErrorAction Stop).Path
+                $info.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$launcherPath`" `"$scriptPath`""
+                $info.WorkingDirectory = $directory
+                $info.UseShellExecute = $false
+                $info.RedirectStandardOutput = $true
+                $info.RedirectStandardError = $true
+                $info.EnvironmentVariables['MOBILE_NAME'] = $MobileName
+                $info.EnvironmentVariables['MOBILE_PROCEDURE'] = $Procedure
+                $info.EnvironmentVariables['MOBILE_RUN_ID'] = $RunId
+                $process = [Diagnostics.Process]::Start($info)
+                $outTask = $process.StandardOutput.ReadToEndAsync()
+                $errTask = $process.StandardError.ReadToEndAsync()
+                if (-not $process.WaitForExit(300000)) {
+                    $process.Kill()
+                    throw 'Hook exceeded its five-minute time limit.'
+                }
+                $exitCode = $process.ExitCode
+                $stdout = $outTask.GetAwaiter().GetResult()
+                $stderr = $errTask.GetAwaiter().GetResult()
+                if ($exitCode -ne 0) { throw "Hook exited with code $exitCode." }
+                $hookSucceeded = $true
+            } catch {
+                $failures.Add("Hook '$($hook.Name)': $($_.Exception.Message)")
+                $stderr += "`n$($_.Exception.Message)"
+            } finally {
+                if ($process) { $process.Dispose() }
+                if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+            $actions.Add([PSCustomObject]@{
+                    Category = 'Hook'; Name = $hook.Name
+                    Status = if ($hookSucceeded) { 'Success' } else { 'Failed' }
+                    Details = [PSCustomObject]@{
+                        Sha256 = $hook.Sha256; StartedUtc = $started; CompletedUtc = [datetime]::UtcNow.ToString('o')
+                        ExitCode = $exitCode
+                        StdOut = $stdout.Substring(0, [Math]::Min(65536, $stdout.Length))
+                        StdErr = $stderr.Substring(0, [Math]::Min(65536, $stderr.Length))
+                    }
+                })
+        }
+        [PSCustomObject]@{ Actions = $actions.ToArray(); Failures = $failures.ToArray() }
+    }
+}
+
+function Get-LinuxProcedureHookScript {
+    [CmdletBinding()]
+    param([array]$Hooks, [string]$MobileName, [string]$Procedure, [string]$RunId)
+    if (-not $Hooks) { return '' }
+    $header = @'
+# Procedure hooks run in isolated child shells; stdout never mixes with result JSON.
+run_mobile_hook() {
+    local hook_name="$1" hook_hash="$2" hook_content="$3"
+    local hook_dir hook_status='Failed' hook_exit=1 hook_started hook_details
+    hook_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    hook_dir="$(mktemp -d)"
+    if [[ -z "$hook_dir" ]]; then
+        record_failure "Hook '$hook_name': cannot create temporary directory"
+        record_action 'Hook' "$hook_name" 'Failed'
+        return
+    fi
+    chmod 700 "$hook_dir"
+    if printf '%s' "$hook_content" | base64 -d > "$hook_dir/hook.sh"; then
+        (cd "$hook_dir" && timeout 300 dzdo env \
+            MOBILE_NAME="$mobile_hook_name" MOBILE_PROCEDURE="$mobile_hook_procedure" MOBILE_RUN_ID="$mobile_hook_run" \
+            bash "$hook_dir/hook.sh") > "$hook_dir/stdout" 2> "$hook_dir/stderr"
+        hook_exit=$?
+        if [[ "$hook_exit" -eq 0 ]]; then hook_status='Success'; fi
+    else
+        printf '%s\n' 'Could not decode hook' > "$hook_dir/stderr"
+        : > "$hook_dir/stdout"
+    fi
+    head -c 65536 "$hook_dir/stdout" > "$hook_dir/out-short"
+    head -c 65536 "$hook_dir/stderr" > "$hook_dir/err-short"
+    hook_details="$(jq -cn --arg sha "$hook_hash" --arg started "$hook_started" \
+        --arg ended "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson code "$hook_exit" \
+        --rawfile stdout "$hook_dir/out-short" --rawfile stderr "$hook_dir/err-short" \
+        '{Sha256:$sha, StartedUtc:$started, CompletedUtc:$ended, ExitCode:$code, StdOut:$stdout, StdErr:$stderr}')"
+    actions_json+=( "$(jq -cn --arg name "$hook_name" --arg status "$hook_status" --argjson details "$hook_details" \
+        '{Category:"Hook", Name:$name, Status:$status, Details:$details}')" )
+    if [[ "$hook_status" != 'Success' ]]; then record_failure "Hook '$hook_name': exit $hook_exit"; fi
+    rm -rf -- "$hook_dir"
+}
+'@
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('mobile_hook_name=' + (ConvertTo-BashArgument $MobileName))
+    $lines.Add('mobile_hook_procedure=' + (ConvertTo-BashArgument $Procedure))
+    $lines.Add('mobile_hook_run=' + (ConvertTo-BashArgument $RunId))
+    $lines.Add($header)
+    foreach ($hook in $Hooks) {
+        $lines.Add(('run_mobile_hook {0} {1} {2}' -f (ConvertTo-BashArgument $hook.Name),
+                (ConvertTo-BashArgument $hook.Sha256), (ConvertTo-BashArgument $hook.ContentBase64)))
+    }
+    return $lines -join "`n"
+}
+
+#endregion
+
 #region Windows provisioning and cleanup
 
 # Literal PowerShell payloads use scriptblocks for editor highlighting and parse checks.
@@ -2524,6 +2711,13 @@ $script:WindowsDeployBlock = {
         }
     }
 
+    if ($payload.Hooks) {
+        $hookResult = & ([scriptblock]::Create($payload.HookRunner)) -Hooks $payload.Hooks `
+            -MobileName $payload.MobileName -Procedure $payload.Procedure -RunId $payload.RunId
+        foreach ($action in $hookResult.Actions) { $actions.Add($action) }
+        foreach ($failure in $hookResult.Failures) { $failures.Add($failure) }
+    }
+
     #
     # Domain
     #
@@ -2604,6 +2798,18 @@ $script:WindowsUnregisterBlock = {
             $failures.Add("${Category} '$Name': $($_.Exception.Message)")
             return $false
         }
+    }
+
+    if ($payload.Hooks) {
+        $hookResult = & ([scriptblock]::Create($payload.HookRunner)) -Hooks $payload.Hooks `
+            -MobileName $payload.MobileName -Procedure $payload.Procedure -RunId $payload.RunId
+        foreach ($action in $hookResult.Actions) { $actions.Add($action) }
+        foreach ($failure in $hookResult.Failures) { $failures.Add($failure) }
+    }
+
+    if ($failures.Count -gt 0) {
+        $actions.Add([PSCustomObject]@{ Category = 'Cleanup'; Name = 'Built-in cleanup'; Status = 'Skipped'; Details = 'Check-in hooks failed.' })
+        return [PSCustomObject]@{ Platform = 'Windows'; Success = $false; Actions = $actions.ToArray(); Failures = $failures.ToArray() }
     }
 
     # Ensure archive directory exists if archiving is enabled
@@ -2936,7 +3142,10 @@ function Get-LinuxDeployScript {
         [string]$b64kt,
 
         [Parameter()]
-        [switch]$SkipLogrotate
+        [switch]$SkipLogrotate,
+        [array]$Hooks = @(),
+        [string]$MobileName,
+        [string]$RunId
     )
 
     # 1. Resolve users according to metadata priority
@@ -3022,6 +3231,10 @@ jq -n \
             'Luks' { if (-not $SkipLuks) { $tasks.Add((New-LinuxTask-Luks -CurrentPass $script:Config.curLuks -NewPin $script:Config.encryptionPin)) } }
             'AddUsers' { if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) } }
         }
+    }
+
+    if ($Hooks) {
+        $tasks.Add((Get-LinuxProcedureHookScript -Hooks $Hooks -MobileName $MobileName -Procedure 'Check-out' -RunId $RunId))
     }
 
     if ($Disjoin) {
@@ -3205,7 +3418,10 @@ function Get-LinuxUnregisterScript {
 
         [bool]$Archive = $true,
 
-        [switch]$SkipLogrotate
+        [switch]$SkipLogrotate,
+        [array]$Hooks = @(),
+        [string]$MobileName,
+        [string]$RunId
     )
 
     #
@@ -3261,6 +3477,12 @@ array_to_json() {
 
     $tasks = [System.Collections.Generic.List[string]]::new()
     $tasks.Add($header)
+    if ($Hooks) {
+        $tasks.Add((Get-LinuxProcedureHookScript -Hooks $Hooks -MobileName $MobileName -Procedure 'Check-in' -RunId $RunId))
+        $tasks.Add('if (( ${#failures[@]} == 0 )); then')
+        $tasks.Add(':')
+    }
+
 
     if ($linuxUsers) {
         $tasks.Add(
@@ -3274,6 +3496,12 @@ array_to_json() {
         $tasks.Add(
             (New-LinuxUnregisterTask-LogService)
         )
+    }
+
+    if ($Hooks) {
+        $tasks.Add('else')
+        $tasks.Add("record_action 'Cleanup' 'Built-in cleanup' 'Skipped'")
+        $tasks.Add('fi')
     }
 
     $footer = @'
@@ -4665,130 +4893,158 @@ function Register-MobileDeployment {
         [int]$DomainKeyVersion = 0
     )
 
-    $provisioningTasks = @(Get-DeploymentTaskSelection -Platform Windows -Phase Provisioning)
-    $mobileData = Get-MobileData -MobileName $MobileName
-    if ($Disjoin -and $mobileData.Linux.Count -gt 0) {
-        $LinuxDisjoinKeytab = Resolve-LinuxDisjoinKeytab -Keytab $LinuxDisjoinKeytab `
-            -DomainController $DomainController -Principal $DomainPrincipal -Kvno $DomainKeyVersion
-    }
-    if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
-    $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump
-    $taskData = @()
-    if (@($mobileData.Windows).Count -gt 0) {
-        $taskData = @(Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0))
-    }
-
-
-    $windowsPayload = [PSCustomObject]@{
-        allUsers = @($mobileData.AllUsers)
-        taskData = @($taskData)
-        MobileName = $MobileName
-        Disjoin = $disJoin
-        Bitlocker = $defaultPin
-        ProvisioningTasks = $provisioningTasks
-
-    }
-
-    $winErrors = [System.Collections.Generic.List[object]]::new()
-    $rawWindows = @()
-    if (@($mobileData.Windows).Count -gt 0) {
-        $rawWindows = Invoke-Command `
-            -ComputerName $mobileData.Windows `
-            -ScriptBlock $Script:WindowsDeployBlock `
-            -ArgumentList $windowsPayload `
-            -ErrorVariable winErrors `
-            -ErrorAction SilentlyContinue
-    }
-
-
-    $winResults = @(
-        foreach ($r in $rawWindows) {
-            [PSCustomObject]@{
-                HostName = $r.PSComputerName
-                Platform = 'Windows'
-                Success  = [bool]$r.Success
-                Actions  = @($r.Actions)
-                Failures = @($r.Failures)
-            }
+    $run = New-MobileRunLog -MobileName $MobileName -Procedure 'Check-out'
+    $runSuccess = $false
+    try {
+        $hooks = @(Get-MobileProcedureHooks -Procedure 'Check-out')
+        Write-MobileRunEvent -Run $run -Event 'HookInventory' -Data @($hooks | Select-Object Name, Platform, Sha256)
+        $windowsHooks = @($hooks | Where-Object Platform -eq 'Windows')
+        $linuxHooks = @($hooks | Where-Object Platform -eq 'Linux')
+        Write-MobileRunEvent -Run $run -Event 'TaskSelection' -Data $script:Config.DeploymentTasks
+        $provisioningTasks = @(Get-DeploymentTaskSelection -Platform Windows -Phase Provisioning)
+        $mobileData = Get-MobileData -MobileName $MobileName
+        Write-MobileRunEvent -Run $run -Event 'Targets' -Data @{ Windows = @($mobileData.Windows); Linux = @($mobileData.Linux) }
+        if ($Disjoin -and $mobileData.Linux.Count -gt 0) {
+            $LinuxDisjoinKeytab = Resolve-LinuxDisjoinKeytab -Keytab $LinuxDisjoinKeytab `
+                -DomainController $DomainController -Principal $DomainPrincipal -Kvno $DomainKeyVersion
         }
-    )
+        Write-MobileRunEvent -Run $run -Event 'PreflightStarted' -Data $null
+        if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
+        Write-MobileRunEvent -Run $run -Event 'PreflightCompleted' -Data @{ Success = $true }
+        $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump
+        $taskData = @()
+        if (@($mobileData.Windows).Count -gt 0) {
+            $taskData = @(Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0))
+        }
 
 
-    foreach ($computer in $mobileData.Windows) {
-        $alreadyReturned = $winResults |
-            Where-Object HostName -eq $computer
+        $windowsPayload = [PSCustomObject]@{
+            allUsers = @($mobileData.AllUsers)
+            taskData = @($taskData)
+            MobileName = $MobileName
+            Disjoin = $disJoin
+            Bitlocker = $defaultPin
+            ProvisioningTasks = $provisioningTasks
+            Hooks = $windowsHooks
+            HookRunner = (Get-WindowsProcedureHookRunner).ToString()
+            Procedure = 'Check-out'
+            RunId = $run.Id
 
-        if ($alreadyReturned) { continue }
+        }
 
-        $hostErrors = @(
-            $winErrors |
-                Where-Object {
-                    $_.TargetObject -eq $computer -or
-                    $_.OriginInfo.PSComputerName -eq $computer
+        $winErrors = [System.Collections.Generic.List[object]]::new()
+        $rawWindows = @()
+        if (@($mobileData.Windows).Count -gt 0) {
+            $rawWindows = Invoke-Command `
+                -ComputerName $mobileData.Windows `
+                -ScriptBlock $Script:WindowsDeployBlock `
+                -ArgumentList $windowsPayload `
+                -ErrorVariable winErrors `
+                -ErrorAction SilentlyContinue
+        }
+
+
+        $winResults = @(
+            foreach ($r in $rawWindows) {
+                [PSCustomObject]@{
+                    HostName = $r.PSComputerName
+                    Platform = 'Windows'
+                    Success  = [bool]$r.Success
+                    Actions  = @($r.Actions)
+                    Failures = @($r.Failures)
                 }
+            }
         )
 
-        $messages = if ($hostErrors) {
-            @($hostErrors | ForEach-Object { $_.Exception.Message })
-        } else {
-            @('No result returned from remote host.')
+
+        foreach ($computer in $mobileData.Windows) {
+            $alreadyReturned = $winResults |
+                Where-Object HostName -eq $computer
+
+            if ($alreadyReturned) { continue }
+
+            $hostErrors = @(
+                $winErrors |
+                    Where-Object {
+                        $_.TargetObject -eq $computer -or
+                        $_.OriginInfo.PSComputerName -eq $computer
+                    }
+            )
+
+            $messages = if ($hostErrors) {
+                @($hostErrors | ForEach-Object { $_.Exception.Message })
+            } else {
+                @('No result returned from remote host.')
+            }
+
+            $winResults += [PSCustomObject]@{
+                HostName = $computer
+                Platform = 'Windows'
+                Success  = $false
+                Actions  = @()
+                Failures = $messages
+            }
         }
 
-        $winResults += [PSCustomObject]@{
-            HostName = $computer
-            Platform = 'Windows'
-            Success  = $false
-            Actions  = @()
-            Failures = $messages
-        }
-    }
+        # Need the linux computers and the linux computers there for easy processing
+        # $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
 
-    # Need the linux computers and the linux computers there for easy processing
-    # $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
+        $linRes = @()
+        $linResults = @()
+        foreach ($result in $winResults) { Write-MobileRunEvent -Run $run -Event 'HostResult' -Data $result }
 
-    $linRes = @()
-    $linResults = @()
-    if ($mobileData.Linux.Count -gt 0) {
-        $linSplat = @{ allUsers = $mobileData.AllUsers }
-        if ($disjoin) {
-            $linSplat['disjoin'] = $true
-            $linSplat['b64kt'] = $LinuxDisjoinKeytab
-        }
-        $linuxDeploy = Get-LinuxDeployScript @linSplat
-        $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $sshKeyPath
+        if ($mobileData.Linux.Count -gt 0) {
+            $linSplat = @{ allUsers = $mobileData.AllUsers; Hooks = $linuxHooks; MobileName = $MobileName; RunId = $run.Id }
+            if ($disjoin) {
+                $linSplat['disjoin'] = $true
+                $linSplat['b64kt'] = $LinuxDisjoinKeytab
+            }
+            $linuxDeploy = Get-LinuxDeployScript @linSplat
+            $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $sshKeyPath
 
-        $linResults = foreach ($r in $linRes) {
-            if ($r.ExitCode -eq 0 -and $r.StdOut) {
-                try {
-                    $r.StdOut | ConvertFrom-Json
-                } catch {
+            $linResults = foreach ($r in $linRes) {
+                if ($r.ExitCode -eq 0 -and $r.StdOut) {
+                    try {
+                        $r.StdOut | ConvertFrom-Json
+                    } catch {
+                        [PSCustomObject]@{
+                            HostName = $r.Target
+                            Platform = 'Linux'
+                            Success  = $false
+                            Actions  = @()
+                            Failures = @(
+                                "Invalid JSON response: $($_.Exception.Message)"
+                                "STDOUT: $($r.StdOut)"
+                                "STDERR: $($r.StdErr)"
+                            )
+                        }
+                    }
+                } else {
                     [PSCustomObject]@{
                         HostName = $r.Target
                         Platform = 'Linux'
                         Success  = $false
                         Actions  = @()
-                        Failures = @(
-                            "Invalid JSON response: $($_.Exception.Message)"
-                            "STDOUT: $($r.StdOut)"
-                            "STDERR: $($r.StdErr)"
-                        )
+                        Failures = @($r.StdErr)
                     }
                 }
-            } else {
-                [PSCustomObject]@{
-                    HostName = $r.Target
-                    Platform = 'Linux'
-                    Success  = $false
-                    Actions  = @()
-                    Failures = @($r.StdErr)
-                }
             }
+
+
         }
-
-
+        $results = @($winResults) + @($linResults)
+        foreach ($result in $linResults) { Write-MobileRunEvent -Run $run -Event 'HostResult' -Data $result }
+        $runSuccess = ($results.Count -gt 0 -and @($results | Where-Object { -not $_.Success }).Count -eq 0)
+        Format-DeploymentResults -results $results -allUsers $mobileData.AllUsers
+    } catch {
+        $runSuccess = $false
+        Write-MobileRunEvent -Run $run -Event 'RunError' -Data @{ Message = $_.Exception.Message }
+        throw
+    } finally {
+        Write-MobileRunEvent -Run $run -Event 'RunCompleted' -Data @{ Success = $runSuccess }
+        Write-Host "[+] Check-out audit log: $($run.Path)"
     }
-    $results = @($winResults) + @($linResults)
-    Format-DeploymentResults -results $results -allUsers $mobileData.AllUsers
+
 }
 
 function Unregister-Deployment {
@@ -4808,128 +5064,153 @@ function Unregister-Deployment {
         [Parameter()]
         [switch]$archive
     )
-    $mobileData = Get-MobileData -MobileName $MobileName
-    $taskData = @(
-        [PSCustomObject]@{ TaskName = 'Mobile-LogArchiver' }
-        [PSCustomObject]@{ TaskName = 'Mobile-DisjoinTask' }
-    )
-    $winErrors = [System.Collections.Generic.List[object]]::new()
-
-    $winResults = @()
-    $linResults = @()
-
-    if (@($mobileData.Windows).Count -gt 0) {
+    $run = New-MobileRunLog -MobileName $MobileName -Procedure 'Check-in'
+    $runSuccess = $false
+    try {
+        $hooks = @(Get-MobileProcedureHooks -Procedure 'Check-in')
+        Write-MobileRunEvent -Run $run -Event 'HookInventory' -Data @($hooks | Select-Object Name, Platform, Sha256)
+        $windowsHooks = @($hooks | Where-Object Platform -eq 'Windows')
+        $linuxHooks = @($hooks | Where-Object Platform -eq 'Linux')
+        Write-MobileRunEvent -Run $run -Event 'TaskSelection' -Data $script:Config.DeploymentTasks
+        $mobileData = Get-MobileData -MobileName $MobileName
+        Write-MobileRunEvent -Run $run -Event 'Targets' -Data @{ Windows = @($mobileData.Windows); Linux = @($mobileData.Linux) }
+        $taskData = @(
+            [PSCustomObject]@{ TaskName = 'Mobile-LogArchiver' }
+            [PSCustomObject]@{ TaskName = 'Mobile-DisjoinTask' }
+        )
         $winErrors = [System.Collections.Generic.List[object]]::new()
 
-        $payload = [PSCustomObject]@{
-            MobileName = $MobileName
-            TaskData = $taskData
-            Archive =  [bool]$archive.IsPresent
-            AllUsers = $mobileData.AllUsers
-            Bitlocker = $oldEncryption
-        }
+        $winResults = @()
+        $linResults = @()
 
-        $rawWindows = Invoke-Command `
-            -ComputerName $mobileData.Windows `
-            -ScriptBlock $script:WindowsUnregisterBlock `
-            -ArgumentList $payload `
-            -ErrorAction SilentlyContinue `
-            -ErrorVariable winErrors
+        if (@($mobileData.Windows).Count -gt 0) {
+            $winErrors = [System.Collections.Generic.List[object]]::new()
 
-        $winResults = @(
-            foreach ($r in $rawWindows) {
-                [PSCustomObject]@{
-                    HostName = $r.PSComputerName
-                    Platform = 'Windows'
-                    Success  = [bool]$r.Success
-                    Actions  = @($r.Actions)
-                    Failures = @($r.Failures)
-                }
-            }
-        )
-
-        foreach ($computer in $mobileData.Windows) {
-            $alreadyReturned = $winResults |
-                Where-Object HostName -eq $computer
-
-            if ($alreadyReturned) {
-                continue
+            $payload = [PSCustomObject]@{
+                MobileName = $MobileName
+                TaskData = $taskData
+                Archive =  [bool]$archive.IsPresent
+                AllUsers = $mobileData.AllUsers
+                Bitlocker = $oldEncryption
+                Hooks = $windowsHooks
+                HookRunner = (Get-WindowsProcedureHookRunner).ToString()
+                Procedure = 'Check-in'
+                RunId = $run.Id
             }
 
-            $hostErrors = @(
-                $winErrors |
-                    Where-Object {
-                        $_.TargetObject -eq $computer -or
-                        $_.OriginInfo.PSComputerName -eq $computer
+            $rawWindows = Invoke-Command `
+                -ComputerName $mobileData.Windows `
+                -ScriptBlock $script:WindowsUnregisterBlock `
+                -ArgumentList $payload `
+                -ErrorAction SilentlyContinue `
+                -ErrorVariable winErrors
+
+            $winResults = @(
+                foreach ($r in $rawWindows) {
+                    [PSCustomObject]@{
+                        HostName = $r.PSComputerName
+                        Platform = 'Windows'
+                        Success  = [bool]$r.Success
+                        Actions  = @($r.Actions)
+                        Failures = @($r.Failures)
                     }
+                }
             )
 
-            $messages = if ($hostErrors) {
-                @(
-                    $hostErrors |
-                        ForEach-Object { $_.Exception.Message }
-                )
-            } else {
-                @('No result returned from remote host.')
-            }
+            foreach ($computer in $mobileData.Windows) {
+                $alreadyReturned = $winResults |
+                    Where-Object HostName -eq $computer
 
-            $winResults += [PSCustomObject]@{
-                HostName = $computer
-                Platform = 'Windows'
-                Success  = $false
-                Actions  = @()
-                Failures = $messages
+                if ($alreadyReturned) {
+                    continue
+                }
+
+                $hostErrors = @(
+                    $winErrors |
+                        Where-Object {
+                            $_.TargetObject -eq $computer -or
+                            $_.OriginInfo.PSComputerName -eq $computer
+                        }
+                )
+
+                $messages = if ($hostErrors) {
+                    @(
+                        $hostErrors |
+                            ForEach-Object { $_.Exception.Message }
+                    )
+                } else {
+                    @('No result returned from remote host.')
+                }
+
+                $winResults += [PSCustomObject]@{
+                    HostName = $computer
+                    Platform = 'Windows'
+                    Success  = $false
+                    Actions  = @()
+                    Failures = $messages
+                }
             }
         }
-    }
 
-    if (@($mobileData.Linux).Count -gt 0) {
-        $linuxUnregister = Get-LinuxUnregisterScript `
-            -AllUsers $mobileData.AllUsers `
-            -Archive:$archive
+        foreach ($result in $winResults) { Write-MobileRunEvent -Run $run -Event 'HostResult' -Data $result }
 
-        $rawLinux = Invoke-Linux `
-            -Computers $mobileData.Linux `
-            -Script $linuxUnregister `
-            -KeyPath $sshKeyPath
+        if (@($mobileData.Linux).Count -gt 0) {
+            $linuxUnregister = Get-LinuxUnregisterScript `
+                -AllUsers $mobileData.AllUsers `
+                -Archive:$archive -Hooks $linuxHooks -MobileName $MobileName -RunId $run.Id
 
-        $linResults = @(
-            foreach ($r in $rawLinux) {
-                if ($r.ExitCode -eq 0 -and $r.StdOut) {
-                    try {
-                        $r.StdOut | ConvertFrom-Json
-                    } catch {
+            $rawLinux = Invoke-Linux `
+                -Computers $mobileData.Linux `
+                -Script $linuxUnregister `
+                -KeyPath $sshKeyPath
+
+            $linResults = @(
+                foreach ($r in $rawLinux) {
+                    if ($r.ExitCode -eq 0 -and $r.StdOut) {
+                        try {
+                            $r.StdOut | ConvertFrom-Json
+                        } catch {
+                            [PSCustomObject]@{
+                                HostName = $r.Target
+                                Platform = 'Linux'
+                                Success  = $false
+                                Actions  = @()
+                                Failures = @(
+                                    "Invalid JSON response: $($_.Exception.Message)"
+                                )
+                            }
+                        }
+                    } else {
                         [PSCustomObject]@{
                             HostName = $r.Target
                             Platform = 'Linux'
                             Success  = $false
                             Actions  = @()
                             Failures = @(
-                                "Invalid JSON response: $($_.Exception.Message)"
+                                if ($r.StdErr) {
+                                    $r.StdErr
+                                } else {
+                                    "SSH exited with code $($r.ExitCode)"
+                                }
                             )
                         }
                     }
-                } else {
-                    [PSCustomObject]@{
-                        HostName = $r.Target
-                        Platform = 'Linux'
-                        Success  = $false
-                        Actions  = @()
-                        Failures = @(
-                            if ($r.StdErr) {
-                                $r.StdErr
-                            } else {
-                                "SSH exited with code $($r.ExitCode)"
-                            }
-                        )
-                    }
                 }
-            }
-        )
+            )
+        }
+
+        $results = @($winResults) + @($linResults)
+        foreach ($result in $linResults) { Write-MobileRunEvent -Run $run -Event 'HostResult' -Data $result }
+        $runSuccess = ($results.Count -gt 0 -and @($results | Where-Object { -not $_.Success }).Count -eq 0)
+        Format-DeploymentResults $results -AllUsers $mobileData.AllUsers -Unregister
+    } catch {
+        $runSuccess = $false
+        Write-MobileRunEvent -Run $run -Event 'RunError' -Data @{ Message = $_.Exception.Message }
+        throw
+    } finally {
+        Write-MobileRunEvent -Run $run -Event 'RunCompleted' -Data @{ Success = $runSuccess }
+        Write-Host "[+] Check-in audit log: $($run.Path)"
     }
-
-    Format-DeploymentResults (@($winResults) + @($linResults)) -AllUsers $mobileData.AllUsers -Unregister
-
 
 }
 
