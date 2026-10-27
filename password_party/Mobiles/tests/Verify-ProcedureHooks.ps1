@@ -6,7 +6,7 @@ New-Item -ItemType Directory -Path $fixture | Out-Null
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join '; ') }
-$names = @('Get-MobileProcedureHooks', 'Write-MobileRunEvent', 'New-MobileRunLog', 'Get-WindowsProcedureHookRunner',
+$names = @('ConvertTo-MobileLogLines', 'Format-MobileRunEvent', 'Show-MobileRunLog', 'Get-MobileProcedureHooks', 'Write-MobileRunEvent', 'New-MobileRunLog', 'Get-WindowsProcedureHookRunner',
     'Get-LinuxProcedureHookScript', 'ConvertTo-BashArgument', 'Get-LinuxDeployScript', 'Get-LinuxUnregisterScript',
     'New-LinuxTask-LeaveDomain', 'Get-DeploymentTaskSelection', 'Test-DeploymentTaskPlan',
     'Register-MobileDeployment', 'Unregister-Deployment')
@@ -132,7 +132,7 @@ try {
         function Invoke-Command { [CmdletBinding()] param($ComputerName, $ScriptBlock, $ArgumentList)
             if ($script:transportFails) { throw 'fixture transport failure' }
             [pscustomobject]@{ PSComputerName = 'fixture-host'; Success = $true
-                Actions = @([pscustomobject]@{ Category = 'Fixture'; Name = 'Built-in action'; Status = 'Success' }); Failures = @() }
+                Actions = @([pscustomobject]@{ Category = 'Fixture'; Name = 'Built-in action'; Status = 'Success'; Details = [pscustomobject]@{ Nested = [pscustomobject]@{ Items = @('one', 'two') }; StdOut = "line one`nline two" } }); Failures = @() }
         }
         Register-MobileDeployment -MobileName fixture
         Unregister-Deployment -MobileName fixture
@@ -144,6 +144,22 @@ try {
             Assert (@($events | Where-Object Event -eq HostResult).Count -eq 1) 'Host actions were not persisted'
             Assert (-not (Get-Content $log.FullName -Raw).Contains('ContentBase64')) 'Audit log contains hook source payload'
         }
+        foreach ($log in $logs) {
+            $readablePath = [IO.Path]::ChangeExtension($log.FullName, '.log')
+            Assert (Test-Path $readablePath) 'Readable companion log was not created'
+            $readable = Get-Content $readablePath -Raw
+            Assert ($readable.Contains('Windows targets: fixture-host') -and $readable.Contains('Linux targets: (none)')) 'Targets were not expanded in readable log'
+            Assert ($readable.Contains('[Success] Fixture / Built-in action') -and $readable.Contains('Details.Nested.Items: one, two')) 'Nested action details were not rendered'
+            Assert (-not $readable.Contains('System.Object[]') -and -not $readable.Contains('@{')) 'Readable log contains object placeholders'
+            $rendered = (Show-MobileRunLog -Path $log.FullName) -join "`n"
+            Assert ($rendered.Contains('Windows targets: fixture-host') -and $rendered.Contains('[Success] Fixture / Built-in action')) 'Existing JSONL viewer lost nested data'
+        }
+        $fixtureEvent = [pscustomobject]@{
+            TimestampUtc = 'fixture'; Procedure = 'Check-out'; MobileName = 'fixture'; Event = 'HostResult'
+            Data = [pscustomobject]@{ HostName = 'tree'; Platform = 'Linux'; Success = $false; Actions = @(); Failures = @('first failure', 'second failure') }
+        }
+        $rendered = (Format-MobileRunEvent $fixtureEvent) -join "`n"
+        Assert ($rendered.Contains('ERROR: first failure') -and $rendered.Contains('ERROR: second failure') -and $rendered.Contains('Result: FAILED')) 'Host failure messages were not expanded'
         $script:transportFails = $true
         try { Register-MobileDeployment -MobileName failed } catch { }
         $failed = Get-ChildItem "$fixture/logs" -Filter '*-failed-*.jsonl' | Select-Object -First 1

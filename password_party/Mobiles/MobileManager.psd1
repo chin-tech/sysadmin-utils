@@ -27,6 +27,7 @@
         'New-MobileDeployment'
         'Write-MobileFile'
         'Set-MobileConfig'
+        'Show-MobileRunLog'
         'Initialize-Environment'
     )
 

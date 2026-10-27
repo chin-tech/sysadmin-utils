@@ -21,11 +21,18 @@ The working directory is temporary. Supporting files and adjacent scripts are no
 
 ## Audit files
 
-Each procedure creates a timestamped `.jsonl` file under the configured `MobileDeployments` directory (normally `.mobiles/.deployments`). The command prints the exact path at the end, including after an error. The log must be writable before deployment can proceed.
+Each procedure creates matching timestamped `.log` and `.jsonl` files under the configured `MobileDeployments` directory (normally `.mobiles/.deployments`). The `.log` is readable text with expanded targets, task selections, host actions, nested details, output, and error messages. The command prints its path at the end, including after an error. The `.jsonl` retains the structured events; its path is also shown with `-Verbose`. Both logs must be writable before deployment can proceed.
 
 Every line is a JSON event with a UTC timestamp, run ID, mobile name, and procedure. Events record run start/completion, selected built-in tasks, target hosts, hook inventory (name/platform/SHA-256), host actions and failures, and procedure exceptions. Hook results include timestamps, exit code, and up to 64 KiB each of stdout and stderr. Script contents, credential payloads, and generated keytabs are not written to the journal. Hook output is logged, so scripts should not print passwords or other secrets. Protect the log directory using your normal administrator access controls.
 
-Read a log in an editor or inspect it with PowerShell:
+Read the `.log` in an editor, or render either file through the viewer. Existing JSONL files from earlier runs work too:
+
+```powershell
+Import-Module ./MobileManager.psd1 -Force
+Show-MobileRunLog -Path 'path-to-run.jsonl'
+```
+
+For structured analysis, inspect the JSONL directly:
 
 ```powershell
 $events = Get-Content 'path-to-run.jsonl' | ForEach-Object { $_ | ConvertFrom-Json }

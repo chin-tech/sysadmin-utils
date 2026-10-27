@@ -2051,6 +2051,105 @@ function Get-MobileProcedureHooks {
     }
 }
 
+function ConvertTo-MobileLogLines {
+    [CmdletBinding()]
+    param([AllowNull()]$Value, [string]$Prefix = '')
+    if ($null -eq $Value) { return "$($Prefix): (none)" }
+    if ($Value -is [string] -or $Value -is [ValueType]) {
+        $text = if ($Value -is [datetime]) { $Value.ToString('o') } else { [string]$Value }
+        $parts = @($text -split '\r?\n')
+        if ($parts.Count -eq 1) { return "$($Prefix): $text" }
+        "$($Prefix):"
+        foreach ($line in $parts) { "    $line" }
+        return
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        if ($Value.Count -eq 0) { return "$($Prefix): (none)" }
+        foreach ($key in ($Value.Keys | Sort-Object)) {
+            $name = if ($Prefix) { "$Prefix.$key" } else { [string]$key }
+            ConvertTo-MobileLogLines -Value $Value[$key] -Prefix $name
+        }
+        return
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = @($Value)
+        if ($items.Count -eq 0) { return "$($Prefix): (none)" }
+        if (@($items | Where-Object { $_ -isnot [string] -and $_ -isnot [ValueType] }).Count -eq 0) {
+            return "$($Prefix): $($items -join ', ')"
+        }
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            ConvertTo-MobileLogLines -Value $items[$i] -Prefix "$Prefix[$i]"
+        }
+        return
+    }
+    $properties = @($Value.PSObject.Properties | Where-Object MemberType -in @('Property', 'NoteProperty', 'AliasProperty', 'ScriptProperty'))
+    if ($properties.Count -eq 0) { return "$($Prefix): $Value" }
+    foreach ($property in $properties) {
+        $name = if ($Prefix) { "$Prefix.$($property.Name)" } else { $property.Name }
+        ConvertTo-MobileLogLines -Value $property.Value -Prefix $name
+    }
+}
+
+function Format-MobileRunEvent {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Record)
+    "[$($Record.TimestampUtc)] $($Record.Procedure) | $($Record.MobileName) | $($Record.Event)"
+    $data = $Record.Data
+    switch ($Record.Event) {
+        'RunStarted' {
+            "  Run ID: $($Record.RunId)"
+            "  Operator: $($data.Operator)"
+        }
+        'Targets' {
+            foreach ($platform in @('Windows', 'Linux')) {
+                $targets = @($data.$platform | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+                "  $platform targets: $(if ($targets.Count) { $targets -join ', ' } else { '(none)' })"
+            }
+        }
+        'HookInventory' {
+            if (-not $data) { '  Hooks: (none)' }
+            foreach ($hook in $data) { "  $($hook.Platform) hook: $($hook.Name) | SHA-256: $($hook.Sha256)" }
+        }
+        'HostResult' {
+            "  Host: $($data.HostName) | Platform: $($data.Platform) | Result: $(if ($data.Success) { 'SUCCESS' } else { 'FAILED' })"
+            if (-not $data.Actions) { '  Actions: no results returned' }
+            foreach ($action in $data.Actions) {
+                "  [$($action.Status)] $($action.Category) / $($action.Name)"
+                if ($null -ne $action.Details) {
+                    ConvertTo-MobileLogLines -Value $action.Details -Prefix '    Details'
+                }
+            }
+            foreach ($failure in $data.Failures) { "  ERROR: $failure" }
+        }
+        'RunCompleted' {
+            "  Overall result: $(if ($data.Success) { 'SUCCESS' } else { 'FAILED' })"
+        }
+        'RunError' { "  ERROR: $($data.Message)" }
+        default {
+            if ($null -ne $data) { ConvertTo-MobileLogLines -Value $data -Prefix '  Data' }
+        }
+    }
+    ''
+}
+
+function Show-MobileRunLog {
+    [CmdletBinding()]
+    param([Parameter(Mandatory, Position = 0)][string]$Path)
+    if ([IO.Path]::GetExtension($Path) -eq '.log') {
+        Get-Content -LiteralPath $Path -ErrorAction Stop
+        return
+    }
+    $lineNumber = 0
+    Get-Content -LiteralPath $Path -ErrorAction Stop | ForEach-Object {
+        $lineNumber++
+        if (-not [string]::IsNullOrWhiteSpace($_)) {
+            try { $record = $_ | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw "Invalid JSON on line $lineNumber in '$Path': $($_.Exception.Message)" }
+            Format-MobileRunEvent -Record $record
+        }
+    }
+}
+
 function Write-MobileRunEvent {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Run, [Parameter(Mandatory)][string]$Event, $Data)
@@ -2063,6 +2162,7 @@ function Write-MobileRunEvent {
         Data = $Data
     }
     $record | ConvertTo-Json -Depth 20 -Compress | Add-Content -LiteralPath $Run.Path -Encoding UTF8 -ErrorAction Stop
+    Format-MobileRunEvent -Record $record | Add-Content -LiteralPath $Run.ReadablePath -Encoding UTF8 -ErrorAction Stop
 }
 
 function New-MobileRunLog {
@@ -2078,7 +2178,8 @@ function New-MobileRunLog {
         Id = $id; MobileName = $MobileName; Procedure = $Procedure
         Path = Join-Path $LogRoot ("{0}-{1}-{2}-{3}.jsonl" -f [datetime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'), $MobileName, $Procedure, $id)
     }
-    # Fail before provisioning if the audit destination cannot be written.
+    $run | Add-Member -NotePropertyName ReadablePath -NotePropertyValue ([IO.Path]::ChangeExtension($run.Path, '.log'))
+    # Fail before provisioning if either audit destination cannot be written.
     Write-MobileRunEvent -Run $run -Event 'RunStarted' -Data @{ Operator = "$env:USERDOMAIN\$env:USERNAME" }
     return $run
 }
@@ -5042,7 +5143,8 @@ function Register-MobileDeployment {
         throw
     } finally {
         Write-MobileRunEvent -Run $run -Event 'RunCompleted' -Data @{ Success = $runSuccess }
-        Write-Host "[+] Check-out audit log: $($run.Path)"
+        Write-Host "[+] Check-out audit log: $($run.ReadablePath)"
+        Write-Verbose "Structured audit log: $($run.Path)"
     }
 
 }
@@ -5209,7 +5311,8 @@ function Unregister-Deployment {
         throw
     } finally {
         Write-MobileRunEvent -Run $run -Event 'RunCompleted' -Data @{ Success = $runSuccess }
-        Write-Host "[+] Check-in audit log: $($run.Path)"
+        Write-Host "[+] Check-in audit log: $($run.ReadablePath)"
+        Write-Verbose "Structured audit log: $($run.Path)"
     }
 
 }
