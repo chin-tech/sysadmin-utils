@@ -6,23 +6,27 @@ usage() {
 Usage: $0 [-p password_or_file] [-d target_drives] [-s] [-h] [password_or_file] [target_drives]
 
 Options:
-  -p PASS    Current LUKS password or path to a file containing it (default: P@ssw0rdP@ssw0rd)
-  -d DRIVES  Target drive filter (e.g., "sda,nvme0n1,md0")
-  -s         Safe mode: build a separate initramfs and create a new GRUB entry
-             instead of overwriting existing initramfs images
+  -p PASS    | Current LUKS password or path to a file containing it (default: P@ssw0rdP@ssw0rd)
+  -d DRIVES  | Target drive filter (e.g., "sda,nvme0n1,md0")
+  -s         | Safe mode: build a separate initramfs and create a new GRUB entry instead of overwriting existing initramfs images
+  -x         | Skip entering pass,
+  -t         | TPM option ( this is arguably less reliable )
   -h         Show this help message
 EOF
 }
 
+luksSlot=5
 separate_grub=0
 currentPass=""
 target_drives=""
+skip=0
 
-while getopts ":p:d:sh" opt; do
+while getopts ":p:d:shx" opt; do
    case "$opt" in
       p) currentPass="$OPTARG" ;;
       d) target_drives="$OPTARG" ;;
       s) separate_grub=1 ;;
+      x) skip=1 ;;
       h) usage; exit 0 ;;
       \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1 ;;
       :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1 ;;
@@ -53,44 +57,45 @@ fi
 
 dracutNeedsRebuild=0
 dracut_mod=""
-if [[ -c /dev/tpmrm0 ]] && [[ "2" = $(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null) ]]; then
-   dracut_mod="clevis"
-   if [[ $separate_grub -eq 0 ]] && ! grep -q 'clevis' /etc/dracut.conf.d/* 2>/dev/null; then
-      echo 'add_dracutmodules+=" clevis "' >> /etc/dracut.conf.d/clevis.conf
+if [[ -n $tpm ]]; then
+   echo "[INFO] Attempting TPM clevis bind"
+   if [[ -c /dev/tpmrm0 ]] && [[ "2" = $(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null) ]]; then
+      dracut_mod="clevis"
+      if [[ $separate_grub -eq 0 ]] && ! grep -q 'clevis' /etc/dracut.conf.d/* 2>/dev/null; then
+         echo 'add_dracutmodules+=" clevis "' >> /etc/dracut.conf.d/clevis.conf
+      fi
+      for d in "${luks_drives[@]}"; do
+         echo -n "$currentPass" | clevis luks bind -y -d "$d" tpm2 '{"pcr_bank":"sha256","pcr_ids":"7"}'
+      done
+      dracutNeedsRebuild=1
    fi
-
-   for d in "${luks_drives[@]}"; do
-      echo -n "$currentPass" | clevis luks bind -y -d "$d" tpm2 '{"pcr_bank":"sha256","pcr_ids":"7"}'
-   done
-   dracutNeedsRebuild=1
-
 else
-   echo "...No TPM Found, hashing hardware"
+   echo "[INFO] /sys/dmi/id hashing..."
    dracut_mod="lukskey"
-
    mkdir -p /etc/security
    # omit /sys/class/dmi/id/board_serial for vm
-   cat /sys/class/dmi/id/product_uuid /sys/class/dmi/id/product_serial | sha256sum | awk '{printf "%s", $1}' > "$outKey"
+
+   
+   cat /sys/class/dmi/id/{product_uuid,product_serial,board_serial} | sha256sum | awk '{printf "%s", $1}' > "$outKey"
    chmod 400 "$outKey"
 
    ## Add LuksKey
    for d in "${luks_drives[@]}"; do
-      echo -n "$currentPass" | cryptsetup -q luksKillSlot "$d" 2 --key-file - 2>/dev/null || true
-      if ! echo -n "$currentPass" | cryptsetup -q -S 2 luksAddKey "$d" "$outKey" --key-file -; then
+      if [[ $skip -eq 1 ]]; then
+         continue
+      fi
+      echo -n "$currentPass" | cryptsetup -q luksKillSlot "$d" $luksSlot --key-file - 2>/dev/null || true
+      if ! echo -n "$currentPass" | cryptsetup -q -S $luksSlot luksAddKey "$d" "$outKey" --key-file -; then
          echo "ERROR: Failed to add LUKS key to slot 2 on $d (check current password)" >&2
          exit 1
       fi
-      if ! cryptsetup luksOpen --test-passphrase "$d" --key-file "$outKey"; then
-         echo "ERROR: Failed to verify new LUKS key on $d" >&2
-         exit 1
-      fi
-      echo "Successfully enrolled and verified hardware key in slot 2 on $d"
+      echo "$d - Success"
    done
 
    syskey_folder='/usr/lib/dracut/modules.d/99lukskey'
    mod_setup_file="$syskey_folder/module-setup.sh"
    key_sh="$syskey_folder/generate-key.sh"
-   sys_service="$syskey_folder/lukskey-gen.service"
+   sys_service="$syskey_folder/luks-key.service"
    mkdir -p "$syskey_folder"
 
    cat << 'EOF' > "$mod_setup_file"
@@ -111,26 +116,24 @@ install() {
     inst_hook cmdline 01 "$moddir/generate-key.sh"
     inst_hook pre-udev 01 "$moddir/generate-key.sh"
 
-    inst_simple "$moddir/lukskey-gen.service" "$systemdsystemunitdir/lukskey-gen.service"
+    inst_simple "$moddir/luks-key.service" "$systemdsystemunitdir/luks-key.service"
 
     # Pull lukskey-gen.service and passive cryptsetup-pre.target into active boot targets
-    mkdir -p "${initdir}${systemdsystemunitdir}/sysinit.target.wants"
-    mkdir -p "${initdir}${systemdsystemunitdir}/cryptsetup.target.requires"
-    mkdir -p "${initdir}${systemdsystemunitdir}/cryptsetup.target.wants"
-    mkdir -p "${initdir}${systemdsystemunitdir}/cryptsetup-pre.target.requires"
-
-    ln -sf "../lukskey-gen.service" "${initdir}${systemdsystemunitdir}/sysinit.target.wants/lukskey-gen.service"
-    ln -sf "../lukskey-gen.service" "${initdir}${systemdsystemunitdir}/cryptsetup.target.requires/lukskey-gen.service"
-    ln -sf "../lukskey-gen.service" "${initdir}${systemdsystemunitdir}/cryptsetup-pre.target.requires/lukskey-gen.service"
-    ln -sf "../cryptsetup-pre.target" "${initdir}${systemdsystemunitdir}/sysinit.target.wants/cryptsetup-pre.target"
-    ln -sf "../cryptsetup-pre.target" "${initdir}${systemdsystemunitdir}/cryptsetup.target.wants/cryptsetup-pre.target"
+    local udir="${initdir}{$systemdsystemunitdir}"
+    mkdir -p "$udir"/{sysinit.target.wants,cryptsetup.target.{requires,wants},cryptsetup-pre.target.requires,systemd-cryptsetup@.service.d}
+    for t in "$udir"/{sysinit.target.wants,cryptsetup.target.requires,cryptsetup-pre.target.requires}; do
+      ln -sf "../luks-key.service" "$t/"
+   done
+   for t in "$udir"/{sysinit.target.wants,cryptsetup.target.wants}; do
+      ln -sf "../cryptsetup-pre.target" "$t/"
+   done
 
     # Drop-in to guarantee systemd-cryptsetup@ instances wait for lukskey-gen.service
     mkdir -p "${initdir}${systemdsystemunitdir}/systemd-cryptsetup@.service.d"
     cat << 'DROPIN' > "${initdir}${systemdsystemunitdir}/systemd-cryptsetup@.service.d/10-lukskey.conf"
 [Unit]
-Requires=lukskey-gen.service
-After=lukskey-gen.service
+Requires=luks-key.service
+After=luks-key.service
 DROPIN
 
     # Ensure initramfs /etc/crypttab contains the keyfile path for all entries
@@ -152,20 +155,14 @@ EOF
 
    cat << 'EOF' > "$key_sh"
 #!/bin/sh
+outKey=/etc/security/luks.key
 SYS_DIR=/sys/class/dmi/id
-UUID_FILE=$SYS_DIR/product_uuid
-SERIAL_FILE=$SYS_DIR/product_serial
 
 [ -d "$SYS_DIR" ] || modprobe dmi-sysfs 2>/dev/null || true
 
-if [ -f "$UUID_FILE" ] && [ -f "$SERIAL_FILE" ]; then
-   mkdir -p /etc/security
-   cat "$UUID_FILE" "$SERIAL_FILE" | sha256sum | awk '{printf "%s", $1}' > /etc/security/luks.key
-   chmod 400 /etc/security/luks.key
-else
-   echo "lukskey-gen: DMI UNAVAILABLE!" >&2
-   exit 1
-fi
+mkdir -p /etc/security
+cat /sys/class/dmi/id/{product_uuid,product_serial,board_serial} | sha256sum | awk '{printf "%s", $1}' > "$outKey"
+chmod 400 /etc/security/luks.key
 EOF
 
    cat << 'EOF' > "$sys_service"
@@ -210,26 +207,28 @@ if [[ $dracutNeedsRebuild = 1 ]]; then
       default_title=$(grubby --info="$default_kernel" | awk -F= '/^title=/ {gsub(/^"|"$|^\x27|\x27$/, "", $2); print $2; exit}')
       [[ -z "$default_title" ]] && default_title="RHEL ($default_kver)"
 
-      unlock_kernel="/boot/vmlinuz-${default_kver}-autounlock"
-      unlock_initrd="/boot/initramfs-${default_kver}-autounlock.img"
+      local kname="vmlinuz-${default_kver}-lukssafe"
+      unlock_kernel="/boot/${kname}"
+      unlock_initrd="/boot/${kname}.img"
 
       echo "Creating dedicated kernel link $unlock_kernel and initramfs $unlock_initrd..."
       ln -f "$default_kernel" "$unlock_kernel" 2>/dev/null || cp -f "$default_kernel" "$unlock_kernel"
       dracut -f -a "$dracut_mod" "$unlock_initrd" "$default_kver"
+      if grep -q 'fips=1' /proc/cmdline; then
+         echo "[INFO] Fips detected...adding hmac"
+         sha512hmac $unlokc_kernel > "/boot/.$kname.hmac"
+      fi
 
+      local grub_title="${default_title} (luks-safe)"
       grubby --remove-kernel="$unlock_kernel" 2>/dev/null || true
-      grubby --add-kernel="$unlock_kernel" \
-             --initrd="$unlock_initrd" \
-             --copy-default \
-             --title="${default_title} (Auto-Unlock)" \
-             --make-default
+      grubby --add-kernel="$unlock_kernel" --initrd="$unlock_initrd" --copy-default --title="${grub_title}" --make-default
 
       if grep -q 'resume=' /proc/cmdline; then
          swap_uuid=$(grep -oP 'resume=\K\S+' /proc/cmdline)
          grubby --update-kernel="$unlock_kernel" --remove-args="resume=$swap_uuid rd.luks.uuid=$swap_uuid"
          grubby --update-kernel="$unlock_kernel" --args="noresume"
       fi
-      echo "Added GRUB entry '${default_title} (Auto-Unlock)' with initramfs $unlock_initrd"
+      echo "Added GRUB entry '${grub_title}' with initramfs $unlock_initrd"
    else
       if grep -q 'resume=' /proc/cmdline; then
          swap_uuid=$(grep -oP 'resume=\K\S+' /proc/cmdline)
