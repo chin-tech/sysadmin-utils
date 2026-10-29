@@ -1,5 +1,4 @@
-enum TaskTriggerType
-{
+enum TaskTriggerType {
     Time         = 1
     Daily        = 2
     Weekly       = 3
@@ -8,144 +7,95 @@ enum TaskTriggerType
     Logon        = 9
 }
 
-function New-TaskXML
-{
+function ConvertTo-Base64 ($x) { [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($x)) }
+function ConvertFrom-Base64 ($x) { [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($x)) }
+
+function New-TaskXML {
     [CmdletBinding()]
     param(
-        [Parameter()][string]$Description = "Automated Task",
-        [Parameter()][string]$Author = "SYSTEM",
-        
-        [Parameter(Mandatory=$true)]
-        [string]$Execute,
-        
-        [Parameter()]
+        [string]$Description = "Automated Task",
+        [string]$Author = "SYSTEM",
+        [string]$Execute = 'powershell.exe',
+        [string]$ToEncode,
         [string]$Arguments = "",
-        
-        # Pass a hashtable or array of hashtables describing triggers
-        [Parameter()]
-        [hashtable[]]$TriggerConfigs = @(@{ Type = [TaskTriggerType]::Boot }),
-        
-        [Parameter()][string]$UserId = "NT AUTHORITY\SYSTEM",
-        [Parameter()][int]$LogonType = 5, # 5 = TASK_LOGON_SERVICE / SYSTEM
-        [Parameter()][int]$RunLevel = 1,  # 1 = TASK_RUNLEVEL_HIGHEST
-        
-        [Parameter()][bool]$Hidden = $true,
-        [Parameter()][string]$ExecutionTimeLimit = "PT72H"
+        [hashtable[]]$TriggerConfigs = @(@{ Type = [TaskTriggerType]::Registration }),
+        [string]$UserId = "NT AUTHORITY\SYSTEM",
+        [int]$LogonType = 5, # TASK_LOGON_SERVICE
+        [int]$RunLevel = 1,  # TASK_RUNLEVEL_HIGHEST
+        [bool]$Hidden = $true,
+        [string]$ExecutionTimeLimit = "PT72H"
     )
 
+    # 1. Resolve Command & Arguments
+    if (-not [string]::IsNullOrWhiteSpace($ToEncode)) {
+        $Execute = 'powershell.exe'
+        $Arguments = @('-Hidden', '-NonInteractive', '-NoProfile', '-EncodedCommand', (ConvertTo-Base64 $ToEncode), $Arguments) -join ' '
+    }
+
+    # 2. Initialize COM Task
     $ts = New-Object -ComObject "Schedule.Service"
     $ts.Connect()
-
-    # 0 = TASK_CREATE (Task Definition)
     $taskDef = $ts.NewTask(0)
-    
-    # 1. Registration Info
+
+    # 3. Registration Info & Principal
     $taskDef.RegistrationInfo.Description = $Description
-    $taskDef.RegistrationInfo.Author = $Author
+    $taskDef.RegistrationInfo.Author      = $Author
 
-    # 2. Task Settings
-    $taskDef.Settings.Enabled = $true
-    $taskDef.Settings.Hidden = $Hidden
-    $taskDef.Settings.StartWhenAvailable = $true
-    $taskDef.Settings.AllowDemandStart = $true
-    $taskDef.Settings.WakeToRun = $true
-    $taskDef.Settings.DisallowStartIfOnBatteries = $false
-    $taskDef.Settings.StopIfGoingOnBatteries = $false
-    $taskDef.Settings.ExecutionTimeLimit = $ExecutionTimeLimit
-
-    # 3. Principal Configuration
-    $taskDef.Principal.UserId = $UserId
+    $taskDef.Principal.UserId    = $UserId
     $taskDef.Principal.LogonType = $LogonType
-    $taskDef.Principal.RunLevel = $RunLevel
+    $taskDef.Principal.RunLevel  = $RunLevel
 
-    # 4. Triggers Configuration
-    foreach ($cfg in $TriggerConfigs)
-    {
-        $tType = [TaskTriggerType]$cfg.Type
+    # 4. Settings Configuration
+    $settings = @{
+        Enabled                    = $true
+        Hidden                     = $Hidden
+        StartWhenAvailable         = $true
+        AllowDemandStart           = $true
+        WakeToRun                  = $true
+        DisallowStartIfOnBatteries = $false
+        StopIfGoingOnBatteries     = $false
+        ExecutionTimeLimit         = $ExecutionTimeLimit
+    }
+    foreach ($k in $settings.Keys) { $taskDef.Settings.$k = $settings[$k] }
+
+    # 5. Triggers Configuration
+    $nowIso = (Get-Date).ToString("s")
+
+    foreach ($cfg in $TriggerConfigs) {
+        $tType   = [TaskTriggerType]($cfg.Type ?? [TaskTriggerType]::Registration)
         $trigger = $taskDef.Triggers.Create([int]$tType)
-        $trigger.Enabled = if ($cfg.ContainsKey('Enabled'))
-        { $cfg.Enabled 
-        } else
-        { $true 
-        }
-        
-        if ($cfg.ContainsKey('StartBoundary'))
-        {
-            $trigger.StartBoundary = $cfg.StartBoundary
+        $trigger.Enabled = if ($cfg.ContainsKey('Enabled')) { $cfg.Enabled } else { $true }
+
+        # Dynamically bind any matching COM properties supplied in the hashtable (e.g., Delay, UserId, DaysInterval)
+        foreach ($key in $cfg.Keys) {
+            if ($key -notin 'Type', 'Enabled' -and $trigger.PSObject.Properties[$key]) {
+                $trigger.$key = $cfg[$key]
+            }
         }
 
-        switch ($tType)
-        {
-            ([TaskTriggerType]::Logon)
-            {
-                # Specific user or $null / empty string for all users
-                if ($cfg.ContainsKey('UserId'))
-                {
-                    $trigger.UserId = $cfg.UserId
-                }
-                if ($cfg.ContainsKey('Delay'))
-                {
-                    $trigger.Delay = $cfg.Delay # e.g. "PT30S"
-                }
+        # Handle type-specific defaults only when omitted
+        switch ($tType) {
+            ([TaskTriggerType]::Daily) {
+                if (-not $cfg.DaysInterval)  { $trigger.DaysInterval = 1 }
+                if (-not $cfg.StartBoundary) { $trigger.StartBoundary = $nowIso }
             }
-            ([TaskTriggerType]::Boot)
-            {
-                if ($cfg.ContainsKey('Delay'))
-                {
-                    $trigger.Delay = $cfg.Delay # e.g. "PT1M"
-                }
+            ([TaskTriggerType]::Weekly) {
+                if (-not $cfg.WeeksInterval) { $trigger.WeeksInterval = 1 }
+                if (-not $cfg.DaysOfWeek)    { $trigger.DaysOfWeek = 2 } # Monday default (bitmask)
+                if (-not $cfg.StartBoundary) { $trigger.StartBoundary = $nowIso }
             }
-            ([TaskTriggerType]::Daily)
-            {
-                $trigger.DaysInterval = if ($cfg.ContainsKey('DaysInterval'))
-                { $cfg.DaysInterval 
-                } else
-                { 1 
-                }
-                if (-not $trigger.StartBoundary)
-                {
-                    $trigger.StartBoundary = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
-                }
-            }
-            ([TaskTriggerType]::Weekly)
-            {
-                $trigger.WeeksInterval = if ($cfg.ContainsKey('WeeksInterval'))
-                { $cfg.WeeksInterval 
-                } else
-                { 1 
-                }
-                # DaysOfWeek bitmask: 1=Sun, 2=Mon, 4=Tue, 8=Wed, 16=Thu, 32=Fri, 64=Sat
-                $trigger.DaysOfWeek = if ($cfg.ContainsKey('DaysOfWeek'))
-                { $cfg.DaysOfWeek 
-                } else
-                { 2 
-                } # Monday default
-                if (-not $trigger.StartBoundary)
-                {
-                    $trigger.StartBoundary = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
-                }
-            }
-            ([TaskTriggerType]::Time)
-            {
-                if (-not $trigger.StartBoundary)
-                {
-                    $trigger.StartBoundary = (Get-Date).AddMinutes(5).ToString("yyyy-MM-ddTHH:mm:ss")
-                }
-            }
-            ([TaskTriggerType]::Registration)
-            {
-                if ($cfg.ContainsKey('Delay'))
-                {
-                    $trigger.Delay = $cfg.Delay
+            ([TaskTriggerType]::Time) {
+                if (-not $cfg.StartBoundary) {
+                    $trigger.StartBoundary = (Get-Date).AddMinutes(5).ToString("s")
                 }
             }
         }
     }
 
-    # 5. Action Configuration (0 = ExecAction)
+    # 6. Action Configuration (0 = ExecAction)
     $action = $taskDef.Actions.Create(0)
     $action.Path = $Execute
-    $action.Arguments = $Arguments
+    $action.Arguments = $Arguments.Trim()
 
     return $taskDef.XmlText
 }
