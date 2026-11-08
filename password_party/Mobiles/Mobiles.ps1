@@ -1,5 +1,20 @@
 [CmdletBinding(DefaultParameterSetName = 'Info')]
 param(
+    [Parameter(Mandatory = $true, ParameterSetName = 'Preflight')]
+    [switch]$Preflight,
+
+    [Parameter(ParameterSetName = 'Preflight')]
+    [switch]$SkipScans,
+
+    [Parameter(ParameterSetName = 'Preflight')]
+    [switch]$Smb,
+
+    [Parameter(ParameterSetName = 'Preflight')]
+    [ValidateRange(0, 3650)][int]$DefinitionMaxAgeDays,
+
+    [Parameter(ParameterSetName = 'Preflight')]
+    [ValidateRange(1, 1440)][int]$ScanTimeoutMinutes,
+
     # --- Mode Switches ---
     [Parameter(Mandatory = $true, ParameterSetName = 'Info')]
     [switch]$Info,
@@ -29,6 +44,7 @@ param(
     [switch]$Archive,
 
     # --- Target Name ---
+    [Parameter(Mandatory = $true, ParameterSetName = 'Preflight', Position = 0)]
     [Parameter(Mandatory = $false, ParameterSetName = 'Info', Position = 0)]
     [Parameter(Mandatory = $true, ParameterSetName = 'RegisterDeployment', Position = 0)]
     [Parameter(Mandatory = $true, ParameterSetName = 'UnRegisterDeployment', Position = 0)]
@@ -96,6 +112,13 @@ if ($PSBoundParameters.ContainsKey('Verbose')) {
 }
 
 switch ($PSCmdlet.ParameterSetName) {
+    'Preflight' {
+        foreach ($option in @('SkipScans', 'Smb', 'DefinitionMaxAgeDays', 'ScanTimeoutMinutes')) {
+            if ($PSBoundParameters.ContainsKey($option)) { $passThru[$option] = $PSBoundParameters[$option] }
+        }
+        Invoke-MobilePreflight -MobileName $Name @passThru
+    }
+
     'Info' {
         if ([string]::IsNullOrWhiteSpace($Name)) {
             Get-MobileOverview @passThru

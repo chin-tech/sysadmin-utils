@@ -36,6 +36,7 @@ $script:Config = [PSCustomObject]@{
     encryptionPin      = $manifestCfg.encryptionPin
     mobileOU           = $manifestCfg.MobileOU
     DeploymentTasks    = $manifestCfg.DeploymentTasks
+    Preflight          = $manifestCfg.Preflight
     NfsHome            = (Join-Path $nfsRoot $env:USERNAME)
     MobileEntries      = (Join-Path $mobileRoot 'entries')
     mobileDefaultUsers = (Join-Path $mobileRoot '.default')
@@ -2169,7 +2170,7 @@ function New-MobileRunLog {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')][string]$MobileName,
-        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out')][string]$Procedure,
+        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out', 'Preflight')][string]$Procedure,
         [string]$LogRoot = $script:Config.MobileDeployments
     )
     New-Item -ItemType Directory -Path $LogRoot -Force -ErrorAction Stop | Out-Null
@@ -4550,6 +4551,302 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
 '
 
 '@
+
+#endregion
+
+#region Standalone preflight scans and readiness reporting
+
+function Get-MobileDefinitionAssessment {
+    [CmdletBinding()]
+    param([AllowNull()][string]$Date, [ValidateRange(0, 3650)][int]$MaximumAgeDays = 7)
+    $parsed = [datetime]::MinValue
+    $valid = [datetime]::TryParseExact($Date, [string[]]@('yyyy-MM-dd', 'yyyy/MM/dd', 'yyyyMMdd'),
+        [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)
+    if (-not $valid) { return [PSCustomObject]@{ Status = 'Unknown'; Date = $Date; AgeDays = $null } }
+    $age = ([datetime]::UtcNow.Date - $parsed.Date).Days
+    [PSCustomObject]@{
+        Status = if ($age -lt 0) { 'FutureDate' } elseif ($age -gt $MaximumAgeDays) { 'Stale' } else { 'Current' }
+        Date = $Date; AgeDays = $age
+    }
+}
+
+function Get-WindowsPreflightBlock {
+    [CmdletBinding()]
+    param()
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add('param($Options)')
+    $parts.Add((Get-WindowsCollector-Registry))
+    $parts.Add((Get-WindowsCollector-Symantec))
+    $parts.Add((Get-WindowsCollector-Ivanti))
+    $parts.Add(({
+        $actions = [System.Collections.Generic.List[object]]::new()
+        $failures = [System.Collections.Generic.List[string]]::new()
+        $symantec = Get-SymantecInformation
+        $ivanti = Get-IvantiInformation
+        $rawDate = [string]$symantec.DefinitionDate
+        $normalizedDate = $null
+        # Accept only an unambiguous date; keep the original value in Details.
+        if ($rawDate -match '^(\d{4})[-/](\d{2})[-/](\d{2})(?:$|[ T])') {
+            $normalizedDate = '{0}-{1}-{2}' -f $Matches[1], $Matches[2], $Matches[3]
+        } elseif ($rawDate -match '^\d{8}$') { $normalizedDate = $rawDate }
+        $actions.Add([PSCustomObject]@{ Category = 'Inventory'; Name = 'Symantec'; Status = $symantec.Status; Details = $symantec })
+        $actions.Add([PSCustomObject]@{ Category = 'Inventory'; Name = 'Ivanti'; Status = $ivanti.Status; Details = $ivanti })
+        $scanStatus = 'Skipped'
+        if (-not $Options.SkipScans) {
+            $started = [datetime]::UtcNow
+            $process = $null
+            $exitCode = $null; $stdout = ''; $stderr = ''
+            $scanStatus = 'Failed'
+            try {
+                $candidates = @($Options.SymantecScanExecutable)
+                foreach ($directory in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+                    if ($directory) { $candidates += Join-Path $directory 'Symantec\Symantec Endpoint Protection\DoScan.exe' }
+                }
+                $executable = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+                if (-not $executable) { throw 'Symantec DoScan.exe was not found; configure SymantecScanExecutable for custom installations.' }
+                $arguments = [System.Collections.Generic.List[string]]::new()
+                $arguments.Add('/Sync')
+                if ($Options.SymantecScanName) {
+                    if ($Options.SymantecScanName -match '["\r\n]') { throw 'Invalid configured Symantec scan name.' }
+                    $arguments.Add('/ScanName "' + $Options.SymantecScanName + '"')
+                } else {
+                    foreach ($path in $Options.WindowsScanPaths) {
+                        if ([string]::IsNullOrWhiteSpace($path) -or $path -match '["\r\n]') { throw 'Invalid Windows scan path.' }
+                        $arguments.Add('/ScanDir "' + $path.TrimEnd('\') + '"')
+                    }
+                }
+                $info = [Diagnostics.ProcessStartInfo]::new()
+                $info.FileName = $executable
+                $info.Arguments = $arguments -join ' '
+                $info.UseShellExecute = $false
+                $info.RedirectStandardOutput = $true
+                $info.RedirectStandardError = $true
+                $process = [Diagnostics.Process]::Start($info)
+                $outTask = $process.StandardOutput.ReadToEndAsync()
+                $errTask = $process.StandardError.ReadToEndAsync()
+                if (-not $process.WaitForExit([int]($Options.ScanTimeoutMinutes * 60000))) {
+                    $process.Kill()
+                    $scanStatus = 'TimedOut'
+                    throw 'Symantec scan launcher timed out. The SEP service may still be scanning; verify on the endpoint.'
+                }
+                $exitCode = $process.ExitCode
+                $stdout = $outTask.GetAwaiter().GetResult()
+                $stderr = $errTask.GetAwaiter().GetResult()
+                if ($exitCode -ne 0) { throw "DoScan.exe exited with code $exitCode." }
+                # Broadcom article 151455: exit 0 does NOT establish no detections.
+                $scanStatus = 'CompletedNeedsReview'
+            } catch { $failures.Add($_.Exception.Message) }
+            finally { if ($process) { $process.Dispose() } }
+            $scanLogs = @()
+            if ($env:ProgramData) {
+                $scanLogs = @(Get-ChildItem -Path (Join-Path $env:ProgramData 'Symantec\Symantec Endpoint Protection\*\Data\Logs\AV\*') `
+                    -File -ErrorAction SilentlyContinue | Where-Object LastWriteTimeUtc -ge $started |
+                    Select-Object FullName, LastWriteTimeUtc, Length)
+            }
+            $actions.Add([PSCustomObject]@{
+                Category = 'AVScan'; Name = 'Symantec'; Status = $scanStatus
+                Details = [PSCustomObject]@{
+                    StartedUtc = $started.ToString('o'); CompletedUtc = [datetime]::UtcNow.ToString('o')
+                    ExitCode = $exitCode; ScanLogs = $scanLogs
+                    Review = 'Read the endpoint AV scan log for detections; process success alone is not a clean verdict.'
+                    StdOut = $stdout.Substring(0, [Math]::Min(65536, $stdout.Length))
+                    StdErr = $stderr.Substring(0, [Math]::Min(65536, $stderr.Length))
+                }
+            })
+        }
+        if ($Options.SkipScans) {
+            $actions.Add([PSCustomObject]@{ Category = 'AVScan'; Name = 'Symantec'; Status = 'Skipped'; Details = 'SkipScans was requested.' })
+        }
+        [PSCustomObject]@{
+            HostName = $env:COMPUTERNAME; Platform = 'Windows'; DefinitionDate = $normalizedDate
+            ScanStatus = $scanStatus; SmbReadiness = 'NotApplicable'
+            Actions = $actions.ToArray(); Failures = $failures.ToArray()
+        }
+    }).ToString())
+    [scriptblock]::Create($parts -join "`n`n")
+}
+
+function Get-LinuxPreflightScript {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Options)
+    $paths = @($Options.LinuxScanPaths | ForEach-Object { ConvertTo-BashArgument $_ }) -join ' '
+    $prefix = @"
+scan_paths=($paths)
+scan_timeout=$([int]$Options.ScanTimeoutMinutes * 60)
+skip_scans=$($Options.SkipScans.ToString().ToLowerInvariant())
+smb_enabled=$($Options.SmbEnabled.ToString().ToLowerInvariant())
+"@
+    return $prefix + "`n" + @'
+set -o pipefail
+export LC_ALL=C
+if ! command -v jq >/dev/null 2>&1; then echo 'Preflight requires jq' >&2; exit 2; fi
+work="$(mktemp -d)" || exit 2
+trap 'rm -rf -- "$work"' EXIT
+chmod 700 "$work"
+version="$(clamscan --version 2>"$work/version-error")"
+version_exit=$?
+definition_date=''
+if [[ "$version_exit" -eq 0 ]]; then
+    definition_date="$(date -u -d "${version##*/}" '+%Y-%m-%d' 2>/dev/null)"
+fi
+scan_status='Skipped'
+scan_code=null
+scan_started=''
+scan_ended=''
+: > "$work/scan-out"
+: > "$work/scan-err"
+if [[ "$skip_scans" == false ]]; then
+    scan_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$version_exit" -ne 0 ]]; then
+        scan_status='Failed'
+        cat "$work/version-error" > "$work/scan-err"
+        scan_code=127
+    else
+        # Detection only: do not delete/quarantine files. Exclude virtual filesystems.
+        timeout "$scan_timeout" dzdo clamscan --recursive --infected --stdout \
+            --exclude-dir='^/(proc|sys|dev|run)(/|$)' -- "${scan_paths[@]}" \
+            > "$work/scan-out" 2> "$work/scan-err"
+        scan_code=$?
+        case "$scan_code" in
+            0) scan_status='Clean' ;;
+            1) scan_status='ThreatsDetected' ;;
+            124|137) scan_status='TimedOut' ;;
+            *) scan_status='Failed' ;;
+        esac
+    fi
+    scan_ended="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
+fips_enabled="$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo unknown)"
+crypto_policy='Unavailable'
+if command -v update-crypto-policies >/dev/null 2>&1; then
+    crypto_policy="$(update-crypto-policies --show 2>/dev/null || echo unknown)"
+fi
+smb_readiness='NotRequested'
+if [[ "$smb_enabled" == true ]]; then
+    if [[ "$fips_enabled" == 1 || "$crypto_policy" == FIPS* ]]; then
+        smb_readiness='BlockedByFips'
+    elif [[ "$fips_enabled" == 0 ]]; then
+        smb_readiness='RequiresMountTest'
+    else
+        smb_readiness='UnknownFipsState'
+    fi
+fi
+head -c 65536 "$work/scan-out" > "$work/out-short"
+head -c 65536 "$work/scan-err" > "$work/err-short"
+jq -n --arg host "$(hostname -s)" --arg date "$definition_date" --arg version "$version" \
+    --arg scan "$scan_status" --argjson code "$scan_code" --arg started "$scan_started" --arg ended "$scan_ended" \
+    --arg smb "$smb_readiness" --arg fips "$fips_enabled" --arg policy "$crypto_policy" \
+    --rawfile stdout "$work/out-short" --rawfile stderr "$work/err-short" \
+    '{HostName:$host, Platform:"Linux", DefinitionDate:$date, ScanStatus:$scan, SmbReadiness:$smb,
+      Actions:[
+        {Category:"Inventory",Name:"ClamAV",Status:(if $date=="" then "Unknown" else "Collected" end),Details:{Version:$version,DefinitionDate:$date}},
+        {Category:"AVScan",Name:"ClamAV",Status:$scan,Details:{ExitCode:$code,StartedUtc:$started,CompletedUtc:$ended,StdOut:$stdout,StdErr:$stderr}},
+        {Category:"Readiness",Name:"Workgroup SMB",Status:$smb,Details:{FipsEnabled:$fips,CryptoPolicy:$policy,Note:"Reporting only: boot options, FIPS policy, fstab and credentials were not modified."}}
+      ], Failures:(if ($scan=="Failed" or $scan=="TimedOut" or $scan=="ThreatsDetected") then ["ClamAV scan: "+$scan] else [] end)}'
+'@
+}
+
+function Invoke-MobilePreflight {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$MobileName,
+        [ValidateRange(0, 3650)][int]$DefinitionMaxAgeDays = $script:Config.Preflight.DefinitionMaxAgeDays,
+        [ValidateRange(1, 1440)][int]$ScanTimeoutMinutes = $script:Config.Preflight.ScanTimeoutMinutes,
+        [switch]$SkipScans,
+        [switch]$Smb,
+        [switch]$PassThru
+    )
+    $run = New-MobileRunLog -MobileName $MobileName -Procedure 'Preflight'
+    $results = [System.Collections.Generic.List[object]]::new()
+    $runSuccess = $false
+    try {
+        $data = Get-MobileData -MobileName $MobileName
+        $smbEnabled = if ($PSBoundParameters.ContainsKey('Smb')) { [bool]$Smb } else {
+            @($data.Windows).Count -gt 0 -and @($data.Linux).Count -gt 0 -and
+                'NetworkSharing' -in @(Get-DeploymentTaskSelection -Platform Windows -Phase PostDeployment)
+        }
+        $options = [PSCustomObject]@{
+            SkipScans = [bool]$SkipScans; ScanTimeoutMinutes = $ScanTimeoutMinutes; SmbEnabled = $smbEnabled
+            SymantecScanName = $script:Config.Preflight.SymantecScanName
+            SymantecScanExecutable = $script:Config.Preflight.SymantecScanExecutable
+            WindowsScanPaths = @($script:Config.Preflight.WindowsScanPaths)
+            LinuxScanPaths = @($script:Config.Preflight.LinuxScanPaths)
+        }
+        if (-not $options.LinuxScanPaths.Count -or @($options.LinuxScanPaths | Where-Object { [string]::IsNullOrWhiteSpace($_) -or -not $_.StartsWith('/') }).Count) {
+            throw 'Preflight LinuxScanPaths must contain absolute paths.'
+        }
+        if (-not $options.WindowsScanPaths.Count -and -not $options.SymantecScanName) { throw 'Configure WindowsScanPaths or SymantecScanName.' }
+        Write-MobileRunEvent -Run $run -Event 'Targets' -Data @{ Windows = @($data.Windows); Linux = @($data.Linux) }
+        Write-MobileRunEvent -Run $run -Event 'PreflightOptions' -Data $options
+        foreach ($platform in @('Windows', 'Linux')) {
+            $hosts = @($data.$platform)
+            if (-not $hosts.Count) { continue }
+            $raw = @()
+            $dispatchError = $null
+            Write-Host "[+] Preflight $platform targets: $($hosts -join ', '); scans $(if ($SkipScans) { 'skipped' } else { 'starting' })."
+            try {
+                if ($platform -eq 'Windows') {
+                    $remoteErrors = @()
+                    $raw = @(Invoke-Command -ComputerName $hosts -ScriptBlock (Get-WindowsPreflightBlock) -ArgumentList $options `
+                        -ErrorAction SilentlyContinue -ErrorVariable remoteErrors)
+                } else {
+                    $raw = @(Invoke-Linux -Computers $hosts -Script (Get-LinuxPreflightScript -Options $options) -KeyPath $script:Config.SSHKeyPath)
+                }
+            } catch {
+                $dispatchError = $_.Exception.Message
+                $raw = @()
+            }
+            foreach ($target in $hosts) {
+                $result = $null
+                try {
+                    if ($platform -eq 'Windows') {
+                        $result = $raw | Where-Object PSComputerName -eq $target | Select-Object -First 1
+                        if (-not $result) {
+                            $errorText = @($remoteErrors | Where-Object { $_.TargetObject -eq $target -or $_.OriginInfo.PSComputerName -eq $target } | ForEach-Object { $_.Exception.Message }) -join '; '
+                            throw "No preflight result returned. $dispatchError $errorText"
+                        }
+                    } else {
+                        $response = $raw | Where-Object Target -eq $target | Select-Object -First 1
+                        if (-not $response) { throw "No preflight result returned. $dispatchError" }
+                        if ($response.ExitCode -ne 0) { throw "SSH exited $($response.ExitCode): $($response.StdErr)" }
+                        $result = $response.StdOut | ConvertFrom-Json -ErrorAction Stop
+                    }
+                    if (-not $result.ScanStatus -or -not $result.Actions) { throw 'Malformed preflight response.' }
+                    $definition = Get-MobileDefinitionAssessment -Date $result.DefinitionDate -MaximumAgeDays $DefinitionMaxAgeDays
+                    $actions = @($result.Actions) + @([PSCustomObject]@{
+                        Category = 'Readiness'; Name = 'AV definition age'; Status = $definition.Status
+                        Details = @{ Date = $definition.Date; AgeDays = $definition.AgeDays; MaximumAgeDays = $DefinitionMaxAgeDays }
+                    })
+                    $ready = $definition.Status -eq 'Current' -and $result.ScanStatus -eq 'Clean' -and
+                        $result.SmbReadiness -in @('NotApplicable', 'NotRequested') -and -not $result.Failures
+                    $entry = [PSCustomObject]@{
+                        HostName = $target; Platform = $platform; Success = $ready
+                        Definitions = $definition.Status; Scan = $result.ScanStatus; SMB = $result.SmbReadiness
+                        Actions = $actions; Failures = @($result.Failures)
+                    }
+                } catch {
+                    $entry = [PSCustomObject]@{
+                        HostName = $target; Platform = $platform; Success = $false
+                        Definitions = 'Unknown'; Scan = 'Unknown'; SMB = 'Unknown'
+                        Actions = @(); Failures = @($_.Exception.Message)
+                    }
+                }
+                $results.Add($entry)
+                Write-MobileRunEvent -Run $run -Event 'HostResult' -Data $entry
+            }
+        }
+        $runSuccess = $results.Count -gt 0 -and @($results | Where-Object { -not $_.Success }).Count -eq 0
+        $results | Format-Table HostName, Platform, Definitions, Scan, SMB -AutoSize | Out-String | Write-Host
+        Write-Host 'Preflight reports readiness only. CompletedNeedsReview requires SEP AV-log review; RequiresMountTest requires an actual SMB mount test.'
+        if ($PassThru) { $results.ToArray() }
+    } catch {
+        Write-MobileRunEvent -Run $run -Event 'RunError' -Data @{ Message = $_.Exception.Message }
+        throw
+    } finally {
+        Write-MobileRunEvent -Run $run -Event 'RunCompleted' -Data @{ Success = $runSuccess }
+        Write-Host "[+] Preflight audit log: $($run.ReadablePath)"
+    }
+}
 
 #endregion
 

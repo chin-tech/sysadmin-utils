@@ -28,6 +28,7 @@
         'Write-MobileFile'
         'Set-MobileConfig'
         'Show-MobileRunLog'
+        'Invoke-MobilePreflight'
         'Initialize-Environment'
     )
 
@@ -49,6 +50,15 @@
                 encryptionPin     = 'defaultPin123!@#'
                 adminRoot = "C:\TEMP"
                 nfsHomeRoot   = "C:\TEMP\"
+
+                Preflight = @{
+                    DefinitionMaxAgeDays = 7
+                    ScanTimeoutMinutes = 240
+                    WindowsScanPaths = @('C:')
+                    LinuxScanPaths = @('/')
+                    SymantecScanName = '' # Optional existing SEP administrator/local scan.
+                    SymantecScanExecutable = '' # Optional custom DoScan.exe installation path.
+                }
 
                 # Remove names to disable optional tasks. Execution uses the safe
                 # order defined by the module, regardless of list order here.
