@@ -54,6 +54,8 @@
                 Preflight = @{
                     DefinitionMaxAgeDays = 7
                     ScanTimeoutMinutes = 240
+                    WindowsScanStateDirectory = '' # Defaults to ProgramData\Mobiles\Preflight.
+                    LinuxScanStateDirectory = '/var/log/mobiles/preflight'
                     WindowsScanPaths = @('C:')
                     LinuxScanPaths = @('/')
                     SymantecScanName = '' # Optional existing SEP administrator/local scan.

@@ -7,7 +7,7 @@ param(
     [switch]$SkipScans,
 
     [Parameter(ParameterSetName = 'Preflight')]
-    [switch]$Smb,
+    [switch]$Rescan,
 
     [Parameter(ParameterSetName = 'Preflight')]
     [ValidateRange(0, 3650)][int]$DefinitionMaxAgeDays,
@@ -113,7 +113,7 @@ if ($PSBoundParameters.ContainsKey('Verbose')) {
 
 switch ($PSCmdlet.ParameterSetName) {
     'Preflight' {
-        foreach ($option in @('SkipScans', 'Smb', 'DefinitionMaxAgeDays', 'ScanTimeoutMinutes')) {
+        foreach ($option in @('SkipScans', 'Rescan', 'DefinitionMaxAgeDays', 'ScanTimeoutMinutes')) {
             if ($PSBoundParameters.ContainsKey($option)) { $passThru[$option] = $PSBoundParameters[$option] }
         }
         Invoke-MobilePreflight -MobileName $Name @passThru

@@ -6,7 +6,7 @@ New-Item -ItemType Directory -Path $fixture | Out-Null
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join '; ') }
-$names = @('Get-MobileDefinitionAssessment', 'Get-WindowsPreflightBlock', 'Get-LinuxPreflightScript', 'Invoke-MobilePreflight',
+$names = @('Start-WindowsPreflightScanJob', 'Get-WindowsPreflightScanWorker', 'Get-WindowsPreflightScanState', 'Get-LinuxPreflightScanWorker', 'Get-MobileDefinitionAssessment', 'Get-WindowsPreflightBlock', 'Get-LinuxPreflightScript', 'Invoke-MobilePreflight',
     'Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
     'ConvertTo-BashArgument', 'New-MobileRunLog', 'Write-MobileRunEvent', 'Format-MobileRunEvent', 'ConvertTo-MobileLogLines')
 $source = $ast.EndBlock.Statements | Where-Object {
@@ -27,7 +27,7 @@ try {
             MobileDeployments = "$fixture/logs"; SSHKeyPath = "$fixture/key"
         }
         $options = [pscustomobject]@{
-            SkipScans = $false; ScanTimeoutMinutes = 1; SmbEnabled = $true
+            SkipScans = $false; ScanTimeoutMinutes = 1
             LinuxScanPaths = @("/fixture path/with 'quote'"); WindowsScanPaths = @('C:')
             SymantecScanName = ''; SymantecScanExecutable = ''
         }
@@ -38,72 +38,174 @@ try {
             [IO.File]::WriteAllText("$tools/clamscan", @'
 #!/usr/bin/env bash
 if [[ "$1" == '--version' ]]; then
-    printf 'ClamAV 0.103/12345/%s\n' "$(date -u '+%a %b %d %T %Y')"
+    printf 'ClamAV 0.103/12345/%s\n' "$(date -u '+%a %b %d 00:00:00 %Y')"
 else
     printf '%s\n' "$@" > "$MOBILE_TEST_SCAN_ARGS"
+    sleep "${MOBILE_TEST_SCAN_DELAY:-0}"
     echo 'fixture scanner output'
     exit "${MOBILE_TEST_SCAN_CODE:-0}"
 fi
 '@)
-            [IO.File]::WriteAllText("$tools/cat", @'
+            [IO.File]::WriteAllText("$tools/systemd-run", @'
 #!/usr/bin/env bash
-if [[ "$1" == '/proc/sys/crypto/fips_enabled' ]]; then echo 1; else exec /bin/cat "$@"; fi
+printf 'dispatch\n' >> "$MOBILE_TEST_DISPATCHES"
+shift
+nohup "$@" </dev/null >/dev/null 2>&1 9>&- &
+printf '%s' "$!" > "$MOBILE_TEST_WORKER_PID"
 '@)
-            [IO.File]::WriteAllText("$tools/update-crypto-policies", "#!/usr/bin/env bash`necho FIPS`n")
-            & chmod +x "$tools/dzdo" "$tools/clamscan" "$tools/cat" "$tools/update-crypto-policies"
-            $oldPath = $env:PATH
-            $oldArgs = $env:MOBILE_TEST_SCAN_ARGS
-            $oldCode = $env:MOBILE_TEST_SCAN_CODE
+            [IO.File]::WriteAllText("$tools/systemctl", @'
+#!/usr/bin/env bash
+pid="$(/bin/cat "$MOBILE_TEST_WORKER_PID" 2>/dev/null)"
+state="$(ps -o stat= -p "${pid:-0}" 2>/dev/null)"
+if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo ActiveState=inactive; fi
+'@)
+            [IO.File]::WriteAllText("$tools/DoScan.exe", "#!/usr/bin/env bash`necho fixture-sep-output`nexit `${MOBILE_TEST_SEP_CODE:-0}`n")
+            Get-ChildItem $tools -File | ForEach-Object { & chmod +x $_.FullName }
+            $environmentNames = @('PATH', 'MOBILE_TEST_SCAN_ARGS', 'MOBILE_TEST_SCAN_CODE', 'MOBILE_TEST_SCAN_DELAY',
+                'MOBILE_TEST_DISPATCHES', 'MOBILE_TEST_WORKER_PID', 'MOBILE_TEST_SEP_CODE')
+            $savedEnvironment = @{}
+            foreach ($name in $environmentNames) { $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name) }
             try {
-                $env:PATH = "$tools" + [IO.Path]::PathSeparator + $oldPath
+                $env:PATH = "$tools" + [IO.Path]::PathSeparator + $env:PATH
                 $env:MOBILE_TEST_SCAN_ARGS = "$fixture/scan-args"
-                foreach ($code in @(0, 1, 2, 124)) {
-                    $env:MOBILE_TEST_SCAN_CODE = [string]$code
-                    $text = Get-LinuxPreflightScript $options
-                    $path = "$fixture/preflight.sh"
-                    [IO.File]::WriteAllText($path, $text)
+                $env:MOBILE_TEST_DISPATCHES = "$fixture/dispatches"
+                $env:MOBILE_TEST_WORKER_PID = "$fixture/worker-pid"
+                $options | Add-Member -NotePropertyName Rescan -NotePropertyValue $false
+                $options | Add-Member -NotePropertyName LinuxScanStateDirectory -NotePropertyValue "$fixture/linux-state"
+                $options | Add-Member -NotePropertyName WindowsScanStateDirectory -NotePropertyValue "$fixture/windows-state"
+                $path = "$fixture/preflight.sh"
+                function Query-LinuxScan {
+                    [IO.File]::WriteAllText($path, (Get-LinuxPreflightScript $options))
                     & bash -n $path
-                    Assert ($LASTEXITCODE -eq 0) 'Linux preflight script is invalid Bash'
+                    Assert ($LASTEXITCODE -eq 0) 'Generated async Linux script is invalid Bash'
                     $output = & bash $path
-                    $linux = ($output -join "`n") | ConvertFrom-Json
-                    $expected = @{ 0 = 'Clean'; 1 = 'ThreatsDetected'; 2 = 'Failed'; 124 = 'TimedOut' }[$code]
-                    Assert ($linux.ScanStatus -eq $expected -and $linux.SmbReadiness -eq 'BlockedByFips') 'Linux scan/FIPS status was incorrect'
-                    Assert ($linux.DefinitionDate -eq $today) 'ClamAV definition date was not normalized'
+                    Assert ($LASTEXITCODE -eq 0) 'Linux preflight dispatch/query failed'
+                    ($output -join "`n") | ConvertFrom-Json
                 }
-                Assert ((Get-Content $env:MOBILE_TEST_SCAN_ARGS) -contains "/fixture path/with 'quote'") 'Linux scan path quoting changed the path'
-                Remove-Item $env:MOBILE_TEST_SCAN_ARGS
+                $env:MOBILE_TEST_SCAN_DELAY = '2'
+                $env:MOBILE_TEST_SCAN_CODE = '0'
+                $clock = [Diagnostics.Stopwatch]::StartNew()
+                $linux = Query-LinuxScan
+                Assert ($linux.ScanStatus -eq 'Starting' -and $clock.Elapsed.TotalSeconds -lt 2) 'Preflight waited for the background scan'
+                $linux = Query-LinuxScan
+                Assert ($linux.ScanStatus -eq 'Running') 'Second preflight did not detect the running scan'
+                $options.Rescan = $true
+                $linux = Query-LinuxScan
+                Assert ($linux.ScanStatus -eq 'Running' -and @(Get-Content $env:MOBILE_TEST_DISPATCHES).Count -eq 1) 'Rescan duplicated an active scan'
+                $options.Rescan = $false
+                for ($i = 0; $i -lt 100; $i++) {
+                    Start-Sleep -Milliseconds 40
+                    $linux = Query-LinuxScan
+                    if ($linux.ScanStatus -eq 'Clean') { break }
+                }
+                Assert ($linux.ScanStatus -eq 'Clean' -and $linux.LastScanStatus -eq 'Clean' -and $linux.LastScanCompletedUtc) 'Detached scan completion was not persisted'
+                Assert ($linux.DefinitionDate -eq $today) 'Async scan lost definition inventory'
+                Assert ('SmbReadiness' -notin $linux.PSObject.Properties.Name -and @($linux.Actions | Where-Object Name -eq 'Workgroup SMB').Count -eq 0) 'Preflight still returned SMB readiness'
+                Assert (-not (Get-LinuxPreflightScript $options).Contains('/proc/sys/crypto/fips_enabled')) 'Preflight still queries FIPS state'
+                $linux = Query-LinuxScan
+                Assert (@(Get-Content $env:MOBILE_TEST_DISPATCHES).Count -eq 1) 'Status query restarted a completed scan'
+                Assert ((Get-Content $env:MOBILE_TEST_SCAN_ARGS) -contains "/fixture path/with 'quote'") 'Scan path quoting changed'
+                $originalPaths = $options.LinuxScanPaths
+                $options.LinuxScanPaths = @('/different-scope')
+                $linux = Query-LinuxScan
+                Assert ($linux.ScanStatus -eq 'Clean' -and -not $linux.ScanEvidenceCurrent) 'Historical clean result was accepted for a different scan scope'
+                $options.LinuxScanPaths = $originalPaths
+                $env:MOBILE_TEST_SCAN_DELAY = '0'
+                foreach ($code in @(1, 2, 124)) {
+                    $env:MOBILE_TEST_SCAN_CODE = [string]$code
+                    $options.Rescan = $true
+                    $linux = Query-LinuxScan
+                    $options.Rescan = $false
+                    $expected = @{ 1 = 'ThreatsDetected'; 2 = 'Failed'; 124 = 'TimedOut' }[$code]
+                    for ($i = 0; $i -lt 50; $i++) {
+                        Start-Sleep -Milliseconds 20
+                        $linux = Query-LinuxScan
+                        if ($linux.ScanStatus -eq $expected) { break }
+                    }
+                    Assert ($linux.ScanStatus -eq $expected) 'Background ClamAV exit-code handling failed'
+                }
                 $options.SkipScans = $true
-                [IO.File]::WriteAllText($path, (Get-LinuxPreflightScript $options))
-                $output = & bash $path
-                $linux = ($output -join "`n") | ConvertFrom-Json
-                Assert ($linux.ScanStatus -eq 'Skipped' -and -not (Test-Path $env:MOBILE_TEST_SCAN_ARGS)) 'SkipScans executed a scan'
+                $before = @(Get-Content $env:MOBILE_TEST_DISPATCHES).Count
+                $linux = Query-LinuxScan
+                Assert ($linux.ScanStatus -eq 'TimedOut' -and @(Get-Content $env:MOBILE_TEST_DISPATCHES).Count -eq $before) 'Status-only mode lost history or dispatched a scan'
+                # An inactive unit with an unfinished state is interrupted, not clean/running.
+                $pointer = Get-Content "$fixture/linux-state/latest.json" -Raw | ConvertFrom-Json
+                '{"Status":"Running"}' | Set-Content (Join-Path $pointer.RunDirectory 'result.json')
+                $linux = Query-LinuxScan
+                Assert ($linux.ScanStatus -eq 'Interrupted') 'Missing worker was reported as still running'
                 $options.SkipScans = $false
 
-                # Fake SEP launcher: exit zero must never be called clean.
-                [IO.File]::WriteAllText("$tools/DoScan.exe", "#!/usr/bin/env bash`necho fixture-sep-output`nexit 0`n")
-                & chmod +x "$tools/DoScan.exe"
-                $options.SymantecScanExecutable = "$tools/DoScan.exe"
+                # Run the actual Windows worker with a fake executable, without Task Scheduler.
+                $runDirectory = "$fixture/windows-state/fixture-run"
+                New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
+                $workerOptions = [pscustomobject]@{
+                    SymantecScanExecutable = "$tools/DoScan.exe"; WindowsScanPaths = @('C:')
+                    SymantecScanName = ''; ScanTimeoutMinutes = 1
+                }
+                $workerOptions | ConvertTo-Json | Set-Content "$runDirectory/options.json"
+                $env:MOBILE_TEST_SEP_CODE = '0'
+                & (Get-WindowsPreflightScanWorker) -RunDirectory $runDirectory
+                $completed = Get-Content "$runDirectory/result.json" -Raw | ConvertFrom-Json
+                Assert ($completed.Status -eq 'CompletedNeedsReview' -and $completed.CompletedUtc) 'SEP worker exit zero was called clean or not persisted'
+                $env:MOBILE_TEST_SEP_CODE = '2'
+                & (Get-WindowsPreflightScanWorker) -RunDirectory $runDirectory
+                $failedWorker = Get-Content "$runDirectory/result.json" -Raw | ConvertFrom-Json
+                Assert ($failedWorker.Status -eq 'Failed' -and $failedWorker.ExitCode -eq 2) 'SEP worker failure was lost'
+                # Query real state logic with mocked registry/scheduler observations.
+                $completed | ConvertTo-Json -Depth 8 | Set-Content "$runDirectory/result.json"
+                $completed | ConvertTo-Json -Depth 8 | Set-Content "$fixture/windows-state/completed.json"
+                @{ RunDirectory = $runDirectory } | ConvertTo-Json | Set-Content "$fixture/windows-state/latest.json"
+                $script:nativeScanStatus = 4
                 function Get-ItemProperty { [CmdletBinding()] param($LiteralPath)
-                    [pscustomobject]@{ LatestVirusDefsDate = $today; LatestVirusDefsRevision = 1; Version = 'fixture'; CoreServer = 'core.example.test' }
+                    [pscustomobject]@{ LatestVirusDefsDate = $today; LatestVirusDefsRevision = 1; Version = 'fixture'
+                        CoreServer = 'core.example.test'; GlobalScanStatus = $script:nativeScanStatus }
                 }
                 function Get-CimInstance { [CmdletBinding()] param($ClassName) @() }
+                function Get-ScheduledTask { [CmdletBinding()] param($TaskName) [pscustomobject]@{ State = 'Ready' } }
                 $windows = & (Get-WindowsPreflightBlock) $options
-                Assert ($windows.ScanStatus -eq 'CompletedNeedsReview') 'SEP exit zero was incorrectly called a clean scan'
+                Assert ($windows.ScanStatus -eq 'CompletedNeedsReview' -and $windows.LastScanCompletedUtc) 'SEP last completed result was not returned'
+                $script:nativeScanStatus = 8
+                $options.Rescan = $true
+                $windows = & (Get-WindowsPreflightBlock) $options
+                Assert ($windows.ScanStatus -eq 'Running' -and $windows.LastScanStatus -eq 'CompletedNeedsReview') 'Active native SEP scan was not respected'
+                $script:nativeScanStatus = 0
+                $options.Rescan = $false
+                @{ Status = 'Running'; StartedUtc = [datetime]::UtcNow.AddMinutes(-5).ToString('o') } | ConvertTo-Json | Set-Content "$runDirectory/result.json"
+                $windows = & (Get-WindowsPreflightBlock) $options
+                Assert ($windows.ScanStatus -eq 'Interrupted') 'Stale SEP worker was reported as running'
+                # Exercise dispatch decisions with only the native scheduler/ACL writer stubbed.
+                . ([scriptblock]::Create((Get-WindowsCollector-Registry)))
+                $script:windowsDispatches = 0
+                function Start-WindowsPreflightScanJob {
+                    param($Options, $Worker, $Root, $Executable)
+                    $script:windowsDispatches++
+                    $directory = Join-Path $Root 'new-job'
+                    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+                    $state = [pscustomobject]@{ Status = 'Starting'; StartedUtc = [datetime]::UtcNow.ToString('o') }
+                    $state | ConvertTo-Json | Set-Content (Join-Path $directory 'result.json')
+                    @{ RunDirectory = $directory } | ConvertTo-Json | Set-Content (Join-Path $Root 'latest.json')
+                    [pscustomobject]@{ State = $state; RunDirectory = $directory }
+                }
+                $options.WindowsScanStateDirectory = "$fixture/dispatch-state"
+                $options.SymantecScanExecutable = "$tools/DoScan.exe"
+                $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker)
+                Assert ($scan.Status -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows did not dispatch a missing scan'
+                $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker)
+                Assert ($scan.Status -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows duplicated a newly queued scan'
+
             } finally {
-                $env:PATH = $oldPath
-                $env:MOBILE_TEST_SCAN_ARGS = $oldArgs
-                $env:MOBILE_TEST_SCAN_CODE = $oldCode
+                foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name]) }
             }
         }
 
         function Get-MobileData { param($MobileName) [pscustomobject]@{ Windows = @('win-host'); Linux = @('linux-host', 'offline-host') } }
         function Get-DeploymentTaskSelection { param($Platform, $Phase) @('NetworkSharing') }
         function Invoke-Command { [CmdletBinding()] param($ComputerName, $ScriptBlock, $ArgumentList)
-            [pscustomobject]@{ PSComputerName = 'win-host'; DefinitionDate = $today; ScanStatus = 'CompletedNeedsReview'; SmbReadiness = 'NotApplicable'
+            [pscustomobject]@{ PSComputerName = 'win-host'; DefinitionDate = $today; ScanStatus = 'CompletedNeedsReview'
                 Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'Symantec'; Status = 'CompletedNeedsReview'; Details = $null }); Failures = @() }
         }
         function Invoke-Linux { param($Computers, $Script, $KeyPath)
-            $result = [pscustomobject]@{ DefinitionDate = [datetime]::UtcNow.AddDays(-20).ToString('yyyy-MM-dd'); ScanStatus = 'Clean'; SmbReadiness = 'BlockedByFips'
+            $result = [pscustomobject]@{ DefinitionDate = [datetime]::UtcNow.AddDays(-20).ToString('yyyy-MM-dd'); ScanStatus = 'Clean'
                 Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'ClamAV'; Status = 'Clean'; Details = $null }); Failures = @() }
             [pscustomobject]@{ Target = 'linux-host'; ExitCode = 0; StdOut = ($result | ConvertTo-Json -Depth 8); StdErr = '' }
         }
@@ -117,7 +219,27 @@ if [[ "$1" == '/proc/sys/crypto/fips_enabled' ]]; then echo 1; else exec /bin/ca
         function Invoke-Linux { param($Computers, $Script, $KeyPath) throw 'fixture SSH dispatch failure' }
         $results = @(Invoke-MobilePreflight dispatch-failed -PassThru)
         Assert ($results.Count -eq 3 -and $results[1].Failures[0].Contains('fixture SSH dispatch failure')) 'Dispatch failure removed planned hosts from the report'
-        'PASS: definition age, fake ClamAV/SEP scans, FIPS reporting, skip mode, quoting, unreachable hosts, and audit records.'
+        function Get-MobileData { param($MobileName) [pscustomobject]@{ Windows = @(); Linux = @('linux-host') } }
+        function Invoke-Linux { param($Computers, $Script, $KeyPath)
+            $result = [pscustomobject]@{ DefinitionDate = $today; ScanStatus = 'Clean'; ScanEvidenceCurrent = $true
+                Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'ClamAV'; Status = 'Clean'; Details = $null }); Failures = @() }
+            [pscustomobject]@{ Target = 'linux-host'; ExitCode = 0; StdOut = ($result | ConvertTo-Json -Depth 8); StdErr = '' }
+        }
+        $results = @(Invoke-MobilePreflight av-ready -PassThru)
+        Assert ($results[0].Success -and $results[0].Readiness -eq 'Ready' -and 'SMB' -notin $results[0].PSObject.Properties.Name) 'AV readiness still depends on SMB checks'
+        function Get-MobileData { param($MobileName) [pscustomobject]@{ Windows = @('win-host'); Linux = @() } }
+        function Invoke-Command { [CmdletBinding()] param($ComputerName, $ScriptBlock, $ArgumentList)
+            [pscustomobject]@{ PSComputerName = 'win-host'; DefinitionDate = $today; ScanStatus = 'Running'
+                Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'Symantec'; Status = 'Running'; Details = $null }); Failures = @() }
+        }
+        $results = @(Invoke-MobilePreflight pending -PassThru)
+        Assert ($results[0].Readiness -eq 'Pending') 'Running scan was labeled as failed'
+        $pending = Get-ChildItem "$fixture/logs" -Filter '*-pending-*.log' | Select-Object -First 1
+        Assert ((Get-Content $pending.FullName -Raw).Contains('Overall result: PENDING')) 'Pending audit summary was labeled as failed'
+        $rejected = $false
+        try { Invoke-MobilePreflight conflict -SkipScans -Rescan } catch { $rejected = $true }
+        Assert $rejected 'Conflicting scan options were accepted'
+        'PASS: detached scans, persistent results, duplicate suppression, rescan/status-only modes, pending/interrupted states, scope checks, AV-only readiness, and audit records.'
     } $fixture $root
 } finally {
     Remove-Module $module -ErrorAction SilentlyContinue
