@@ -37,6 +37,7 @@ $script:Config = [PSCustomObject]@{
     mobileOU           = $manifestCfg.MobileOU
     DeploymentTasks    = $manifestCfg.DeploymentTasks
     Preflight          = $manifestCfg.Preflight
+    SMBUser            = $manifestCfg.SMBUser
     NfsHome            = (Join-Path $nfsRoot $env:USERNAME)
     MobileEntries      = (Join-Path $mobileRoot 'entries')
     mobileDefaultUsers = (Join-Path $mobileRoot '.default')
@@ -740,7 +741,7 @@ function Find-ADComputerMatch {
             Name            = if ($props.Contains('name')) { $props['name'][0] } else { '' }
             DnsHostName     = if ($props.Contains('dnshostname')) { $props['dnshostname'][0] } else { '' }
             OperatingSystem = if ($props.Contains('operatingsystem')) { $props['operatingsystem'][0] } else { '' }
-            DisplayText     = "$($props['name'][0]) ($($props['operatingsystem'][0]))" 
+            DisplayText     = "$($props['name'][0]) ($($props['operatingsystem'][0]))"
         }
     }
 
@@ -4558,7 +4559,7 @@ collect_hasRotate()  { printf "HasAdminRotate\t%s\n" "$(find /etc/systemd -iname
 
 function Get-MobileDefinitionAssessment {
     [CmdletBinding()]
-    param([AllowNull()][string]$Date, [ValidateRange(0, 3650)][int]$MaximumAgeDays = 7)
+    param([AllowNull()][string]$Date, [ValidateRange(0, 3650)][int]$MaximumAgeDays = 30)
     $parsed = [datetime]::MinValue
     $valid = [datetime]::TryParseExact($Date, [string[]]@('yyyy-MM-dd', 'yyyy/MM/dd', 'yyyyMMdd'),
         [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)
@@ -4689,7 +4690,7 @@ function Start-WindowsPreflightScanJob {
 
 function Get-WindowsPreflightScanState {
     [CmdletBinding()]
-    param([Parameter(Mandatory)]$Options, [Parameter(Mandatory)][scriptblock]$Worker)
+    param([Parameter(Mandatory)]$Options, [Parameter(Mandatory)][scriptblock]$Worker, [string]$DefinitionDate)
     $root = if ($Options.WindowsScanStateDirectory) { $Options.WindowsScanStateDirectory } else {
         Join-Path $env:ProgramData 'Mobiles\Preflight'
     }
@@ -4738,7 +4739,11 @@ function Get-WindowsPreflightScanState {
         elseif ($nativeStatus -eq 10) { $status = 'Interrupted' }
         $launch = -not $Options.SkipScans -and -not $active -and
             $status -notin @('Starting', 'Running') -and ($Options.Rescan -or $status -eq 'NotStarted')
-        if ($launch) {
+        $maximumAge = if ($null -ne $Options.DefinitionMaxAgeDays) { [int]$Options.DefinitionMaxAgeDays } else { 30 }
+        $definition = Get-MobileDefinitionAssessment -Date $DefinitionDate -MaximumAgeDays $maximumAge
+        $blocked = $launch -and -not $Options.ForceScan -and $definition.Status -ne 'Current'
+        if ($blocked) { $status = 'BlockedDefinitions' }
+        if ($launch -and -not $blocked) {
             $candidates = @($Options.SymantecScanExecutable)
             foreach ($directory in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
                 if ($directory) { $candidates += Join-Path $directory 'Symantec\Symantec Endpoint Protection\DoScan.exe' }
@@ -4762,6 +4767,8 @@ function Get-WindowsPreflightScanState {
         [PSCustomObject]@{
             Status = $status; NativeScanStatus = $nativeStatus; StateDirectory = $root
             Current = $saved; LastCompleted = $lastCompleted; LatestAVLogs = $logs
+            DefinitionAssessment = $definition; ScanBlocked = [bool]$blocked
+            Note = if ($blocked) { 'Definitions are stale, unknown, or future-dated; use -ForceScan to override.' } else { $null }
             Review = 'SEP completion is not a clean verdict. Review the latest native AV-log evidence.'
         }
     } finally {
@@ -4779,6 +4786,7 @@ function Get-WindowsPreflightBlock {
     $parts.Add((Get-WindowsCollector-Symantec))
     $parts.Add((Get-WindowsCollector-Ivanti))
     $parts.Add('function Start-WindowsPreflightScanJob {' + ${function:Start-WindowsPreflightScanJob}.ToString() + '}')
+    $parts.Add('function Get-MobileDefinitionAssessment {' + ${function:Get-MobileDefinitionAssessment}.ToString() + '}')
     $parts.Add('function Get-WindowsPreflightScanState {' + ${function:Get-WindowsPreflightScanState}.ToString() + '}')
     $parts.Add('$scanWorker = {' + (Get-WindowsPreflightScanWorker).ToString() + '}')
     $parts.Add(({
@@ -4795,7 +4803,7 @@ function Get-WindowsPreflightBlock {
         $actions.Add([PSCustomObject]@{ Category = 'Inventory'; Name = 'Symantec'; Status = $symantec.Status; Details = $symantec })
         $actions.Add([PSCustomObject]@{ Category = 'Inventory'; Name = 'Ivanti'; Status = $ivanti.Status; Details = $ivanti })
         try {
-            $scan = Get-WindowsPreflightScanState -Options $Options -Worker $scanWorker
+            $scan = Get-WindowsPreflightScanState -Options $Options -Worker $scanWorker -DefinitionDate $normalizedDate
         } catch {
             $scan = [PSCustomObject]@{ Status = 'Failed'; Error = $_.Exception.Message }
         }
@@ -4822,15 +4830,48 @@ set -o pipefail
 export LC_ALL=C
 run_dir="$1"
 source "$run_dir/options.sh"
+export PATH
 state_root="$(dirname "$run_dir")"
 started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-jq -n --arg started "$started" '{Status:"Running", StartedUtc:$started}' > "$run_dir/result.tmp"
+# mountinfo describes this worker's mount namespace, including NFS bind mounts.
+# Decode kernel-escaped mount points before escaping them as literal regex paths.
+excluded_nfs=()
+exclude_args=(--exclude-dir='^/(proc|sys|dev|run)(/|$)')
+discovery_error=''
+if [[ ! -r /proc/self/mountinfo ]]; then
+    discovery_error='Cannot read /proc/self/mountinfo; NFS exclusions could not be determined'
+else
+    while IFS= read -r mount_record; do
+        mount_fields="${mount_record%% - *}"
+        filesystem="${mount_record#* - }"
+        filesystem="${filesystem%% *}"
+        [[ "$filesystem" == nfs || "$filesystem" == nfs4 ]] || continue
+        read -r mount_id parent_id device mount_root mount_point mount_options remainder <<< "$mount_fields"
+        printf -v mount_point '%b' "$mount_point"
+        excluded_nfs+=("$mount_point")
+        pattern="$(printf '%s' "$mount_point" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+        if [[ "$mount_point" == / ]]; then
+            exclude_args+=(--exclude-dir='^/')
+        else
+            exclude_args+=("--exclude-dir=^${pattern}(/|$)")
+        fi
+    done < /proc/self/mountinfo
+fi
+excluded_json="$(printf '%s\n' "${excluded_nfs[@]}" | jq -R . | jq -s 'map(select(length > 0)) | unique | sort')"
+jq -n --arg started "$started" --argjson excluded "$excluded_json" \
+    '{Status:"Running",StartedUtc:$started,ExcludedNfsMounts:$excluded}' > "$run_dir/result.tmp"
 mv -f "$run_dir/result.tmp" "$run_dir/result.json"
 # This worker is supervised by systemd, independent of the requesting SSH session.
-timeout "$scan_timeout" clamscan --recursive --infected --stdout --log="$run_dir/clamav.log" \
-    --exclude-dir='^/(proc|sys|dev|run)(/|$)' -- "${scan_paths[@]}" \
-    > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt"
-code=$?
+if [[ -n "$discovery_error" ]]; then
+    : > "$run_dir/stdout.txt"
+    printf '%s\n' "$discovery_error" > "$run_dir/stderr.txt"
+    code=2
+else
+    timeout "$scan_timeout" clamscan --recursive --infected --stdout --log="$run_dir/clamav.log" \
+        "${exclude_args[@]}" -- "${scan_paths[@]}" \
+        > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt"
+    code=$?
+fi
 case "$code" in
     0) status='Clean' ;;
     1) status='ThreatsDetected' ;;
@@ -4841,8 +4882,8 @@ head -c 65536 "$run_dir/stdout.txt" > "$run_dir/out-short"
 head -c 65536 "$run_dir/stderr.txt" > "$run_dir/err-short"
 jq -n --arg status "$status" --arg started "$started" --arg ended "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson code "$code" --arg version "$version" --arg log "$run_dir/clamav.log" --argjson paths "$(printf '%s\n' "${scan_paths[@]}" | jq -R . | jq -s .)" \
-    --rawfile stdout "$run_dir/out-short" --rawfile stderr "$run_dir/err-short" \
-    '{Status:$status,StartedUtc:$started,CompletedUtc:$ended,ExitCode:$code,DefinitionVersion:$version,LogPath:$log,ScanPaths:$paths,StdOut:$stdout,StdErr:$stderr}' \
+    --argjson excluded "$excluded_json" --rawfile stdout "$run_dir/out-short" --rawfile stderr "$run_dir/err-short" \
+    '{Status:$status,StartedUtc:$started,CompletedUtc:$ended,ExitCode:$code,DefinitionVersion:$version,LogPath:$log,ScanPaths:$paths,ExcludedNfsMounts:$excluded,StdOut:$stdout,StdErr:$stderr}' \
     > "$run_dir/result.tmp"
 mv -f "$run_dir/result.tmp" "$run_dir/result.json"
 cp "$run_dir/result.json" "$state_root/completed.tmp"
@@ -4856,7 +4897,17 @@ function Get-LinuxPreflightScript {
     $paths = @($Options.LinuxScanPaths | ForEach-Object { ConvertTo-BashArgument $_ }) -join ' '
     $stateRoot = if ($Options.LinuxScanStateDirectory) { $Options.LinuxScanStateDirectory } else { '/var/log/mobiles/preflight' }
     if (-not $stateRoot.StartsWith('/')) { throw 'LinuxScanStateDirectory must be an absolute path.' }
+    $toolDirectories = if ($Options.LinuxToolDirectories) { @($Options.LinuxToolDirectories) } else { @('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin') }
+    foreach ($directory in $toolDirectories) {
+        if ([string]::IsNullOrWhiteSpace($directory) -or -not $directory.StartsWith('/') -or $directory -match '[:\r\n]') {
+            throw 'LinuxToolDirectories must contain absolute directory paths without colons or newlines.'
+        }
+    }
+    $maximumAge = if ($null -ne $Options.DefinitionMaxAgeDays) { [int]$Options.DefinitionMaxAgeDays } else { 30 }
     $prefix = @"
+force_scan=$(([bool]$Options.ForceScan).ToString().ToLowerInvariant())
+maximum_age=$maximumAge
+export PATH=$(ConvertTo-BashArgument ($toolDirectories -join ':'))
 scan_paths=($paths)
 scan_timeout=$([int]$Options.ScanTimeoutMinutes * 60)
 skip_scans=$(([bool]$Options.SkipScans).ToString().ToLowerInvariant())
@@ -4868,7 +4919,7 @@ set -o pipefail
 export LC_ALL=C
 umask 077
 for required in jq flock; do
-    if ! command -v "$required" >/dev/null 2>&1; then echo "Preflight requires $required" >&2; exit 2; fi
+    if ! command -v "$required" >/dev/null 2>&1; then echo "Preflight requires $required; searched PATH=$PATH" >&2; exit 2; fi
 done
 mkdir -p "$state_root" || exit 2
 chmod 700 "$state_root" || exit 2
@@ -4880,6 +4931,15 @@ version_exit=$?
 definition_date=''
 if [[ "$version_exit" -eq 0 ]]; then
     definition_date="$(date -u -d "${version##*/}" '+%Y-%m-%d' 2>/dev/null)"
+fi
+definitions_current=false
+if [[ -n "$definition_date" ]]; then
+    definition_epoch="$(date -u -d "$definition_date" +%s 2>/dev/null)"
+    today_epoch="$(date -u -d "$(date -u +%F)" +%s)"
+    if [[ -n "$definition_epoch" ]]; then
+        age_days=$(( (today_epoch - definition_epoch) / 86400 ))
+        if (( age_days >= 0 && age_days <= maximum_age )); then definitions_current=true; fi
+    fi
 fi
 scan_status='NotStarted'
 current='null'
@@ -4915,8 +4975,10 @@ elif [[ "$scan_status" == 'Running' ]]; then
 fi
 if [[ "$locked" == false ]]; then
     scan_status='Starting'
-elif [[ "$skip_scans" == false && "$active" == false && ( "$rescan" == true || "$scan_status" == 'NotStarted' ) ]]; then
-    if [[ "$version_exit" -ne 0 ]]; then
+elif [[ "$skip_scans" == false && "$active" == false && "$scan_status" != Starting && ( "$rescan" == true || "$scan_status" == 'NotStarted' ) ]]; then
+    if [[ "$force_scan" != true && "$definitions_current" != true ]]; then
+        scan_status='BlockedDefinitions'
+    elif [[ "$version_exit" -ne 0 ]]; then
         scan_status='Failed'
         current='{"Status":"Failed","Error":"clamscan is unavailable"}'
     elif ! command -v systemd-run >/dev/null 2>&1; then
@@ -4925,7 +4987,7 @@ elif [[ "$skip_scans" == false && "$active" == false && ( "$rescan" == true || "
     else
         run_dir="$(mktemp -d "$state_root/run-XXXXXXXXXX")" || exit 2
         unit="mobiles-preflight-av-$(basename "$run_dir").service"
-        declare -p scan_paths scan_timeout version > "$run_dir/options.sh"
+        declare -p scan_paths scan_timeout version PATH > "$run_dir/options.sh"
         cat > "$run_dir/worker.sh" <<'MOBILE_CLAM_WORKER'
 '@
     $afterWorker = @'
@@ -4958,7 +5020,7 @@ jq -n --arg host "$(hostname -s)" --arg date "$definition_date" --arg version "$
       LastScanStatus:($previous.Status // null),LastScanCompletedUtc:($previous.CompletedUtc // null),ScanEvidenceCurrent:($scope and $definitions),
       Actions:[
         {Category:"Inventory",Name:"ClamAV",Status:(if $date=="" then "Unknown" else "Collected" end),Details:{Version:$version,DefinitionDate:$date}},
-        {Category:"AVScan",Name:"ClamAV",Status:$scan,Details:{StateDirectory:$directory,Current:$current,LastCompleted:$previous,ScopeMatches:$scope,DefinitionsMatch:$definitions}}
+        {Category:"AVScan",Name:"ClamAV",Status:$scan,Details:{StateDirectory:$directory,Current:$current,LastCompleted:$previous,ScopeMatches:$scope,DefinitionsMatch:$definitions,ScanBlocked:($scan=="BlockedDefinitions"),Note:(if $scan=="BlockedDefinitions" then "Definitions are stale, unknown, or future-dated; use -ForceScan to override" else null end)}}
       ],Failures:(if ($scan=="Failed" or $scan=="TimedOut" or $scan=="ThreatsDetected" or $scan=="Interrupted") then ["ClamAV scan: "+$scan] else [] end)}'
 '@
     $delimiter = 'MOBILE_PREFLIGHT_ROOT_' + [guid]::NewGuid().ToString('N')
@@ -4974,6 +5036,7 @@ function Invoke-MobilePreflight {
         [ValidateRange(1, 1440)][int]$ScanTimeoutMinutes = $script:Config.Preflight.ScanTimeoutMinutes,
         [switch]$SkipScans,
         [switch]$Rescan,
+        [Alias('force-scan')][switch]$ForceScan,
         [switch]$PassThru
     )
     if ($SkipScans -and $Rescan) { throw '-SkipScans and -Rescan cannot be used together.' }
@@ -4984,9 +5047,10 @@ function Invoke-MobilePreflight {
     try {
         $data = Get-MobileData -MobileName $MobileName
         $options = [PSCustomObject]@{
-            SkipScans = [bool]$SkipScans; Rescan = [bool]$Rescan; ScanTimeoutMinutes = $ScanTimeoutMinutes
+            SkipScans = [bool]$SkipScans; Rescan = [bool]$Rescan; ForceScan = [bool]$ForceScan; DefinitionMaxAgeDays = $DefinitionMaxAgeDays; ScanTimeoutMinutes = $ScanTimeoutMinutes
             WindowsScanStateDirectory = $script:Config.Preflight.WindowsScanStateDirectory
             LinuxScanStateDirectory = $script:Config.Preflight.LinuxScanStateDirectory
+            LinuxToolDirectories = $script:Config.Preflight.LinuxToolDirectories
             SymantecScanName = $script:Config.Preflight.SymantecScanName
             SymantecScanExecutable = $script:Config.Preflight.SymantecScanExecutable
             WindowsScanPaths = @($script:Config.Preflight.WindowsScanPaths)

@@ -12,7 +12,15 @@ Repeat the same command to inspect running scans or the latest completed result.
 .\Mobiles.ps1 -Preflight -Name example -Rescan
 ```
 
-An active scan is always reused, even with `-Rescan`. To query inventory/status/history without starting a missing scan:
+New scans require definitions dated within the last 30 UTC calendar days (inclusive), configurable through `DefinitionMaxAgeDays`. Stale, missing/unrecognized, and future-dated definitions prevent dispatch and report `BlockedDefinitions`. Existing scans and history remain visible. To override only this definition gate, use PowerShell's `-ForceScan` (alias `-force-scan`):
+
+```powershell
+.\Mobiles.ps1 -Preflight -Name example -ForceScan
+# For a fresh attempt when completed history already exists:
+.\Mobiles.ps1 -Preflight -Name example -Rescan -ForceScan
+```
+
+Forced scans still report stale/unknown definitions and do not make those hosts ready. `-SkipScans` remains query-only even with `-ForceScan`. An active scan is always reused, even with `-Rescan`. To query inventory/status/history without starting a missing scan:
 
 ```powershell
 .\Mobiles.ps1 -Preflight -Name example -SkipScans
@@ -26,7 +34,7 @@ Override the definition-age threshold or scan timeout for a run:
 
 `-SkipScans` and `-Rescan` are mutually exclusive. Timeout/path overrides affect the next dispatched scan, not a scan already running.
 
-The manifest's `DefaultConfig.Preflight` holds defaults: seven days, 240 minutes, Windows `C:`, Linux `/`, and optional Symantec scan name/executable overrides. A full `Preflight` dictionary can also be supplied through the existing configuration override. Configure additional Windows drives and Linux paths there as needed. Prefer an existing SEP administrator scan name when your site requires a specific scan policy. Paths, arguments, and outcomes are recorded in the normal `.log`/`.jsonl` audit pair under `MobileDeployments`.
+The manifest's `DefaultConfig.Preflight` holds defaults: 30 days, 240 minutes, Windows `C:`, Linux `/`, and optional Symantec scan name/executable overrides. A full `Preflight` dictionary can also be supplied through the existing configuration override. Configure additional Windows drives and Linux paths there as needed. Prefer an existing SEP administrator scan name when your site requires a specific scan policy. Paths, arguments, and outcomes are recorded in the normal `.log`/`.jsonl` audit pair under `MobileDeployments`.
 
 ## Outcomes
 
@@ -36,7 +44,9 @@ Definition status is `Current`, `Stale`, `FutureDate`, or `Unknown`. Recognized 
 
 Linux dispatches a root-owned transient systemd service through `dzdo`. Its worker runs `clamscan` with a timeout, configured paths, and an explicit per-scan `--log` file. `clamscan` has no universal results directory; this program creates durable managed history under `/var/log/mobiles/preflight` by default (`Preflight.LinuxScanStateDirectory`). It uses `bash`, `systemd-run`/`systemctl`, `flock`, `jq`, GNU `date`/coreutils, and procps. A dispatch lock, service state, and native `clamscan` process detection prevent duplicate scans. Services survive SSH disconnects. Abandoned/inactive workers are reported as `Interrupted` rather than being mistaken for successful completion.
 
-ClamAV scans configured paths recursively, excluding `/proc`, `/sys`, `/dev`, and `/run`. Other mounted filesystems beneath a configured path may be included. No removal/quarantine options are supplied. Exit codes map to `Clean` (0), `ThreatsDetected` (1), `Failed` (other errors), or `TimedOut`. The worker persists exit status, UTC times, scanned paths, definition version, and up to 64 KiB of stdout/stderr per stream; the complete native log remains on the endpoint. A historical clean result is not treated as current readiness evidence when its paths or definition version differ from the current request. Existing unmanaged ClamAV logs are not assumed to be clean scan history. See the [ClamAV manual](https://github.com/Cisco-Talos/clamav/blob/main/docs/man/clamscan.1.in).
+Both the elevated dispatcher and detached worker use `Preflight.LinuxToolDirectories` as their explicit PATH. Defaults include `/usr/local/bin`, `/usr/local/sbin`, and the standard system directories; add your site's custom tool directories there if needed. Use only administrator-controlled directories, since these commands run as root. This avoids dependencies disappearing when dzdo or systemd supplies a different PATH from the SSH login. Missing dependency errors include the searched PATH.
+
+ClamAV scans configured paths recursively, excluding `/proc`, `/sys`, `/dev`, and `/run`. At the start of each Linux worker, mounted `nfs` and `nfs4` directories (including bind mounts) are discovered from `/proc/self/mountinfo` and excluded automatically. Spaces, backslashes, and regex characters in mount paths are handled as literal path characters. `ExcludedNfsMounts` is recorded in running/completed state and the collected audit details. If mount information cannot be read, the scan fails without launching ClamAV. Mounts added after discovery are not covered until a fresh scan; keep mounts stable during a scan. Other filesystem types beneath a configured path may still be included. No removal/quarantine options are supplied. Exit codes map to `Clean` (0), `ThreatsDetected` (1), `Failed` (other errors), or `TimedOut`. The worker persists exit status, UTC times, scanned paths, definition version, and up to 64 KiB of stdout/stderr per stream; the complete native log remains on the endpoint. A historical clean result is not treated as current readiness evidence when its paths or definition version differ from the current request. Existing unmanaged ClamAV logs are not assumed to be clean scan history. See the [ClamAV manual](https://github.com/Cisco-Talos/clamav/blob/main/docs/man/clamscan.1.in).
 
 Windows dispatches the persistent `Mobiles-PreflightAV` scheduled task as SYSTEM, with protected worker/state files under `%ProgramData%\Mobiles\Preflight` by default (`Preflight.WindowsScanStateDirectory`). The worker waits on `DoScan.exe /Sync` and records completion; the administrator's preflight call returns after starting the task. The two standard DoScan installation locations are tried unless a custom executable path is supplied. The native `GlobalScanStatus` registry value is also checked, so active SEP scans started elsewhere are respected. Existing native completion/status and recent AV-log excerpts are reported when available. Latest native AV-log timestamps describe log modification, not necessarily a scan completion timestamp.
 

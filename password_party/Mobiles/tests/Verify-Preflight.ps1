@@ -19,7 +19,8 @@ try {
         function Assert($condition, $message) { if (-not $condition) { throw $message } }
         $today = [datetime]::UtcNow.ToString('yyyy-MM-dd')
         Assert ((Get-MobileDefinitionAssessment $today).Status -eq 'Current') 'Current definitions were rejected'
-        Assert ((Get-MobileDefinitionAssessment ([datetime]::UtcNow.AddDays(-10).ToString('yyyy-MM-dd'))).Status -eq 'Stale') 'Stale definitions were not flagged'
+        Assert ((Get-MobileDefinitionAssessment ([datetime]::UtcNow.AddDays(-31).ToString('yyyy-MM-dd'))).Status -eq 'Stale') 'Stale definitions were not flagged'
+        Assert ((Get-MobileDefinitionAssessment ([datetime]::UtcNow.AddDays(-30).ToString('yyyy-MM-dd'))).Status -eq 'Current') '30-day boundary was rejected'
         Assert ((Get-MobileDefinitionAssessment 'ambiguous-date').Status -eq 'Unknown') 'Unknown date was guessed'
         Assert ((Get-MobileDefinitionAssessment ([datetime]::UtcNow.AddDays(2).ToString('yyyy-MM-dd'))).Status -eq 'FutureDate') 'Future definition date was not flagged'
         $script:Config = [pscustomobject]@{
@@ -27,18 +28,21 @@ try {
             MobileDeployments = "$fixture/logs"; SSHKeyPath = "$fixture/key"
         }
         $options = [pscustomobject]@{
-            SkipScans = $false; ScanTimeoutMinutes = 1
+            SkipScans = $false; ScanTimeoutMinutes = 1; ForceScan = $false; DefinitionMaxAgeDays = 30
             LinuxScanPaths = @("/fixture path/with 'quote'"); WindowsScanPaths = @('C:')
             SymantecScanName = ''; SymantecScanExecutable = ''
         }
+        Assert ((Get-LinuxPreflightScript $options).Contains('/usr/local/bin')) 'Older configuration did not receive default tool directories'
         if ((Get-Command bash -ErrorAction SilentlyContinue) -and (Get-Command jq -ErrorAction SilentlyContinue)) {
             $tools = Join-Path $fixture 'tools'
             New-Item -ItemType Directory -Path $tools | Out-Null
-            [IO.File]::WriteAllText("$tools/dzdo", "#!/usr/bin/env bash`nexec `"`$@`"`n")
+            [IO.File]::WriteAllText("$tools/dzdo", "#!/usr/bin/env bash`nexport PATH=/usr/bin:/bin`nexec `"`$@`"`n")
+            $realJq = (Get-Command jq -CommandType Application).Source
+            [IO.File]::WriteAllText("$tools/jq", "#!/bin/bash`nexec $(ConvertTo-BashArgument $realJq) " + '"$@"' + "`n")
             [IO.File]::WriteAllText("$tools/clamscan", @'
 #!/usr/bin/env bash
 if [[ "$1" == '--version' ]]; then
-    printf 'ClamAV 0.103/12345/%s\n' "$(date -u '+%a %b %d 00:00:00 %Y')"
+    printf 'ClamAV 0.103/12345/%s\n' "${MOBILE_TEST_DEFINITION_DATE:-$(date -u '+%a %b %d 00:00:00 %Y')}"
 else
     printf '%s\n' "$@" > "$MOBILE_TEST_SCAN_ARGS"
     sleep "${MOBILE_TEST_SCAN_DELAY:-0}"
@@ -50,7 +54,7 @@ fi
 #!/usr/bin/env bash
 printf 'dispatch\n' >> "$MOBILE_TEST_DISPATCHES"
 shift
-nohup "$@" </dev/null >/dev/null 2>&1 9>&- &
+PATH=/usr/bin:/bin nohup "$@" </dev/null >/dev/null 2>&1 9>&- &
 printf '%s' "$!" > "$MOBILE_TEST_WORKER_PID"
 '@)
             [IO.File]::WriteAllText("$tools/systemctl", @'
@@ -62,7 +66,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
             [IO.File]::WriteAllText("$tools/DoScan.exe", "#!/usr/bin/env bash`necho fixture-sep-output`nexit `${MOBILE_TEST_SEP_CODE:-0}`n")
             Get-ChildItem $tools -File | ForEach-Object { & chmod +x $_.FullName }
             $environmentNames = @('PATH', 'MOBILE_TEST_SCAN_ARGS', 'MOBILE_TEST_SCAN_CODE', 'MOBILE_TEST_SCAN_DELAY',
-                'MOBILE_TEST_DISPATCHES', 'MOBILE_TEST_WORKER_PID', 'MOBILE_TEST_SEP_CODE')
+                'MOBILE_TEST_DISPATCHES', 'MOBILE_TEST_WORKER_PID', 'MOBILE_TEST_SEP_CODE', 'MOBILE_TEST_DEFINITION_DATE')
             $savedEnvironment = @{}
             foreach ($name in $environmentNames) { $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name) }
             try {
@@ -70,18 +74,50 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 $env:MOBILE_TEST_SCAN_ARGS = "$fixture/scan-args"
                 $env:MOBILE_TEST_DISPATCHES = "$fixture/dispatches"
                 $env:MOBILE_TEST_WORKER_PID = "$fixture/worker-pid"
+                $options | Add-Member -NotePropertyName LinuxToolDirectories -NotePropertyValue @($tools, '/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin')
                 $options | Add-Member -NotePropertyName Rescan -NotePropertyValue $false
                 $options | Add-Member -NotePropertyName LinuxScanStateDirectory -NotePropertyValue "$fixture/linux-state"
                 $options | Add-Member -NotePropertyName WindowsScanStateDirectory -NotePropertyValue "$fixture/windows-state"
+                $mountInfoPath = "$fixture/mountinfo"
+                @'
+20 1 0:1 / / rw - xfs /dev/root rw
+21 20 0:2 / /mnt/team\040share.[a]+ rw - nfs server:/team rw
+22 20 0:3 / /mnt/nfs4 rw - nfs4 server:/v4 rw
+23 20 0:2 /subdir /mnt/bind\134path rw - nfs server:/team rw
+24 20 0:4 / /mnt/local rw - ext4 /dev/local rw
+25 20 0:5 / /mnt/smb rw - cifs //server/share rw
+'@ | Set-Content $mountInfoPath
                 $path = "$fixture/preflight.sh"
                 function Query-LinuxScan {
-                    [IO.File]::WriteAllText($path, (Get-LinuxPreflightScript $options))
+                    [IO.File]::WriteAllText($path, (Get-LinuxPreflightScript $options).Replace('/proc/self/mountinfo', $mountInfoPath))
                     & bash -n $path
                     Assert ($LASTEXITCODE -eq 0) 'Generated async Linux script is invalid Bash'
                     $output = & bash $path
                     Assert ($LASTEXITCODE -eq 0) 'Linux preflight dispatch/query failed'
                     ($output -join "`n") | ConvertFrom-Json
                 }
+                foreach ($definitionDate in @([datetime]::UtcNow.AddDays(-31).ToString('yyyy-MM-dd'), 'invalid', [datetime]::UtcNow.AddDays(1).ToString('yyyy-MM-dd'))) {
+                    $env:MOBILE_TEST_DEFINITION_DATE = $definitionDate
+                    $linux = Query-LinuxScan
+                    Assert ($linux.ScanStatus -eq 'BlockedDefinitions' -and -not (Test-Path $env:MOBILE_TEST_DISPATCHES)) 'Linux dispatched with stale/unknown/future definitions'
+                }
+                $options.ForceScan = $true
+                $options.SkipScans = $true
+                $linux = Query-LinuxScan
+                Assert ($linux.ScanStatus -eq 'NotStarted' -and -not (Test-Path $env:MOBILE_TEST_DISPATCHES)) 'ForceScan overrode query-only mode'
+                $options.SkipScans = $false
+                $linux = Query-LinuxScan
+                Assert ($linux.ScanStatus -eq 'Starting') 'ForceScan did not override Linux definition gate'
+                for ($i = 0; $i -lt 100; $i++) {
+                    Start-Sleep -Milliseconds 40
+                    $linux = Query-LinuxScan
+                    if ($linux.ScanStatus -eq 'Clean') { break }
+                }
+                Assert ($linux.ScanStatus -eq 'Clean') 'Forced Linux scan did not complete'
+                $options.ForceScan = $false
+                Remove-Item Env:MOBILE_TEST_DEFINITION_DATE
+                Remove-Item $options.LinuxScanStateDirectory -Recurse -Force
+                Remove-Item $env:MOBILE_TEST_DISPATCHES
                 $env:MOBILE_TEST_SCAN_DELAY = '2'
                 $env:MOBILE_TEST_SCAN_CODE = '0'
                 $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -99,6 +135,13 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                     if ($linux.ScanStatus -eq 'Clean') { break }
                 }
                 Assert ($linux.ScanStatus -eq 'Clean' -and $linux.LastScanStatus -eq 'Clean' -and $linux.LastScanCompletedUtc) 'Detached scan completion was not persisted'
+                $scanDetails = ($linux.Actions | Where-Object Category -eq AVScan).Details
+                $excluded = @($scanDetails.Current.ExcludedNfsMounts)
+                Assert ($excluded.Count -eq 3 -and $excluded -contains '/mnt/team share.[a]+' -and $excluded -contains '/mnt/nfs4' -and $excluded -contains '/mnt/bind\path') 'NFS/NFS4/bind mount discovery or kernel path decoding failed'
+                Assert (@($scanDetails.LastCompleted.ExcludedNfsMounts).Count -eq 3) 'Completed history lost NFS exclusions'
+                $scanArgs = @(Get-Content $env:MOBILE_TEST_SCAN_ARGS)
+                Assert ($scanArgs -contains '--exclude-dir=^/mnt/team share\.\[a\]\+(/|$)' -and $scanArgs -contains '--exclude-dir=^/mnt/bind\\path(/|$)') 'NFS exclusion paths were not regex-escaped or passed as single arguments'
+                Assert (-not ($scanArgs -match 'mnt/local|mnt/smb')) 'Local/SMB mounts were excluded as NFS'
                 Assert ($linux.DefinitionDate -eq $today) 'Async scan lost definition inventory'
                 Assert ('SmbReadiness' -notin $linux.PSObject.Properties.Name -and @($linux.Actions | Where-Object Name -eq 'Workgroup SMB').Count -eq 0) 'Preflight still returned SMB readiness'
                 Assert (-not (Get-LinuxPreflightScript $options).Contains('/proc/sys/crypto/fips_enabled')) 'Preflight still queries FIPS state'
@@ -111,6 +154,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 Assert ($linux.ScanStatus -eq 'Clean' -and -not $linux.ScanEvidenceCurrent) 'Historical clean result was accepted for a different scan scope'
                 $options.LinuxScanPaths = $originalPaths
                 $env:MOBILE_TEST_SCAN_DELAY = '0'
+                '20 1 0:1 / / rw - xfs /dev/root rw' | Set-Content $mountInfoPath
                 foreach ($code in @(1, 2, 124)) {
                     $env:MOBILE_TEST_SCAN_CODE = [string]$code
                     $options.Rescan = $true
@@ -123,6 +167,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                         if ($linux.ScanStatus -eq $expected) { break }
                     }
                     Assert ($linux.ScanStatus -eq $expected) 'Background ClamAV exit-code handling failed'
+                    Assert (@(($linux.Actions | Where-Object Category -eq AVScan).Details.Current.ExcludedNfsMounts).Count -eq 0) 'Worker reused old NFS exclusions after mounts changed'
                 }
                 $options.SkipScans = $true
                 $before = @(Get-Content $env:MOBILE_TEST_DISPATCHES).Count
@@ -134,6 +179,18 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 $linux = Query-LinuxScan
                 Assert ($linux.ScanStatus -eq 'Interrupted') 'Missing worker was reported as still running'
                 $options.SkipScans = $false
+
+                Remove-Item $mountInfoPath
+                Remove-Item $env:MOBILE_TEST_SCAN_ARGS
+                $options.Rescan = $true
+                $linux = Query-LinuxScan
+                $options.Rescan = $false
+                for ($i = 0; $i -lt 50; $i++) {
+                    Start-Sleep -Milliseconds 40
+                    $linux = Query-LinuxScan
+                    if ($linux.ScanStatus -eq 'Failed') { break }
+                }
+                Assert ($linux.ScanStatus -eq 'Failed' -and -not (Test-Path $env:MOBILE_TEST_SCAN_ARGS)) 'Scanner ran despite failed NFS discovery'
 
                 # Run the actual Windows worker with a fake executable, without Task Scheduler.
                 $runDirectory = "$fixture/windows-state/fixture-run"
@@ -188,10 +245,19 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 }
                 $options.WindowsScanStateDirectory = "$fixture/dispatch-state"
                 $options.SymantecScanExecutable = "$tools/DoScan.exe"
+                foreach ($definitionDate in @([datetime]::UtcNow.AddDays(-31).ToString('yyyy-MM-dd'), '', [datetime]::UtcNow.AddDays(1).ToString('yyyy-MM-dd'))) {
+                    $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker) -DefinitionDate $definitionDate
+                    Assert ($scan.Status -eq 'BlockedDefinitions' -and $script:windowsDispatches -eq 0) 'Windows dispatched with stale/unknown/future definitions'
+                }
+                $options.ForceScan = $true
                 $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker)
+                $options.ForceScan = $false
                 Assert ($scan.Status -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows did not dispatch a missing scan'
                 $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker)
                 Assert ($scan.Status -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows duplicated a newly queued scan'
+                $options.WindowsScanStateDirectory = "$fixture/current-dispatch-state"
+                $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker) -DefinitionDate ([datetime]::UtcNow.AddDays(-30).ToString('yyyy-MM-dd'))
+                Assert ($scan.Status -eq 'Starting' -and $script:windowsDispatches -eq 2) 'Windows rejected definitions at the 30-day boundary'
 
             } finally {
                 foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name]) }
@@ -205,7 +271,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'Symantec'; Status = 'CompletedNeedsReview'; Details = $null }); Failures = @() }
         }
         function Invoke-Linux { param($Computers, $Script, $KeyPath)
-            $result = [pscustomobject]@{ DefinitionDate = [datetime]::UtcNow.AddDays(-20).ToString('yyyy-MM-dd'); ScanStatus = 'Clean'
+            $result = [pscustomobject]@{ DefinitionDate = [datetime]::UtcNow.AddDays(-40).ToString('yyyy-MM-dd'); ScanStatus = 'Clean'
                 Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'ClamAV'; Status = 'Clean'; Details = $null }); Failures = @() }
             [pscustomobject]@{ Target = 'linux-host'; ExitCode = 0; StdOut = ($result | ConvertTo-Json -Depth 8); StdErr = '' }
         }

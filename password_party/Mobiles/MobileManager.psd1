@@ -50,12 +50,14 @@
                 encryptionPin     = 'defaultPin123!@#'
                 adminRoot = "C:\TEMP"
                 nfsHomeRoot   = "C:\TEMP\"
+                SMBUser       = 'mobile-smb-access'
 
                 Preflight = @{
-                    DefinitionMaxAgeDays = 7
+                    DefinitionMaxAgeDays = 30
                     ScanTimeoutMinutes = 240
                     WindowsScanStateDirectory = '' # Defaults to ProgramData\Mobiles\Preflight.
                     LinuxScanStateDirectory = '/var/log/mobiles/preflight'
+                    LinuxToolDirectories = @('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin')
                     WindowsScanPaths = @('C:')
                     LinuxScanPaths = @('/')
                     SymantecScanName = '' # Optional existing SEP administrator/local scan.
