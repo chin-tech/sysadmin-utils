@@ -21,6 +21,8 @@ MOBILE_RUN_ID
 
 The working directory is temporary. Supporting files and adjacent scripts are not copied. Hooks should be self-contained, handle repeated execution, and avoid interactive prompts. Use `throw`/`Write-Error` or `exit 1` in PowerShell, and a nonzero exit status in Bash, to report failure. Hooks are independent child processes, so shell variables and functions do not carry between scripts.
 
+The execution path is `Get-MobileProcedureHooks` (discover and snapshot), then `Get-WindowsProcedureHookRunner` or `Get-LinuxProcedureHookScript` (execute and record). SMB check-in uses these same runners. The Linux `-Standalone` option adds the result envelope when hooks run outside normal provisioning/cleanup. The Windows launcher exists to turn PowerShell errors into a failed process exit code; it is a temporary part of that execution, not a scheduled job.
+
 ## Audit files
 
 Each procedure creates matching timestamped `.log` and `.jsonl` files under the configured `MobileDeployments` directory (normally `.mobiles/.deployments`). The `.log` is readable text with expanded targets, task selections, host actions, nested details, output, and error messages. The command prints its path at the end, including after an error. The `.jsonl` retains the structured events; its path is also shown with `-Verbose`. Both logs must be writable before deployment can proceed.

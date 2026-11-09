@@ -6,11 +6,18 @@ New-Item -ItemType Directory -Path $fixture | Out-Null
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join '; ') }
+$statements = @($ast.EndBlock.Statements)
+$smbAsts = @(foreach ($file in @('WindowsSmb.ps1','LinuxSmb.ps1','MobileSmb.ps1')) {
+    $smbAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root "Private/$file"), [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw ($errors.Message -join '; ') }
+    $statements += $smbAst.EndBlock.Statements
+    $smbAst
+})
 $names = @('ConvertTo-MobileLogLines', 'Format-MobileRunEvent', 'Show-MobileRunLog', 'Get-MobileProcedureHooks', 'Write-MobileRunEvent', 'New-MobileRunLog', 'Get-WindowsProcedureHookRunner',
     'Get-LinuxProcedureHookScript', 'ConvertTo-BashArgument', 'Get-LinuxDeployScript', 'Get-LinuxUnregisterScript',
     'New-LinuxTask-LeaveDomain', 'Get-DeploymentTaskSelection', 'Test-DeploymentTaskPlan',
     'Register-MobileDeployment', 'Unregister-Deployment', 'Read-MobileSmbPlan', 'Get-MobileSmbPlanPath', 'Get-MobileSmbId')
-$source = $ast.EndBlock.Statements | Where-Object {
+$source = $statements | Where-Object {
     ($_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in $names) -or
     ($_ -is [System.Management.Automation.Language.TypeDefinitionAst] -and $_.Name -in @('GroupType', 'LinuxAccountType')) -or
     ($_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -in @(
@@ -97,6 +104,13 @@ try {
                 Assert (-not $linux.Success -and $linux.Actions.Count -eq 2) 'Linux hook result JSON was corrupted or failed hook was ignored'
                 Assert ($linux.Actions[0].Details.StdOut.Trim() -eq 'linux:fixture:Check-out') 'Linux context or quoted filename failed'
                 Assert ($linux.Actions[1].Details.ExitCode -eq 7) 'Linux exit code was not recorded'
+                # SMB check-in uses the same runner directly, without another hand-built envelope.
+                $standalone = Get-LinuxProcedureHookScript -Hooks $linuxHooks -MobileName fixture -Procedure Check-in -RunId fixture-run -Standalone -ToolPath $env:PATH
+                [IO.File]::WriteAllText($path, $standalone)
+                $standaloneResult = ((& bash $path) -join "`n") | ConvertFrom-Json
+                Assert ($standaloneResult.Actions.Count -eq 2 -and $standaloneResult.Failures.Count -eq 1) 'Standalone hooks lost actions or failures'
+                Assert ($standaloneResult.Actions[0].Details.StdOut.Trim() -eq 'linux:fixture:Check-in') 'Standalone hooks lost procedure context/output'
+
                 $currentUser = (& id -un).Trim()
                 $user = [pscustomobject]@{
                     BaseName = 'fixture'; LinuxName = $currentUser

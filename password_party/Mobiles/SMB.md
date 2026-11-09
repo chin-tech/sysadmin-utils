@@ -31,7 +31,7 @@ To explicitly start the native fstab mount units and run temporary write/delete 
 
 Verification checks the reboot, kernel FIPS enforcement, captured address and expected CIFS sources. Mount/probe attempts are bounded by timeouts. It reports unavailable shares as `NeedsReview`; `nofail` remains in fstab. Status queries append observations to the normal `.log`/`.jsonl` audit pair.
 
-The Linux implementation is split into `Get-LinuxSmbNetworkScript`, `Get-LinuxSmbBootScript`, `Get-LinuxSmbMountScript`, `Get-LinuxSmbGroupScript`, and `Get-LinuxSmbStatusScript` in `MobileManager.psm1`. These are ordinary SSH command fragments. Only data and credentials are persisted, not generated executable content. Windows line endings are normalized on the outbound command stream; JSON carries data only.
+The Linux implementation is split into `Get-LinuxSmbNetworkScript`, `Get-LinuxSmbBootScript`, `Get-LinuxSmbMountScript`, `Get-LinuxSmbGroupScript`, and `Get-LinuxSmbStatusScript` in `Private/LinuxSmb.ps1`. These are ordinary SSH command fragments. Routine JSON access lives in the session helpers (`state_get`, `state_set`, `state_add`, `state_list`, and `option_get`). For example, `state_set OriginalKernel "$normal_kernel"` saves a string, and `state_add CreatedMountPoints "$directory"` records a directory once in creation order. `mount_entries` reads each mount into `host`, `target`, `source`, and `authority` fields in one pass. Keep JSON as data; do not source it as shell code. The existing JSON schema and legacy restoration path remain compatible. Only data and credentials are persisted, not generated executable content. Windows line endings are normalized on the outbound command stream; JSON carries data only.
 
 ## SMB account and permissions
 
@@ -44,7 +44,7 @@ The configured username reaches Windows account creation, permissions and Linux 
 
 Check-in deletes only accounts created by this deployment. Reused accounts retain their password and original enabled state. Existing share grants and this account's NTFS rules are recorded and restored; unrelated identities are preserved. External changes to the same account's NTFS rules require inspection rather than being overwritten. Only logon-right entries added by this deployment are removed. New shares grant the SMB account full access; protected child NTFS ACLs can still deny particular paths. `NetworkSharing` is independent of optional `UserRights`/`PostDeploy` tasks.
 
-Windows still uses its PowerShell startup task for deferred DHCP/static changes. Preparation reports `PreparedPendingReboot`; after boot the task records `Active`. Windows management operations (including check-in hooks, cleanup, and status) use the recorded computer names, without falling back to WinRM by IP. Name resolution and management authentication must still work after disjoin. Captured IPs are used for Linux SMB mounts. The SMB data credential does not replace management credentials, and the tool does not change TrustedHosts.
+Windows installs only `boot.ps1`, a short network action for deferred DHCP/static changes. It contains no account, share, ACL or task-installation code. `Get-WindowsSmbTaskOptions` uses the existing `New-TaskXML` builder on the controller; the endpoint registers that XML as SYSTEM. Its boot trigger has no expiry, so it still works if checkout and reboot are days apart. Account/share setup and cleanup run over WinRM while the controller is connected. Check-in replaces the old full `worker.ps1` with this smaller boot action for existing deployments. Preparation reports `PreparedPendingReboot`; after boot the task records `Active`. Windows management operations (including check-in hooks, cleanup, and status) use the recorded computer names, without falling back to WinRM by IP. Name resolution and management authentication must still work after disjoin. Captured IPs are used for Linux SMB mounts. The SMB data credential does not replace management credentials, and the tool does not change TrustedHosts.
 
 ## Check-in and older deployments
 
@@ -58,7 +58,26 @@ Reconnect to the original network, reboot, then use `-SmbStatus` to confirm `Res
 
 Saved deployments from the old Linux service implementation can be checked in with this version. Cleanup disables/removes that service and deletes its worker without executing it, so CRLF in the old worker does not block check-in. The old active mobile connection is disabled for autoconnect; its untouched original connection is used after reboot. The disabled legacy profile is retained to avoid interrupting the current SSH session; it can be deleted manually after restoration. Fresh checkouts create no such profile or service. An old service still running with its deployment lock must be stopped before check-in.
 
-Controller plans live under `MobileDeployments/smb/<id>.json`. Linux restoration data lives under `/var/lib/mobiles/smb/<id>`; credential files are mode 0600 inside a mode-0700 directory. Windows state/history remains under `C:\ProgramData\Mobiles\Smb\<id>`. Passwords and generated payloads are excluded from controller plans/audits. Use `Preflight.LinuxToolDirectories` for custom tool locations.
+## Finding and maintaining the implementation
+
+The module loads three ordinary PowerShell files explicitly:
+
+- `Private/MobileSmb.ps1`: selection, controller plans, check-out/check-in order and status.
+- `Private/WindowsSmb.ps1`: Windows inventory, provisioning and the separate network-only boot action.
+- `Private/LinuxSmb.ps1`: Linux networking, boot entries, mounts and access groups.
+
+Keep the `Private` directory beside `MobileManager.psm1` when copying the program. These files are part of the program, not custom `Scripts/Check-in` or `Scripts/Check-out` hooks. Edit the script blocks in these files; generated endpoint scripts should not be hand-maintained. CLI options, result objects and normal audit display remain the same.
+
+Controller plans live under `MobileDeployments/smb/<id>.json`. Each host's `State` contains its returned restoration details, including Windows DHCP/DNS, account ownership, shares and permission snapshots, or Linux original connection/boot settings. Preparation, cleanup and successful status queries refresh these snapshots. Failed connections retain the last collected snapshot; a disconnected controller cannot observe subsequent boot changes until the next status query. For an offline reference on the primary node:
+
+```powershell
+$plan = Get-Content '<MobileDeployments>\smb\<id>.json' -Raw | ConvertFrom-Json
+$plan.Windows | Select-Object HostName, Status, State
+$plan.Windows[0].State | Format-List *
+$plan.Linux[0].State | Format-List *
+```
+
+Endpoint state is retained as a local recovery copy and the input to disconnected startup operations; check-in reads that current copy. The controller record lets you inspect the captured settings without logging into each host. It is a snapshot, not a live database. Linux restoration data lives under `/var/lib/mobiles/smb/<id>`; credential files are mode 0600 inside a mode-0700 directory. Windows recovery state remains under `C:\ProgramData\Mobiles\Smb\<id>`. Passwords and generated payloads are excluded from controller plans/audits. Use `Preflight.LinuxToolDirectories` for custom tool locations.
 
 Offline validation: `pwsh -NoProfile -File ./tests/Verify-SmbDeployment.ps1`. Native RHEL 7.9/8.10 boot and Windows ACL/WinRM behavior still require site validation.
 

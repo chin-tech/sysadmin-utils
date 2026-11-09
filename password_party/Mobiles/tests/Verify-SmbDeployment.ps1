@@ -6,12 +6,19 @@ New-Item -ItemType Directory -Path $fixture | Out-Null
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join '; ') }
+$statements = @($ast.EndBlock.Statements)
+$smbAsts = @(foreach ($file in @('WindowsSmb.ps1','LinuxSmb.ps1','MobileSmb.ps1')) {
+    $smbAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root "Private/$file"), [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw ($errors.Message -join '; ') }
+    $statements += $smbAst.EndBlock.Statements
+    $smbAst
+})
 $names = @('Get-MobileSmbToolPath','Get-MobileSmbId','Resolve-MobileSmbHosts','Select-MobileSmbInterface','Get-MobileSmbMountPlan',
-    'Get-WindowsMobileSmbInventory','Get-LinuxMobileSmbInventory','Get-WindowsMobileSmbWorker','New-LinuxTask-SmbGroup','Get-LinuxSmbSessionScript','Get-LinuxSmbNetworkScript','Get-LinuxSmbBootScript','Get-LinuxSmbMountScript','Get-LinuxSmbGroupScript','Get-LinuxSmbStatusScript','Get-LinuxMobileSmbScript',
+    'Get-LinuxProcedureHookScript','Get-WindowsSmbBootScript','Get-WindowsSmbTaskOptions','Get-WindowsMobileSmbInventory','Get-LinuxMobileSmbInventory','Get-WindowsMobileSmbWorker','New-LinuxTask-SmbGroup','Get-LinuxSmbSessionScript','Get-LinuxSmbNetworkScript','Get-LinuxSmbBootScript','Get-LinuxSmbMountScript','Get-LinuxSmbGroupScript','Get-LinuxSmbStatusScript','Get-LinuxMobileSmbScript',
     'Get-MobileSmbPlanPath','Save-MobileSmbPlan','Read-MobileSmbPlan','ConvertFrom-MobileSmbLinuxResult','Initialize-MobileSmbDeployment',
     'Invoke-MobileSmbCheckInHooks','Restore-MobileSmbDeployment','Show-MobileSmbStatus','ConvertTo-BashArgument','New-MobileRunLog','Write-MobileRunEvent','Format-MobileRunEvent','ConvertTo-MobileLogLines')
-$source = $ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in $names } | ForEach-Object { $_.Extent.Text }
-$nested = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Initialize-SmbAccount','Get-AccountRules','Restore-AccountRules','New-SmbAccountRule') }, $true) | ForEach-Object { $_.Extent.Text }
+$source = $statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in $names } | ForEach-Object { $_.Extent.Text }
+$nested = $smbAsts[0].FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Initialize-SmbAccount','Get-AccountRules','Restore-AccountRules','New-SmbAccountRule') }, $true) | ForEach-Object { $_.Extent.Text }
 $source = @($source) + @($nested)
 $windowsSource = (($source -join "`n").Replace("`r`n", "`n")).Replace("`n", "`r`n")
 $windowsModule = New-Module -ScriptBlock ([scriptblock]::Create($windowsSource))
@@ -56,6 +63,17 @@ try {
         Assert $rejected 'Cancelling SMB selection did not stop checkout'
         $credential = [pscredential]::new('configured-smb', (ConvertTo-SecureString 'fixture-pass' -AsPlainText -Force))
         $windowsWorker = Get-WindowsMobileSmbWorker
+        $windowsBoot = Get-WindowsSmbBootScript
+        # The existing XML builder is Windows COM-based; verify its caller's exact inputs offline.
+        function New-TaskXML {
+            param($Description,$Execute,$Arguments,$TriggerConfigs,$ExecutionTimeLimit)
+            Assert ($Execute -eq 'powershell.exe' -and $ExecutionTimeLimit -eq 'PT2M') 'SMB task did not use the shared XML builder'
+            Assert ($TriggerConfigs.Count -eq 1 -and $TriggerConfigs[0].Type -eq 8 -and $TriggerConfigs[0].EndBoundary -eq '') 'SMB startup trigger expires before an offline reboot'
+            '<Task><Arguments>' + [Security.SecurityElement]::Escape($Arguments) + '</Arguments></Task>'
+        }
+        $bootOptions = Get-WindowsSmbTaskOptions -Root 'C:\ProgramData\Mobiles\Smb\fixture' -Mode Activate
+        Assert ($bootOptions.TaskXml.Contains('boot.ps1') -and -not $bootOptions.BootScript.Contains('New-LocalUser') -and -not $bootOptions.BootScript.Contains('Register-ScheduledTask') -and -not $bootOptions.BootScript.Contains('New-SmbShare')) 'Startup still installs the provisioning worker'
+
         Assert (-not $windowsWorker.ToString().Contains('mobile-smb-access') -and -not $windowsWorker.ToString().Contains('SupeSecret')) 'Windows worker still embeds hardcoded credentials'
         # Run the actual account helper, independently of Windows-only ACL APIs.
         $state = [pscustomobject]@{ UserName='configured-smb'; UserSid=$null; AccountOwned=$false; AccountWasEnabled=$false }
@@ -94,24 +112,27 @@ try {
         function Set-DnsClientServerAddress { [CmdletBinding()] param($InterfaceIndex,$ServerAddresses,[switch]$ResetServerAddresses) $script:networkCalls += "Dns:${InterfaceIndex}:$ResetServerAddresses" }
         function Get-NetFirewallRule { [CmdletBinding()] param($Name) }
         function Remove-NetFirewallRule { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) }
-        function New-ScheduledTaskAction { param($Execute,$Argument) $script:scheduledMode=$Argument; [pscustomobject]@{ Execute=$Execute; Arguments=$Argument } }
-        function New-ScheduledTaskTrigger { param([switch]$AtStartup) [pscustomobject]@{ AtStartup=$true } }
-        function New-ScheduledTaskSettingsSet { param([switch]$StartWhenAvailable,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries) [pscustomobject]@{} }
-        function Register-ScheduledTask { [CmdletBinding()] param($TaskName,$Action,$Trigger,$Settings,$User,$RunLevel,[switch]$Force) }
+        function Register-ScheduledTask {
+            [CmdletBinding()] param($TaskName,$Xml,$User,[switch]$Force)
+            $script:scheduledMode = $Xml
+        }
         function Unregister-ScheduledTask { [CmdletBinding()] param($TaskName,[switch]$Confirm) }
         $savedSystemRoot = $env:SystemRoot; $env:SystemRoot = "$fixture/windows"
         try {
-            $active = & $windowsWorker Activate $winRoot
+            $active = & $windowsBoot Activate $winRoot
             Assert ($active.Status -eq 'Active' -and $script:networkCalls -contains 'Static:7:10.2.3.4/24' -and $script:networkCalls -contains 'Dhcp:7:Disabled') 'Windows DHCP address was not frozen on the selected adapter'
-            $restore = & $windowsWorker Restore $winRoot
+            'legacy full worker' | Set-Content (Join-Path $winRoot 'worker.ps1')
+            $restore = & $windowsWorker Restore $winRoot (Get-WindowsSmbTaskOptions -Root $winRoot -Mode RestoreBoot)
+            Assert (-not (Test-Path (Join-Path $winRoot 'worker.ps1')) -and $script:scheduledMode.Contains('boot.ps1')) 'Legacy startup task did not migrate to the smaller boot action'
             Assert ($restore.Status -eq 'RestorePendingReboot' -and $script:scheduledMode.Contains('-Mode RestoreBoot') -and $script:networkCalls -notcontains 'Dhcp:7:Enabled') 'Windows check-in changed the network in the live session'
-            $restored = & $windowsWorker RestoreBoot $winRoot
+            $restored = & ([scriptblock]::Create((Get-Content (Join-Path $winRoot 'boot.ps1') -Raw))) -Mode RestoreBoot -Root $winRoot
             Assert ($restored.Status -eq 'Restored' -and $script:networkCalls -contains 'Dhcp:7:Enabled' -and $script:networkCalls -contains 'Dns:7:True') 'Windows startup did not restore DHCP/DNS'
             $winState.OriginalDhcp='Disabled'; $winState.Status='PreparedPendingReboot'
             $winState | ConvertTo-Json -Depth 8 | Set-Content "$winRoot/state.json"
             $script:networkCalls=@()
-            $active = & $windowsWorker Activate $winRoot
-            $restored = & $windowsWorker RestoreBoot $winRoot
+            $active = & $windowsBoot Activate $winRoot
+            $restore = & $windowsWorker Restore $winRoot (Get-WindowsSmbTaskOptions -Root $winRoot -Mode RestoreBoot)
+            $restored = & $windowsBoot RestoreBoot $winRoot
             Assert ($script:networkCalls.Count -eq 0) 'An originally static interface was changed to DHCP'
         } finally { $env:SystemRoot = $savedSystemRoot }
 
@@ -137,12 +158,12 @@ try {
         }
         $savedSystemRoot=$env:SystemRoot; $env:SystemRoot="$fixture/windows"
         try {
-            $restored = & $windowsWorker Restore $winRoot
+            $restored = & $windowsWorker Restore $winRoot (Get-WindowsSmbTaskOptions -Root $winRoot -Mode RestoreBoot)
             Assert ($restored.Status -eq 'RestorePendingReboot' -and $script:restoredShareAccess -contains 'Read' -and $script:disabledAccounts -eq 0) 'Existing account/share access was not preserved'
             Assert ($script:restoredRights.Contains('SeNetworkLogonRight = *fixture-sid,*other') -and $script:restoredRights.Contains('SeDenyInteractiveLogonRight = *other')) 'Existing logon rights were removed with deployment-added rights'
             $winState.AccountWasEnabled=$false
             $winState | ConvertTo-Json -Depth 10 | Set-Content "$winRoot/state.json"
-            $restored = & $windowsWorker Restore $winRoot
+            $restored = & $windowsWorker Restore $winRoot (Get-WindowsSmbTaskOptions -Root $winRoot -Mode RestoreBoot)
             Assert ($script:disabledAccounts -eq 1) 'An account originally disabled was left enabled'
         } finally { $env:SystemRoot=$savedSystemRoot }
         # Restore only this account's NTFS rules; preserve other identities and detect external edits.
@@ -259,6 +280,17 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
                 $prepared = Invoke-SandboxScript $prepare
                 $stateRoot = "$sandbox/var/lib/mobiles/smb/$id"
                 Assert ($prepared.Status -eq 'PreparedPendingReboot' -and -not (Test-Path "$sandbox/mounted") -and -not (Test-Path "$stateRoot/worker.sh")) 'Preparation started mounts or persisted executable content'
+                # The readability helpers must round-trip data, not evaluate shell syntax.
+                $note = 'Operator''s "note": $(exit 99)' + "`nnext line"
+                $helperScript = "root='/var/lib/mobiles/smb/$id'`n" + (Get-LinuxSmbSessionScript) + "`n" +
+                    'state_set MaintenanceNote ' + (ConvertTo-BashArgument $note) + "`n" + @'
+state_add MaintenanceOrder first
+state_add MaintenanceOrder second
+state_add MaintenanceOrder first
+cat "$state"
+'@
+                $helperState = Invoke-SandboxScript (Convert-SandboxScript $helperScript)
+                Assert ($helperState.MaintenanceNote -eq $note -and ($helperState.MaintenanceOrder -join ',') -eq 'first,second') 'State helpers changed quoted/multiline values or list order/uniqueness'
                 $network = Get-Content "$sandbox/network.json" -Raw | ConvertFrom-Json
                 Assert ($network.'ipv4.method' -eq 'manual' -and $network.'ipv4.addresses' -eq '10.2.3.6/24' -and $network.'ipv4.dns' -eq '10.2.3.1') 'Persistent network configuration was not staged or unrelated settings changed'
                 $fstab = Get-Content "$sandbox/etc/fstab" -Raw
@@ -311,13 +343,13 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
         # Controller wiring: every Windows host is shared, but only selected hosts get Linux mounts.
         $script:Config.Preflight.LinuxToolDirectories = @('/usr/local/sbin','/usr/local/bin','/usr/sbin','/usr/bin','/sbin','/bin')
         $script:preparedWindows = @(); $script:restoreOrder = @(); $script:linuxRestoreFails = $false
-        $script:windowsTargets = @(); $script:failWindowsStatus = $false
+        $script:windowsTargets = @(); $script:failWindowsStatus = $false; $script:busyWindowsStatus = $false
         function Get-WindowsProcedureHookRunner { { param($Hooks,$MobileName,$Procedure,$RunId) } }
         function Invoke-Command {
             [CmdletBinding()] param($ComputerName,$ScriptBlock,[array]$ArgumentList)
             $script:windowsTargets += $ComputerName
             Assert ($ComputerName -in @('WIN-A','WIN-B')) 'Windows remoting must use recorded names, never captured IPs'
-            if ($ScriptBlock.ToString().Contains('[scriptblock]::Create($Runner)')) {
+            if ($ArgumentList.Count -eq 4 -and $ArgumentList[2] -eq 'Check-in') {
                 return [pscustomobject]@{ Actions=@(); Failures=@() }
             }
             if ($ScriptBlock.ToString().Contains('Get-CimInstance Win32_LogicalDisk')) {
@@ -327,12 +359,13 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
             } elseif ($ArgumentList[0] -eq 'Prepare') {
                 Assert ($ArgumentList[2].UserName -eq 'configured-smb' -and $ArgumentList[3].UserName -eq 'configured-smb') 'SMBUser/credential did not reach Windows preparation'
                 $script:preparedWindows += $ComputerName
-                [pscustomobject]@{ Status='PreparedPendingReboot'; Shares=@('C','D') }
+                [pscustomobject]@{ Status='PreparedPendingReboot'; Shares=@('C','D'); OriginalDhcp='Enabled'; OriginalDnsStatic='10.20.1.1'; AccountOwned=$false; AddedRights=@('SeNetworkLogonRight') }
             } elseif ($ArgumentList[0] -eq 'Restore') {
                 $script:restoreOrder += "Windows:$ComputerName"
                 [pscustomobject]@{ Status='RestorePendingReboot' }
             } elseif ($ArgumentList[0] -eq 'Status') {
                 if ($script:failWindowsStatus) { throw 'Name-based management unavailable' }
+                if ($script:busyWindowsStatus) { return [pscustomobject]@{ Status='Busy' } }
                 [pscustomobject]@{ Status='Restored' }
             }
             else { throw 'Unexpected mocked Windows operation' }
@@ -340,7 +373,10 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
         function Invoke-Linux {
             param($Computers,$Script,$KeyPath)
             $state = $null; $code = 0; $errorText = ''
-            if ($Script.Contains('ip -o -4 address show up scope global')) {
+            if ($Script.Contains('run_mobile_hook')) {
+                Assert ($Script.Contains('export PATH=') -and $Script.Contains('Actions:$actions')) 'SMB hooks did not use the standalone runner and configured tool path'
+                $state = [pscustomobject]@{ Actions=@(); Failures=@() }
+            } elseif ($Script.Contains('ip -o -4 address show up scope global')) {
                 $state = [pscustomobject]@{ Interfaces=@([pscustomobject]@{ InterfaceName='eth0'; IPAddress='10.20.1.20'; PrefixLength=24 }) }
             } elseif ($Script.Contains("payload=")) {
                 $match = [regex]::Match($Script, "printf '%s' '([^']+)' \| base64 -d")
@@ -361,12 +397,18 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
         Assert ($script:preparedWindows.Count -eq 2 -and $plan.StorageHosts.Count -eq 1 -and $plan.Mounts.Count -eq 2) 'Coordinator did not separate all Windows shares from selected Linux storage'
         $windowsOnly = Initialize-MobileSmbDeployment -MobileData ([pscustomobject]@{ Windows=$data.Windows; Linux=@(); AllUsers=@() }) -MobileName windows-only -SmbCredential $credential -Run $run
         Assert ($windowsOnly.Mounts.Count -eq 0 -and $windowsOnly.StorageHosts.Count -eq 0 -and $windowsOnly.Linux.Count -eq 0) 'Windows-only deployment stored null mount entries or prompted for Linux storage'
+        $savedPlan = Read-MobileSmbPlan orchestrated
+        Assert ($savedPlan.Windows[0].State.OriginalDhcp -eq 'Enabled' -and $savedPlan.Windows[0].State.AddedRights.Count -eq 1 -and $savedPlan.Linux[0].State.Status -eq 'PreparedPendingReboot') 'Primary-node plan did not capture endpoint restoration state'
         $saved = Get-Content (Get-MobileSmbPlanPath orchestrated) -Raw
         $audit = Get-Content $run.Path -Raw
         Assert (-not $saved.Contains('fixture-pass') -and -not $audit.Contains('fixture-pass') -and -not $audit.Contains('payload_b64')) 'Credentials/worker payload leaked into controller state or audit'
         $script:windowsTargets = @()
-        Invoke-MobileSmbCheckInHooks -Plan $plan -Run $run -WindowsHooks @([pscustomobject]@{ Name='fixture-hook' }) -LinuxHooks @()
+        Invoke-MobileSmbCheckInHooks -Plan $plan -Run $run -WindowsHooks @([pscustomobject]@{ Name='fixture-hook' }) -LinuxHooks @([pscustomobject]@{ Name='fixture.sh'; Sha256='fixture-sha'; ContentBase64='dHJ1ZQo=' })
         Assert (($script:windowsTargets -join ',') -eq 'WIN-A,WIN-B') 'Check-in hooks did not target both recorded Windows names'
+        $script:busyWindowsStatus = $true
+        $null = Show-MobileSmbStatus orchestrated
+        Assert ((Read-MobileSmbPlan orchestrated).Windows[0].State.OriginalDhcp -eq 'Enabled') 'Busy status erased the saved Windows recovery settings'
+        $script:busyWindowsStatus = $false
         $script:linuxRestoreFails = $true
         $rejected = $false; try { Restore-MobileSmbDeployment $plan $run } catch { $rejected = $true }
         Assert ($rejected -and $script:restoreOrder.Count -eq 1 -and $script:restoreOrder[0] -like 'Linux:*') 'Windows shares were removed despite a Linux unmount failure'
@@ -380,6 +422,7 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
         $unreachable = @(Show-MobileSmbStatus orchestrated)
         Assert (@($unreachable | Where-Object { $_.Platform -eq 'Windows' -and $_.Status -eq 'Unreachable' }).Count -eq 2) 'Failed name-based management was not reported as unreachable'
         Assert (($script:windowsTargets -join ',') -eq 'WIN-A,WIN-B') 'Status retried Windows management using another target'
+        Assert ((Read-MobileSmbPlan orchestrated).Windows[0].State.Status -eq 'Restored') 'An unreachable host erased the last primary-node snapshot'
 
         'PASS: native Linux preparation/verification/restoration, no startup worker, existing account reuse, numeric mounts, nofail/automount, legacy cleanup, and controller wiring.'
     } $fixture $root $source
