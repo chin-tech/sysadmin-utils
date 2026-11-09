@@ -9,7 +9,7 @@ if ($errors.Count) { throw ($errors.Message -join '; ') }
 $names = @('Get-MobileSmbToolPath','Get-MobileSmbId','Resolve-MobileSmbHosts','Select-MobileSmbInterface','Get-MobileSmbMountPlan',
     'Get-WindowsMobileSmbInventory','Get-LinuxMobileSmbInventory','Get-WindowsMobileSmbWorker','New-LinuxTask-SmbGroup','Get-LinuxSmbSessionScript','Get-LinuxSmbNetworkScript','Get-LinuxSmbBootScript','Get-LinuxSmbMountScript','Get-LinuxSmbGroupScript','Get-LinuxSmbStatusScript','Get-LinuxMobileSmbScript',
     'Get-MobileSmbPlanPath','Save-MobileSmbPlan','Read-MobileSmbPlan','ConvertFrom-MobileSmbLinuxResult','Initialize-MobileSmbDeployment',
-    'Restore-MobileSmbDeployment','Show-MobileSmbStatus','ConvertTo-BashArgument','New-MobileRunLog','Write-MobileRunEvent','Format-MobileRunEvent','ConvertTo-MobileLogLines')
+    'Invoke-MobileSmbCheckInHooks','Restore-MobileSmbDeployment','Show-MobileSmbStatus','ConvertTo-BashArgument','New-MobileRunLog','Write-MobileRunEvent','Format-MobileRunEvent','ConvertTo-MobileLogLines')
 $source = $ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in $names } | ForEach-Object { $_.Extent.Text }
 $nested = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Initialize-SmbAccount','Get-AccountRules','Restore-AccountRules','New-SmbAccountRule') }, $true) | ForEach-Object { $_.Extent.Text }
 $source = @($source) + @($nested)
@@ -311,8 +311,15 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
         # Controller wiring: every Windows host is shared, but only selected hosts get Linux mounts.
         $script:Config.Preflight.LinuxToolDirectories = @('/usr/local/sbin','/usr/local/bin','/usr/sbin','/usr/bin','/sbin','/bin')
         $script:preparedWindows = @(); $script:restoreOrder = @(); $script:linuxRestoreFails = $false
+        $script:windowsTargets = @(); $script:failWindowsStatus = $false
+        function Get-WindowsProcedureHookRunner { { param($Hooks,$MobileName,$Procedure,$RunId) } }
         function Invoke-Command {
             [CmdletBinding()] param($ComputerName,$ScriptBlock,[array]$ArgumentList)
+            $script:windowsTargets += $ComputerName
+            Assert ($ComputerName -in @('WIN-A','WIN-B')) 'Windows remoting must use recorded names, never captured IPs'
+            if ($ScriptBlock.ToString().Contains('[scriptblock]::Create($Runner)')) {
+                return [pscustomobject]@{ Actions=@(); Failures=@() }
+            }
             if ($ScriptBlock.ToString().Contains('Get-CimInstance Win32_LogicalDisk')) {
                 $last = if ($ComputerName -eq 'WIN-A') { 11 } else { 12 }
                 [pscustomobject]@{ Interfaces = @([pscustomobject]@{ InterfaceName='Ethernet'; InterfaceGuid="guid-$ComputerName"; IPAddress="10.20.1.$last"; PrefixLength=24 })
@@ -324,7 +331,10 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
             } elseif ($ArgumentList[0] -eq 'Restore') {
                 $script:restoreOrder += "Windows:$ComputerName"
                 [pscustomobject]@{ Status='RestorePendingReboot' }
-            } elseif ($ArgumentList[0] -eq 'Status') { [pscustomobject]@{ Status='Restored' } }
+            } elseif ($ArgumentList[0] -eq 'Status') {
+                if ($script:failWindowsStatus) { throw 'Name-based management unavailable' }
+                [pscustomobject]@{ Status='Restored' }
+            }
             else { throw 'Unexpected mocked Windows operation' }
         }
         function Invoke-Linux {
@@ -354,6 +364,9 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
         $saved = Get-Content (Get-MobileSmbPlanPath orchestrated) -Raw
         $audit = Get-Content $run.Path -Raw
         Assert (-not $saved.Contains('fixture-pass') -and -not $audit.Contains('fixture-pass') -and -not $audit.Contains('payload_b64')) 'Credentials/worker payload leaked into controller state or audit'
+        $script:windowsTargets = @()
+        Invoke-MobileSmbCheckInHooks -Plan $plan -Run $run -WindowsHooks @([pscustomobject]@{ Name='fixture-hook' }) -LinuxHooks @()
+        Assert (($script:windowsTargets -join ',') -eq 'WIN-A,WIN-B') 'Check-in hooks did not target both recorded Windows names'
         $script:linuxRestoreFails = $true
         $rejected = $false; try { Restore-MobileSmbDeployment $plan $run } catch { $rejected = $true }
         Assert ($rejected -and $script:restoreOrder.Count -eq 1 -and $script:restoreOrder[0] -like 'Linux:*') 'Windows shares were removed despite a Linux unmount failure'
@@ -362,6 +375,11 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
         Assert ($script:restoreOrder.Count -eq 3 -and $script:restoreOrder[0] -eq 'Linux:10.20.1.20' -and $script:restoreOrder[1] -like 'Windows:*') 'Check-in did not unmount Linux before removing Windows shares'
         $statuses = @(Show-MobileSmbStatus orchestrated)
         Assert ($statuses.Count -eq 3 -and (Read-MobileSmbPlan orchestrated).Status -eq 'Restored') 'Post-reboot status did not complete the saved lifecycle'
+
+        $script:failWindowsStatus = $true; $script:windowsTargets = @()
+        $unreachable = @(Show-MobileSmbStatus orchestrated)
+        Assert (@($unreachable | Where-Object { $_.Platform -eq 'Windows' -and $_.Status -eq 'Unreachable' }).Count -eq 2) 'Failed name-based management was not reported as unreachable'
+        Assert (($script:windowsTargets -join ',') -eq 'WIN-A,WIN-B') 'Status retried Windows management using another target'
 
         'PASS: native Linux preparation/verification/restoration, no startup worker, existing account reuse, numeric mounts, nofail/automount, legacy cleanup, and controller wiring.'
     } $fixture $root $source

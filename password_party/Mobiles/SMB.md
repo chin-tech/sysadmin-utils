@@ -44,7 +44,7 @@ The configured username reaches Windows account creation, permissions and Linux 
 
 Check-in deletes only accounts created by this deployment. Reused accounts retain their password and original enabled state. Existing share grants and this account's NTFS rules are recorded and restored; unrelated identities are preserved. External changes to the same account's NTFS rules require inspection rather than being overwritten. Only logon-right entries added by this deployment are removed. New shares grant the SMB account full access; protected child NTFS ACLs can still deny particular paths. `NetworkSharing` is independent of optional `UserRights`/`PostDeploy` tasks.
 
-Windows still uses its PowerShell startup task for deferred DHCP/static changes. Preparation reports `PreparedPendingReboot`; after boot the task records `Active`. Windows management authentication/trust must already support access by the captured IP after disjoin. The SMB data credential does not replace management credentials, and the tool does not change TrustedHosts.
+Windows still uses its PowerShell startup task for deferred DHCP/static changes. Preparation reports `PreparedPendingReboot`; after boot the task records `Active`. Windows management operations (including check-in hooks, cleanup, and status) use the recorded computer names, without falling back to WinRM by IP. Name resolution and management authentication must still work after disjoin. Captured IPs are used for Linux SMB mounts. The SMB data credential does not replace management credentials, and the tool does not change TrustedHosts.
 
 ## Check-in and older deployments
 

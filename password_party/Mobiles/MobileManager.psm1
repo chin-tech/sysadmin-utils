@@ -6181,7 +6181,7 @@ function Invoke-MobileSmbCheckInHooks {
         if (-not $WindowsHooks.Count) { break }
         $runner = { param($Hooks, $Runner, $MobileName, $RunId)
             & ([scriptblock]::Create($Runner)) -Hooks $Hooks -MobileName $MobileName -Procedure 'Check-in' -RunId $RunId }
-        $result = Invoke-Command -ComputerName $hostInfo.Interface.IPAddress -ScriptBlock $runner -ArgumentList $WindowsHooks, (Get-WindowsProcedureHookRunner).ToString(), $Plan.MobileName, $Run.Id -ErrorAction Stop
+        $result = Invoke-Command -ComputerName $hostInfo.HostName -ScriptBlock $runner -ArgumentList $WindowsHooks, (Get-WindowsProcedureHookRunner).ToString(), $Plan.MobileName, $Run.Id -ErrorAction Stop
         Write-MobileRunEvent -Run $Run -Event 'HostResult' -Data @{ HostName = $hostInfo.HostName; Platform = 'Windows'; Success = (-not $result.Failures.Count); Actions = $result.Actions; Failures = $result.Failures }
         if ($result.Failures.Count) { throw "Check-in hooks failed on $($hostInfo.HostName); SMB cleanup was not started." }
     }
@@ -6220,7 +6220,7 @@ function Restore-MobileSmbDeployment {
     }
     foreach ($hostInfo in $Plan.Windows) {
         $root = "C:\ProgramData\Mobiles\Smb\$($Plan.Id)"
-        $result = Invoke-Command -ComputerName $hostInfo.Interface.IPAddress -ScriptBlock (Get-WindowsMobileSmbWorker) -ArgumentList 'Restore', $root -ErrorAction Stop
+        $result = Invoke-Command -ComputerName $hostInfo.HostName -ScriptBlock (Get-WindowsMobileSmbWorker) -ArgumentList 'Restore', $root -ErrorAction Stop
         if ($result.Status -notin @('RestorePendingReboot','Restored') -and $null -ne $result) { throw "SMB restoration incomplete on $($hostInfo.HostName)." }
         $hostInfo.Status = if ($result) { $result.Status } else { 'NotPrepared' }
         Save-MobileSmbPlan $Plan
@@ -6242,8 +6242,7 @@ function Show-MobileSmbStatus {
         foreach ($hostInfo in $plan.Windows) {
             try {
                 $root = "C:\ProgramData\Mobiles\Smb\$($plan.Id)"
-                try { $state = Invoke-Command -ComputerName $hostInfo.HostName -ScriptBlock (Get-WindowsMobileSmbWorker) -ArgumentList 'Status', $root -ErrorAction Stop }
-                catch { $state = Invoke-Command -ComputerName $hostInfo.Interface.IPAddress -ScriptBlock (Get-WindowsMobileSmbWorker) -ArgumentList 'Status', $root -ErrorAction Stop }
+                $state = Invoke-Command -ComputerName $hostInfo.HostName -ScriptBlock (Get-WindowsMobileSmbWorker) -ArgumentList 'Status', $root -ErrorAction Stop
                 [pscustomobject]@{ HostName = $hostInfo.HostName; IPAddress = $hostInfo.Interface.IPAddress; Platform = 'Windows'; Status = $state.Status; Details = $state }
             } catch { [pscustomobject]@{ HostName = $hostInfo.HostName; IPAddress = $hostInfo.Interface.IPAddress; Platform = 'Windows'; Status = 'Unreachable'; Details = $_.Exception.Message } }
         }
@@ -6485,7 +6484,7 @@ function Unregister-Deployment {
             Invoke-MobileSmbCheckInHooks -Plan $smbPlan -Run $run -WindowsHooks $windowsHooks -LinuxHooks $linuxHooks
             Restore-MobileSmbDeployment -Plan $smbPlan -Run $run
             $windowsHooks = @(); $linuxHooks = @() # Already executed before storage teardown.
-            $mobileData.Windows = @($smbPlan.Windows | ForEach-Object { $_.Interface.IPAddress })
+            $mobileData.Windows = @($smbPlan.Windows | ForEach-Object { $_.HostName })
             $mobileData.Linux = @($smbPlan.Linux | ForEach-Object { $_.Interface.IPAddress })
         }
         $taskData = @(
