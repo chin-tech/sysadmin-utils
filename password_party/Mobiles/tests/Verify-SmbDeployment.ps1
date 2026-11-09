@@ -7,14 +7,25 @@ $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join '; ') }
 $names = @('Get-MobileSmbToolPath','Get-MobileSmbId','Resolve-MobileSmbHosts','Select-MobileSmbInterface','Get-MobileSmbMountPlan',
-    'Get-WindowsMobileSmbInventory','Get-LinuxMobileSmbInventory','Get-WindowsMobileSmbWorker','Get-LinuxMobileSmbWorker','Get-LinuxMobileSmbScript',
+    'Get-WindowsMobileSmbInventory','Get-LinuxMobileSmbInventory','Get-WindowsMobileSmbWorker','New-LinuxTask-SmbGroup','Get-LinuxSmbSessionScript','Get-LinuxSmbNetworkScript','Get-LinuxSmbBootScript','Get-LinuxSmbMountScript','Get-LinuxSmbGroupScript','Get-LinuxSmbStatusScript','Get-LinuxMobileSmbScript',
     'Get-MobileSmbPlanPath','Save-MobileSmbPlan','Read-MobileSmbPlan','ConvertFrom-MobileSmbLinuxResult','Initialize-MobileSmbDeployment',
     'Restore-MobileSmbDeployment','Show-MobileSmbStatus','ConvertTo-BashArgument','New-MobileRunLog','Write-MobileRunEvent','Format-MobileRunEvent','ConvertTo-MobileLogLines')
 $source = $ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in $names } | ForEach-Object { $_.Extent.Text }
+$nested = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Initialize-SmbAccount','Get-AccountRules','Restore-AccountRules','New-SmbAccountRule') }, $true) | ForEach-Object { $_.Extent.Text }
+$source = @($source) + @($nested)
+$windowsSource = (($source -join "`n").Replace("`r`n", "`n")).Replace("`n", "`r`n")
+$windowsModule = New-Module -ScriptBlock ([scriptblock]::Create($windowsSource))
+try {
+    $normalized = & $windowsModule {
+        $script:Config=[pscustomobject]@{ Preflight=@{} }
+        Get-LinuxMobileSmbScript -Mode Status -Id ('0'*20)
+    }
+    if ($normalized.Contains("`r")) { throw 'Windows checkout emitted CRLF to the Linux command stream' }
+} finally { Remove-Module $windowsModule -ErrorAction SilentlyContinue }
 $module = New-Module -ScriptBlock ([scriptblock]::Create($source -join "`n"))
 try {
     & $module {
-        param($fixture, $root)
+        param($fixture, $root, $source)
         function Assert($condition, $message) { if (-not $condition) { throw $message } }
         $script:Config = [pscustomobject]@{ SMBUser = 'configured-smb'; SMBLinuxGroup = 'users'; SSHKeyPath = "$fixture/key"; MobileDeployments = "$fixture/logs"
             Preflight = @{ LinuxToolDirectories = @('/usr/local/sbin','/usr/local/bin','/usr/sbin','/usr/bin','/sbin','/bin') } }
@@ -46,11 +57,24 @@ try {
         $credential = [pscredential]::new('configured-smb', (ConvertTo-SecureString 'fixture-pass' -AsPlainText -Force))
         $windowsWorker = Get-WindowsMobileSmbWorker
         Assert (-not $windowsWorker.ToString().Contains('mobile-smb-access') -and -not $windowsWorker.ToString().Contains('SupeSecret')) 'Windows worker still embeds hardcoded credentials'
-        # Refuse pre-existing accounts before ACL/network changes, including on non-Windows test runners.
-        function Get-LocalUser { [CmdletBinding()] param($Name) [pscustomobject]@{ Name = $Name } }
-        $rejected = $false
-        try { & $windowsWorker Prepare "$fixture/no-state" ([pscustomobject]@{ UserName='configured-smb' }) $credential } catch { $rejected = $_.Exception.Message -like '*already exists*' }
-        Assert $rejected 'Existing SMB password would be overwritten'
+        # Run the actual account helper, independently of Windows-only ACL APIs.
+        $state = [pscustomobject]@{ UserName='configured-smb'; UserSid=$null; AccountOwned=$false; AccountWasEnabled=$false }
+        $script:existingAccount = [pscustomobject]@{ Name='configured-smb'; Enabled=$true; SID=[pscustomobject]@{ Value='fixture-sid' } }
+        $script:createdAccounts=0; $script:enabledAccounts=0
+        function Save-State { }
+        function Get-LocalUser { [CmdletBinding()] param($Name) $script:existingAccount }
+        function New-LocalUser { [CmdletBinding()] param($Name,$Password,$Description,[switch]$AccountNeverExpires,[switch]$PasswordNeverExpires)
+            $script:createdAccounts++; $script:existingAccount=[pscustomobject]@{ Name=$Name; Enabled=$true; SID=[pscustomobject]@{ Value='new-fixture-sid' } } }
+        function Set-LocalUser { throw 'An existing SMB password must not be reset' }
+        function Enable-LocalUser { param($Name) $script:enabledAccounts++ }
+        Initialize-SmbAccount
+        Assert (-not $state.AccountOwned -and $state.AccountWasEnabled -and $script:createdAccounts -eq 0) 'Existing SMB account was rejected or recreated'
+        $script:existingAccount.Enabled=$false
+        Initialize-SmbAccount
+        Assert (-not $state.AccountOwned -and -not $state.AccountWasEnabled -and $script:enabledAccounts -eq 1) 'Disabled account was not enabled with its original state recorded'
+        $script:existingAccount=$null
+        Initialize-SmbAccount
+        Assert ($state.AccountOwned -and $script:createdAccounts -eq 1) 'Missing SMB account was not created'
 
         # Exercise the actual Windows network worker with native cmdlets mocked.
         $winRoot = "$fixture/windows-state"
@@ -91,13 +115,63 @@ try {
             Assert ($script:networkCalls.Count -eq 0) 'An originally static interface was changed to DHCP'
         } finally { $env:SystemRoot = $savedSystemRoot }
 
+        # Reused accounts retain pre-existing share and logon permissions at check-in.
+        $winState.Status='Active'; $winState.UserSid='fixture-sid'
+        $winState | Add-Member AccountWasEnabled $true -Force
+        $winState | Add-Member AddedRights @('SeDenyInteractiveLogonRight') -Force
+        $winState.Shares=@([pscustomobject]@{ Name='C'; Created=$false; OriginalAllow=@('Read') })
+        $winState | ConvertTo-Json -Depth 10 | Set-Content "$winRoot/state.json"
+        $script:existingAccount=[pscustomobject]@{ Name='configured-smb'; Enabled=$true; SID=[pscustomobject]@{ Value='fixture-sid' } }
+        $script:restoredShareAccess=@(); $script:disabledAccounts=0
+        function Get-SmbShare { [CmdletBinding()] param($Name) [pscustomobject]@{ Path='C:\' } }
+        function Revoke-SmbShareAccess { [CmdletBinding()] param($Name,$AccountName,[switch]$Force) }
+        function Grant-SmbShareAccess { [CmdletBinding()] param($Name,$AccountName,$AccessRight,[switch]$Force) $script:restoredShareAccess += $AccessRight }
+        function Remove-LocalUser { throw 'A reused SMB account must not be deleted' }
+        function Disable-LocalUser { param($Name) $script:disabledAccounts++ }
+        function secedit {
+            $nativeArgs=@($args)
+            $inf=$nativeArgs[[array]::IndexOf($nativeArgs,'/cfg')+1]
+            if ($nativeArgs -contains '/export') { "[Privilege Rights]`nSeNetworkLogonRight = *fixture-sid,*other`nSeDenyInteractiveLogonRight = *fixture-sid,*other" | Set-Content $inf }
+            else { $script:restoredRights=Get-Content $inf -Raw }
+            $global:LASTEXITCODE=0
+        }
+        $savedSystemRoot=$env:SystemRoot; $env:SystemRoot="$fixture/windows"
+        try {
+            $restored = & $windowsWorker Restore $winRoot
+            Assert ($restored.Status -eq 'RestorePendingReboot' -and $script:restoredShareAccess -contains 'Read' -and $script:disabledAccounts -eq 0) 'Existing account/share access was not preserved'
+            Assert ($script:restoredRights.Contains('SeNetworkLogonRight = *fixture-sid,*other') -and $script:restoredRights.Contains('SeDenyInteractiveLogonRight = *other')) 'Existing logon rights were removed with deployment-added rights'
+            $winState.AccountWasEnabled=$false
+            $winState | ConvertTo-Json -Depth 10 | Set-Content "$winRoot/state.json"
+            $restored = & $windowsWorker Restore $winRoot
+            Assert ($script:disabledAccounts -eq 1) 'An account originally disabled was left enabled'
+        } finally { $env:SystemRoot=$savedSystemRoot }
+        # Restore only this account's NTFS rules; preserve other identities and detect external edits.
+        $state.UserSid='fixture-sid'
+        function New-SmbAccountRule($Rule) {
+            [pscustomobject]@{ IdentityReference=[pscustomobject]@{ Value='fixture-sid' }; FileSystemRights=$Rule.Rights; AccessControlType=$Rule.Type; InheritanceFlags=$Rule.Inheritance; PropagationFlags=$Rule.Propagation }
+        }
+        $full=[pscustomobject]@{ Rights=2032127; Type=0; Inheritance=3; Propagation=0 }
+        $read=[pscustomobject]@{ Rights=131209; Type=0; Inheritance=3; Propagation=0 }
+        $foreign=New-SmbAccountRule $full; $foreign.IdentityReference.Value='other-sid'
+        $acl=[pscustomobject]@{ Rules=@($foreign,(New-SmbAccountRule $full)) }
+        $acl | Add-Member ScriptMethod GetAccessRules { param($explicit,$inherited,$type) $this.Rules }
+        $acl | Add-Member ScriptMethod RemoveAccessRuleSpecific { param($rule) $this.Rules=@($this.Rules | Where-Object { $_ -ne $rule }) }
+        $acl | Add-Member ScriptMethod AddAccessRule { param($rule) $this.Rules+= $rule }
+        Restore-AccountRules $acl ([pscustomobject]@{ Drive='C'; Before=@($read); Applied=@($full) })
+        Assert ($acl.Rules.Count -eq 2 -and @($acl.Rules | Where-Object { $_.IdentityReference.Value -eq 'fixture-sid' })[0].FileSystemRights -eq $read.Rights) 'Original per-account NTFS rights were lost'
+        $rejected=$false
+        try { Restore-AccountRules $acl ([pscustomobject]@{ Drive='C'; Before=@(); Applied=@($full) }) } catch { $rejected=$true }
+        Assert $rejected 'External changes to the same account ACL were overwritten'
+
         if ((Get-Command bash -ErrorAction SilentlyContinue) -and (Get-Command jq -ErrorAction SilentlyContinue)) {
             $tools = "$fixture/tools"; $sandbox = "$fixture/endpoint"; $id = Get-MobileSmbId fixture
-            New-Item -ItemType Directory -Path $tools, "$sandbox/etc/systemd/system", "$sandbox/boot", "$sandbox/run/lock", "$sandbox/proc/sys/crypto", "$sandbox/share" | Out-Null
+            New-Item -ItemType Directory -Path $tools, "$sandbox/etc/systemd/system", "$sandbox/boot", "$sandbox/run/lock", "$sandbox/proc/sys/crypto", "$sandbox/proc/sys/kernel/random", "$sandbox/share" | Out-Null
             $envNames = @('PATH','MOBILE_SMB_FIXTURE'); $savedEnv = @{}
             foreach ($name in $envNames) { $savedEnv[$name] = [Environment]::GetEnvironmentVariable($name) }
             try {
                 $env:MOBILE_SMB_FIXTURE = $sandbox
+                'boot-before-checkout' | Set-Content "$sandbox/proc/sys/kernel/random/boot_id"
+                @{ 'connection.autoconnect'='yes'; 'ipv4.method'='auto'; 'ipv4.addresses'=''; 'ipv4.dns'='10.2.3.1' } | ConvertTo-Json | Set-Content "$sandbox/network.json"
                 '1' | Set-Content "$sandbox/proc/sys/crypto/fips_enabled"
                 'kernel' | Set-Content "$sandbox/boot/vmlinuz-normal"
                 'initrd' | Set-Content "$sandbox/boot/initramfs-normal.img"
@@ -105,18 +179,30 @@ try {
                 "UUID=root / xfs defaults 0 0`n//other/share /existing cifs nofail 0 0" | Set-Content "$sandbox/etc/fstab"
                 $originalFstab = Get-Content "$sandbox/etc/fstab" -Raw
                 [IO.File]::WriteAllText("$tools/dzdo", "#!/bin/bash`nexec `"`$@`"`n")
-                foreach ($tool in @('systemctl','restorecon','usermod','gpasswd')) { [IO.File]::WriteAllText("$tools/$tool", "#!/bin/bash`nprintf '%s\\n' `"$tool `$*`" >> `"`$MOBILE_SMB_FIXTURE/commands`"`n") }
+                foreach ($tool in @('restorecon','usermod','gpasswd')) { [IO.File]::WriteAllText("$tools/$tool", "#!/bin/bash`nprintf '%s\\n' `"$tool `$*`" >> `"`$MOBILE_SMB_FIXTURE/commands`"`n") }
                 [IO.File]::WriteAllText("$tools/mount.cifs", "#!/bin/bash`nexit 0`n")
                 [IO.File]::WriteAllText("$tools/ip", "#!/bin/bash`necho '2: eth0 inet 10.2.3.6/24 scope global eth0'`n")
                 [IO.File]::WriteAllText("$tools/nmcli", @'
 #!/bin/bash
 printf 'nmcli %s\n' "$*" >> "$MOBILE_SMB_FIXTURE/commands"
 if [[ "$*" == '-t -f UUID,DEVICE connection show --active' ]]; then echo '12345678-1234-1234-1234-123456789abc:eth0'
-elif [[ "$*" == '-t -f NAME connection show' ]]; then [[ ! -f "$MOBILE_SMB_FIXTURE/clone" ]] || cat "$MOBILE_SMB_FIXTURE/clone"
-elif [[ "$1 $2" == 'connection clone' ]]; then printf '%s' "$5" > "$MOBILE_SMB_FIXTURE/clone"
-elif [[ "$1 $2" == 'connection delete' ]]; then rm -f "$MOBILE_SMB_FIXTURE/clone"
+elif [[ "$1 $2 $3 $4" == '-t --escape no -f' ]]; then
+    printf '%s:%s\n' "$5" "$(jq -r --arg key "$5" '.[$key]' "$MOBILE_SMB_FIXTURE/network.json")"
+elif [[ "$1 $2 $3" == 'connection modify uuid' ]]; then
+    shift 4
+    while (( $# )); do jq --arg key "$1" --arg value "$2" '.[$key]=$value' "$MOBILE_SMB_FIXTURE/network.json" > "$MOBILE_SMB_FIXTURE/network.tmp"; mv "$MOBILE_SMB_FIXTURE/network.tmp" "$MOBILE_SMB_FIXTURE/network.json"; shift 2; done
 fi
 exit 0
+'@)
+                [IO.File]::WriteAllText("$tools/systemctl", @'
+#!/bin/bash
+printf 'systemctl %s\n' "$*" >> "$MOBILE_SMB_FIXTURE/commands"
+if [[ "$1" == is-active ]]; then exit 1; fi
+if [[ "$1" == start ]]; then
+    [[ ! -f "$MOBILE_SMB_FIXTURE/mount-fails" ]] || exit 1
+    target="$(systemd-escape --unescape --path "${2%.mount}")"
+    awk -v target="$target" '$2==target {print $1, $2}' "$MOBILE_SMB_FIXTURE/etc/fstab" >> "$MOBILE_SMB_FIXTURE/mounted"
+fi
 '@)
                 [IO.File]::WriteAllText("$tools/grubby", @'
 #!/bin/bash
@@ -156,7 +242,7 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
                 $options = [pscustomobject]@{ UserName='configured-smb'; Interface=[pscustomobject]@{ InterfaceName='eth0'; IPAddress='10.2.3.6'; PrefixLength=24 }; Mounts=$testMounts; LinuxGroup='users'; LinuxUsers=@() }
                 function Convert-SandboxScript([string]$Text) {
                     # Rewrite OS paths ONLY in this test. All commands that change native state are mocked.
-                    foreach ($prefix in @('/var/lib/mobiles','/etc','/boot','/run/lock','/proc/sys/crypto','/share')) { $Text = $Text.Replace($prefix, "$sandbox$prefix") }
+                    foreach ($prefix in @('/var/lib/mobiles','/etc','/boot/','/run/lock','/proc/sys/crypto','/proc/sys/kernel/','/share')) { $Text = $Text.Replace($prefix, "$sandbox$prefix") }
                     $Text
                 }
                 function Invoke-SandboxScript([string]$Text) {
@@ -169,49 +255,57 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
                     ($output -join "`n") | ConvertFrom-Json
                 }
                 $prepare = Convert-SandboxScript (Get-LinuxMobileSmbScript -Mode Prepare -Id $id -Options $options -Credential $credential)
-                # The payload itself is encoded. Replace the embedded worker in the fixture options before encoding it.
-                $decodedMatch = [regex]::Match($prepare, "payload_b64='([^']+)'")
-                $payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($decodedMatch.Groups[1].Value)) | ConvertFrom-Json
-                $payload.Worker = Convert-SandboxScript $payload.Worker
-                $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 12 -Compress)))
-                $prepare = $prepare.Replace($decodedMatch.Groups[1].Value, $encoded)
+                Assert (-not $prepare.Contains('worker.sh') -and -not $prepare.Contains('ExecStart=') -and $prepare -notmatch '(?m)^\s*nmcli connection (up|down)') 'Checkout still installs a worker or reconnects the interface'
                 $prepared = Invoke-SandboxScript $prepare
                 $stateRoot = "$sandbox/var/lib/mobiles/smb/$id"
-                $unitText = Get-Content "$sandbox/etc/systemd/system/$($prepared.Unit)" -Raw
-                Assert ($unitText.Contains('Type=simple') -and $unitText.Contains('/usr/bin/timeout 300')) 'Mount verification delayed boot or lacked a runtime bound'
-                Assert ($prepared.Status -eq 'PreparedPendingReboot' -and -not (Test-Path "$sandbox/mounted")) 'Preparation activated network or mounts immediately'
-                Assert ((Get-Content "$sandbox/etc/fstab" -Raw) -eq $originalFstab) 'Preparation changed fstab before the disconnected boot'
-                Assert (-not (Get-Content "$stateRoot/options.json" -Raw).Contains('fixture-pass')) 'Password leaked into options JSON'
-                $creds = Get-Content "$stateRoot/credentials-WIN-A" -Raw
-                Assert ($creds.Contains('username=configured-smb') -and $creds.Contains('domain=WIN-A')) 'Configured account/server authority did not reach Linux credentials'
-                [IO.File]::WriteAllText("$fixture/fips-enforced.sh", "/bin/bash '$stateRoot/worker.sh' Activate '$stateRoot'")
-                & bash "$fixture/fips-enforced.sh" 2> "$fixture/worker-error" | Out-Null
-                Assert ($LASTEXITCODE -ne 0 -and -not (Test-Path "$sandbox/mounted")) 'SMB activated while FIPS was still enforced'
-                '0' | Set-Content "$sandbox/proc/sys/crypto/fips_enabled"
-                $activated = Invoke-SandboxScript "/bin/bash '$stateRoot/worker.sh' Activate '$stateRoot'"
-                Assert ($activated.Status -eq 'Active' -and $activated.Mounts.Count -eq 3) 'SMB activation did not mount all selected hosts/drives'
+                Assert ($prepared.Status -eq 'PreparedPendingReboot' -and -not (Test-Path "$sandbox/mounted") -and -not (Test-Path "$stateRoot/worker.sh")) 'Preparation started mounts or persisted executable content'
+                $network = Get-Content "$sandbox/network.json" -Raw | ConvertFrom-Json
+                Assert ($network.'ipv4.method' -eq 'manual' -and $network.'ipv4.addresses' -eq '10.2.3.6/24' -and $network.'ipv4.dns' -eq '10.2.3.1') 'Persistent network configuration was not staged or unrelated settings changed'
                 $fstab = Get-Content "$sandbox/etc/fstab" -Raw
-                Assert ($fstab.Contains('//10.2.3.4/C') -and $fstab.Contains('//10.2.3.5/E') -and $fstab.Contains('sec=ntlmssp') -and $fstab.Contains('nofail') -and $fstab.Contains('_netdev') -and $fstab.Contains('//other/share /existing')) 'Managed fstab lost IPs, mount options or unrelated entries'
-                $again = Invoke-SandboxScript "/bin/bash '$stateRoot/worker.sh' Activate '$stateRoot'"
-                Assert ($again.Status -eq 'Active') 'Already-mounted expected shares were not reused'
+                Assert ($fstab.Contains('//10.2.3.4/C') -and $fstab.Contains('//10.2.3.5/E') -and $fstab.Contains('nofail,x-systemd.automount') -and $fstab.Contains('//other/share /existing')) 'Native fstab setup lost sources/options or existing entries'
+                Assert (-not (Get-Content "$stateRoot/options.json" -Raw).Contains('fixture-pass')) 'Password leaked into options JSON'
+                Assert ((& stat -c '%a' "$sandbox/share/WIN-A") -eq '755' -and (& stat -c '%a' "$stateRoot/credentials-WIN-A") -eq '600') 'Share parent traversal or credential permissions are incorrect'
+                Assert ((Get-Content "$stateRoot/credentials-WIN-A" -Raw).Contains('username=configured-smb')) 'Configured SMB account did not reach credentials'
+                $groupTask = "record_action() { printf '%s\n' `"`$4`"; }; record_failure() { echo failed >&2; return 1; }`n" + (New-LinuxTask-SmbGroup $id)
+                $groupResult = Invoke-SandboxScript (Convert-SandboxScript $groupTask)
+                Assert ($groupResult.Status -eq 'PreparedPendingReboot') 'SMB group task did not integrate with ordinary Linux provisioning'
+                $status = Invoke-SandboxScript (Convert-SandboxScript (Get-LinuxMobileSmbScript Status $id))
+                Assert ($status.Status -eq 'PreparedPendingReboot') 'Status ignored the required reboot'
+                'boot-after-checkout' | Set-Content "$sandbox/proc/sys/kernel/random/boot_id"
+                $status = Invoke-SandboxScript (Convert-SandboxScript (Get-LinuxMobileSmbScript Verify $id))
+                Assert ($status.Status -eq 'NeedsReview' -and -not (Test-Path "$sandbox/mounted")) 'Verification mounted shares with FIPS enforced'
+                '0' | Set-Content "$sandbox/proc/sys/crypto/fips_enabled"
+                $status = Invoke-SandboxScript (Convert-SandboxScript (Get-LinuxMobileSmbScript Status $id))
+                Assert ($status.Status -eq 'NeedsReview' -and -not (Test-Path "$sandbox/mounted")) 'Read-only status started missing mounts'
+                $verified = Invoke-SandboxScript (Convert-SandboxScript (Get-LinuxMobileSmbScript Verify $id))
+                Assert ($verified.Status -eq 'Active' -and $verified.Mounts.Count -eq 3) 'Explicit verification failed to mount/probe selected drives'
                 New-Item -ItemType File "$sandbox/mount-busy" | Out-Null
-                [IO.File]::WriteAllText("$fixture/busy.sh", "/bin/bash '$stateRoot/worker.sh' Restore '$stateRoot'")
+                [IO.File]::WriteAllText("$fixture/busy.sh", (Convert-SandboxScript (Get-LinuxMobileSmbScript Restore $id)))
                 & bash "$fixture/busy.sh" 2> "$fixture/worker-error" | Out-Null
-                Assert ($LASTEXITCODE -ne 0 -and (Test-Path "$stateRoot/credentials-WIN-A")) 'Busy unmount did not prevent credential removal'
+                Assert ($LASTEXITCODE -ne 0 -and (Test-Path "$stateRoot/credentials-WIN-A")) 'Busy mount did not block cleanup'
                 Remove-Item "$sandbox/mount-busy"
-                # Simulate a kernel update advancing the normal default while checked out.
                 'updated kernel' | Set-Content "$sandbox/boot/vmlinuz-new-normal"
                 "$sandbox/boot/vmlinuz-new-normal" | Set-Content "$sandbox/default-kernel"
-                $restored = Invoke-SandboxScript "/bin/bash '$stateRoot/worker.sh' Restore '$stateRoot'"
-                Assert ($restored.Status -eq 'RestorePendingReboot' -and -not (Test-Path "$stateRoot/credentials-WIN-A")) 'Check-in did not remove credentials and stage restoration'
-                Assert ((Get-Content "$sandbox/default-kernel" -Raw).Trim() -eq "$sandbox/boot/vmlinuz-new-normal") 'Check-in overwrote a newer normal default kernel'
-                $after = Get-Content "$sandbox/etc/fstab" -Raw
-                Assert ($after.Contains('//other/share /existing') -and -not $after.Contains('# BEGIN MOBILES')) 'Check-in removed unrelated fstab entries or left managed entries'
+                $restored = Invoke-SandboxScript (Convert-SandboxScript (Get-LinuxMobileSmbScript Restore $id))
+                Assert ($restored.Status -eq 'RestorePendingReboot' -and -not (Test-Path "$stateRoot/credentials-WIN-A")) 'Check-in did not stage restoration or remove credentials'
+                $network = Get-Content "$sandbox/network.json" -Raw | ConvertFrom-Json
+                Assert ($network.'ipv4.method' -eq 'auto' -and $network.'ipv4.addresses' -eq '' -and $network.'ipv4.dns' -eq '10.2.3.1') 'Original network settings were not restored'
+                Assert ((Get-Content "$sandbox/default-kernel" -Raw).Trim() -eq "$sandbox/boot/vmlinuz-new-normal") 'A newer normal kernel default was overwritten'
+                Assert (-not (Get-Content "$sandbox/etc/fstab" -Raw).Contains('# BEGIN MOBILES') -and -not (Test-Path "$sandbox/share/WIN-A")) 'Managed entries/directories remained after cleanup'
                 '1' | Set-Content "$sandbox/proc/sys/crypto/fips_enabled"
-                $restoredBoot = Invoke-SandboxScript "/bin/bash '$stateRoot/worker.sh' RestoreBoot '$stateRoot'"
-                Assert ($restoredBoot.Status -eq 'Restored' -and -not (Test-Path "$sandbox/clone")) 'Check-in boot did not restore the original profile'
-                Assert (-not (Test-Path "$sandbox/share/WIN-A") -and (Test-Path "$sandbox/share")) 'Created parent mount directories were left behind or an existing /share was removed'
-                Assert ((Get-Content "$sandbox/commands" -Raw).Contains('connection up uuid 12345678-1234-1234-1234-123456789abc')) 'Original NM profile was not restored by UUID'
+                'boot-after-checkin' | Set-Content "$sandbox/proc/sys/kernel/random/boot_id"
+                $status = Invoke-SandboxScript (Convert-SandboxScript (Get-LinuxMobileSmbScript Status $id))
+                Assert ($status.Status -eq 'Restored' -and (Get-Content "$stateRoot/state.json" -Raw | ConvertFrom-Json).Status -eq 'Restored') 'Restoration was not verified/checkpointed after reboot'
+                Assert (-not (Get-Content "$sandbox/commands" -Raw).Contains('connection up')) 'A command reconnected the live management interface'
+                # Legacy state can be checked in without executing its CRLF worker.
+                $legacy = Get-Content "$stateRoot/state.json" -Raw | ConvertFrom-Json
+                $legacy.PSObject.Properties.Remove('OriginalNetwork'); $legacy.Version=1; $legacy.Status='Active'
+                $legacy | Add-Member MobileConnection "mobiles-smb-$id"
+                $legacy | ConvertTo-Json -Depth 12 | Set-Content "$stateRoot/state.json"
+                [IO.File]::WriteAllText("$stateRoot/worker.sh", "#!/bin/bash`r`nexit 99`r`n")
+                'legacy service' | Set-Content "$sandbox/etc/systemd/system/mobiles-smb-$id.service"
+                $legacyRestore = Invoke-SandboxScript (Convert-SandboxScript (Get-LinuxMobileSmbScript Restore $id))
+                Assert ($legacyRestore.Status -eq 'RestorePendingReboot' -and -not (Test-Path "$stateRoot/worker.sh") -and -not (Test-Path "$sandbox/etc/systemd/system/mobiles-smb-$id.service")) 'Legacy cleanup executed/retained the old worker/service'
             } finally { foreach ($name in $envNames) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name]) } }
         }
         # Controller wiring: every Windows host is shared, but only selected hosts get Linux mounts.
@@ -222,7 +316,7 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
             if ($ScriptBlock.ToString().Contains('Get-CimInstance Win32_LogicalDisk')) {
                 $last = if ($ComputerName -eq 'WIN-A') { 11 } else { 12 }
                 [pscustomobject]@{ Interfaces = @([pscustomobject]@{ InterfaceName='Ethernet'; InterfaceGuid="guid-$ComputerName"; IPAddress="10.20.1.$last"; PrefixLength=24 })
-                    LocalAuthority = $ComputerName; AccountExists = $false; Drives = @('C','D') }
+                    LocalAuthority = $ComputerName; AccountExists = $true; Drives = @('C','D') }
             } elseif ($ArgumentList[0] -eq 'Prepare') {
                 Assert ($ArgumentList[2].UserName -eq 'configured-smb' -and $ArgumentList[3].UserName -eq 'configured-smb') 'SMBUser/credential did not reach Windows preparation'
                 $script:preparedWindows += $ComputerName
@@ -236,19 +330,19 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
         function Invoke-Linux {
             param($Computers,$Script,$KeyPath)
             $state = $null; $code = 0; $errorText = ''
-            if ($Script.Contains('ip -o -4 address show up')) {
+            if ($Script.Contains('ip -o -4 address show up scope global')) {
                 $state = [pscustomobject]@{ Interfaces=@([pscustomobject]@{ InterfaceName='eth0'; IPAddress='10.20.1.20'; PrefixLength=24 }) }
-            } elseif ($Script.Contains("payload_b64='")) {
-                $match = [regex]::Match($Script, "payload_b64='([^']+)'")
+            } elseif ($Script.Contains("payload=")) {
+                $match = [regex]::Match($Script, "printf '%s' '([^']+)' \| base64 -d")
                 $body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($match.Groups[1].Value)) | ConvertFrom-Json
                 Assert ($body.Password -eq 'fixture-pass' -and $body.UserName -eq 'configured-smb') 'Credential did not reach Linux preparation'
                 Assert ($body.Mounts.Count -eq 2 -and $body.Mounts[0].Source -eq '//10.20.1.12/C') 'Unselected Windows hosts were included in Linux mounts'
                 $state = [pscustomobject]@{ Status='PreparedPendingReboot' }
-            } elseif ($Script -match "worker.sh' Restore") {
+            } elseif ($Script.Contains("finish RestorePendingReboot")) {
                 $script:restoreOrder += "Linux:$($Computers[0])"
                 if ($script:linuxRestoreFails) { $code = 2; $errorText='Busy mount' }
                 $state = [pscustomobject]@{ Status='RestorePendingReboot' }
-            } elseif ($Script -match "worker.sh' Status") { $state = [pscustomobject]@{ Status='Restored' } }
+            } elseif ($Script.Contains("verify_mounts=")) { $state = [pscustomobject]@{ Status='Restored' } }
             else { throw 'Unexpected mocked Linux operation' }
             [pscustomobject]@{ Target=$Computers[0]; ExitCode=$code; StdOut=($state | ConvertTo-Json -Depth 10); StdErr=$errorText }
         }
@@ -269,8 +363,8 @@ mv "$MOBILE_SMB_FIXTURE/mounted.tmp" "$MOBILE_SMB_FIXTURE/mounted"
         $statuses = @(Show-MobileSmbStatus orchestrated)
         Assert ($statuses.Count -eq 3 -and (Read-MobileSmbPlan orchestrated).Status -eq 'Restored') 'Post-reboot status did not complete the saved lifecycle'
 
-        'PASS: SMB host/interface selection, IP-based mount plans, configured credentials, nofail mounts, deferred networking, busy-mount gates, preserved fstab entries, and restoration.'
-    } $fixture $root
+        'PASS: native Linux preparation/verification/restoration, no startup worker, existing account reuse, numeric mounts, nofail/automount, legacy cleanup, and controller wiring.'
+    } $fixture $root $source
 } finally {
     Remove-Module $module -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fixture -Recurse -Force

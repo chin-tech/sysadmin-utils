@@ -21,6 +21,9 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'SmbStatus')]
     [switch]$SmbStatus,
 
+    [Parameter(ParameterSetName = 'SmbStatus')]
+    [switch]$VerifyMounts,
+
     # --- Mode Switches ---
     [Parameter(Mandatory = $true, ParameterSetName = 'Info')]
     [switch]$Info,
@@ -125,7 +128,7 @@ if ($PSBoundParameters.ContainsKey('Verbose')) {
 }
 
 switch ($PSCmdlet.ParameterSetName) {
-    'SmbStatus' { Show-MobileSmbStatus -MobileName $Name @passThru }
+    'SmbStatus' { Show-MobileSmbStatus -MobileName $Name -VerifyMounts:$VerifyMounts @passThru }
 
     'Preflight' {
         foreach ($option in @('SkipScans', 'Rescan', 'ForceScan', 'DefinitionMaxAgeDays', 'ScanTimeoutMinutes')) {

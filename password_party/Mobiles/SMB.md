@@ -1,70 +1,65 @@
-# Mobile SMB checkout and check-in
+# SMB checkout and check-in
 
-`NetworkSharing` in `DeploymentTasks.Windows.PostDeployment` enables the coordinated workflow. Every Windows computer in the mobile shares its fixed local drives, including its system drive. `-SmbHosts` chooses which of those computers Linux mounts; it does not restrict Windows share creation.
+Enable `NetworkSharing` in `DeploymentTasks.Windows.PostDeployment`. All Windows hosts share their fixed drives. `-SmbHosts` selects which Windows hosts Linux mounts; blank/invalid input opens the mobile-scoped terminal picker.
 
 ```powershell
 .\Mobiles.ps1 -RegisterDeployment -Name tmobile -SmbHosts WIN-A,WIN-B -Disjoin
 ```
 
-The existing domain-controller/keytab arguments remain available for Linux departure. Omitting `-SmbHosts`, supplying blank input, or including an unknown name opens the terminal multi-select picker populated from that mobile's Windows list. Valid names are preselected when correcting invalid input. Cancellation/empty selection stops checkout. Unattended use requires valid explicit selections; redirected input cannot use the picker.
+Each host's active `10.x` interface is selected automatically when unique, or through the interface picker when ambiguous. Duplicate addresses or incompatible subnets stop preparation. Sources use captured Windows IPs; local paths use `/share/<hostname>/<drive>`. Domain departure still uses the existing keytab/credential arguments and account checks.
 
-Each host's active `10.x` IPv4 interface is discovered. One match is selected automatically; multiple matches open an interface picker. No match stops preparation. Duplicate addresses and selected subnets that cannot directly reach one another stop preparation before endpoint changes. This assumes an isolated network without an intervening router. The selected Windows IPs are captured explicitly, so CIFS sources do not require DNS:
+## Native Linux configuration
 
-```fstab
-//10.20.1.11/C /share/WIN-A/C cifs credentials=/var/lib/mobiles/smb/<id>/credentials-WIN-A,sec=ntlmssp,vers=3.0,_netdev,nofail,x-systemd.device-timeout=15s,file_mode=0660,dir_mode=0770,gid=users 0 0
+Checkout writes persistent settings, then ordinary boot facilities apply them. It installs **no Linux SMB worker script or custom service**:
+
+- NetworkManager: save the current connection's autoconnect, IPv4 method and configured addresses, then set the captured address/prefix as static. Other profile settings remain unchanged. No `connection up/down`, device reapply, or NetworkManager restart runs during checkout/check-in.
+- Boot: when FIPS is currently enforced, create a separate mobile kernel entry with `fips=0`. Keep normal entries and save the normal default. The dedicated images require free `/boot` space. RHEL 8 crypto policy is not changed; actual FIPS/SMB compatibility is verified after reboot.
+- Mounts: write a marked `/etc/fstab` block with numeric IP sources, `sec=ntlmssp`, SMB 3.0, `_netdev,nofail,x-systemd.automount`, and root-only credential files. Native automounts mount on access; an unavailable storage host does not become a required boot mount.
+- Access: after ordinary Linux account provisioning, add local mobile users to `SMBLinuxGroup`, recording only memberships added by the deployment. Failure blocks domain departure.
+
+Disconnect from the domain network and reboot onto the isolated network. A normal status query observes state without starting mounts:
+
+```powershell
+.\Mobiles.ps1 -SmbStatus -Name tmobile
 ```
 
-The hostname names the local directory; the source uses the numeric address. Multiple storage hosts receive separate directories. The credential authority is the Windows machine's actual local computer name, including when the mobile lists an FQDN. Each mount receives a systemd mount-unit drop-in setting `TimeoutSec=30`; this avoids depending on newer fstab timeout options unavailable in upstream systemd 219. Every managed fstab line has **`nofail`** and `_netdev`. A missing share does not make it a required boot mount. The activation worker runs as a background service, so its mount/probe attempts also do not delay the multi-user boot target. It still reports unsuccessful mounts and write probes.
+To explicitly start the native fstab mount units and run temporary write/delete probes:
 
-## Configuration and credentials
+```powershell
+.\Mobiles.ps1 -SmbStatus -Name tmobile -VerifyMounts
+```
 
-Set these in the manifest or your existing `cfg.psd1` override:
+Verification checks the reboot, kernel FIPS enforcement, captured address and expected CIFS sources. Mount/probe attempts are bounded by timeouts. It reports unavailable shares as `NeedsReview`; `nofail` remains in fstab. Status queries append observations to the normal `.log`/`.jsonl` audit pair.
+
+The Linux implementation is split into `Get-LinuxSmbNetworkScript`, `Get-LinuxSmbBootScript`, `Get-LinuxSmbMountScript`, `Get-LinuxSmbGroupScript`, and `Get-LinuxSmbStatusScript` in `MobileManager.psm1`. These are ordinary SSH command fragments. Only data and credentials are persisted, not generated executable content. Windows line endings are normalized on the outbound command stream; JSON carries data only.
+
+## SMB account and permissions
 
 ```powershell
 SMBUser = 'mobile-smb-access'
 SMBLinuxGroup = 'users'
 ```
 
-The account name is used for account creation, share permissions, and Linux credential files. `NetworkSharing` creates the account independently of the optional `UserRights`/`PostDeploy` tasks. The command prompts once for a secure password, or accepts `-SmbCredential` with a username matching `SMBUser`. The account must be distinct from deployment user accounts. Existing accounts are reported before preparation; their passwords are never overwritten. Existing drive-letter shares must point to the expected drive root. New shares grant full access to this account; existing share permissions are preserved with an additional grant. NTFS permissions grant inheritable full control at each drive root without taking ownership or changing protected child ACLs. Protected paths can therefore remain inaccessible.
+The configured username reaches Windows account creation, permissions and Linux credentials. Password input uses `Read-Host -AsSecureString`, or `-SmbCredential` with the configured username. An existing account is **reused without resetting its password**; supply its current password, consistently across the storage hosts. A missing account is created. An existing disabled account is temporarily enabled and its original enabled state recorded. Incorrect credentials are reported by explicit mount verification.
 
-`SMBLinuxGroup` must already exist. At activation the deployment's local Linux users are added if necessary, and only those added memberships are removed on check-in. This group controls local access to the shared-account mounts. The Windows account receives network logon rights and is denied local/RDP interactive logon. A deployment-owned firewall rule permits TCP 445 from `10.0.0.0/8` on all profiles.
+Check-in deletes only accounts created by this deployment. Reused accounts retain their password and original enabled state. Existing share grants and this account's NTFS rules are recorded and restored; unrelated identities are preserved. External changes to the same account's NTFS rules require inspection rather than being overwritten. Only logon-right entries added by this deployment are removed. New shares grant the SMB account full access; protected child NTFS ACLs can still deny particular paths. `NetworkSharing` is independent of optional `UserRights`/`PostDeploy` tasks.
 
-Windows receives the password as a SecureString credential over the existing WinRM transport. Linux receives it in the SSH payload, then stores it only in root-owned mode-0600 credential files inside a mode-0700 state directory. The controller plan and audit logs contain no password or generated worker payload. Endpoint worker/options/state files require administrator/root access. Use `Preflight.LinuxToolDirectories` for custom dependency locations, just as with preflight.
+Windows still uses its PowerShell startup task for deferred DHCP/static changes. Preparation reports `PreparedPendingReboot`; after boot the task records `Active`. Windows management authentication/trust must already support access by the captured IP after disjoin. The SMB data credential does not replace management credentials, and the tool does not change TrustedHosts.
 
-## Checkout and activation
-
-1. Resolve selections and collect interface/drive inventory before changing endpoints.
-2. Save a non-secret controller plan under `MobileDeployments/smb/<id>.json`. Prepare Windows accounts, shares, permissions, firewall rules, and startup workers. Prepare Linux credentials, empty mount directories, a cloned NetworkManager profile, and its startup service. Preparation failures stop ordinary provisioning/domain departure and retain restoration state.
-3. Run ordinary checkout tasks, hooks and local-account checks. Domain departure still requires `-Disjoin` and successful prerequisites.
-4. Disconnect from the domain network, connect the isolated mobile network, and reboot the hosts. Address changes are deferred until startup. Windows freezes the selected DHCP address; originally static Windows addressing is retained. Linux activates a static clone using the captured address/prefix, without modifying its original connection profile. The clone omits corporate IPv4 gateways, static routes and DNS.
-5. Collect results after the hosts finish booting:
-
-```powershell
-.\Mobiles.ps1 -SmbStatus -Name tmobile
-```
-
-Preparation reports `PreparedPendingReboot`, not verified connectivity. Windows activation reports `Active` once its selected static address is installed. Linux activation verifies FIPS enforcement is off, installs the managed fstab block, mounts every selected share, and performs a temporary write/delete probe in each. A mount failure is recorded as an activation failure while `nofail` permits boot to continue. Once storage hosts are available, a Linux administrator can retry using `systemctl restart mobiles-smb-<id>.service`. Existing mounts are reused only when their sources match the plan.
-
-On Linux hosts currently enforcing FIPS, preparation copies the normal default kernel and initramfs to uniquely named mobile images and creates a dedicated grubby entry with `fips=0`. Ordinary entries are retained. The copies let check-in remove only the mobile entry and its images, without removing the normal entry for the same kernel version. Enough `/boot` space for both images is required. Preparation requires grubby to resolve the default kernel and a single initramfs file; unsupported layouts fail explicitly. Hosts initially outside FIPS mode do not receive a mobile kernel entry. The workflow does not change the RHEL 8 system crypto policy; successful kernel verification and an actual CIFS mount are required. Validate this behavior on both site images.
-
-## Check-in
+## Check-in and older deployments
 
 ```powershell
 .\Mobiles.ps1 -UnRegisterDeployment -Name tmobile
 ```
 
-For a saved SMB deployment, check-in hooks run before SMB teardown, and are not run a second time during ordinary cleanup. All Linux clients must unmount successfully before any Windows shares are removed. Busy mounts stop cleanup; the workflow does not force/lazily detach them. Managed fstab blocks, credential files and mount timeout drop-ins are removed. Added Linux group memberships, Windows account/share/NTFS grants, local logon-right entries and firewall rules are removed while preserving pre-existing shares and unrelated settings. Newly created empty mount directories are removed during the restoration boot.
+Check-in hooks run first. Linux unmounts must succeed before any Windows shares are removed; busy mounts abort cleanup without force/lazy unmount. Remove only managed fstab entries, credentials, newly created empty directories and added group memberships. Restore saved NetworkManager values without reconnecting the live interface. Restore the normal boot selection and FIPS arguments; preserve a newer normal default and repair new normal entries that inherited `fips=0` during updates. Windows restores its saved DHCP/DNS behavior at startup, retaining originally static configurations.
 
-Networking restoration is deferred to startup so management sessions remain available for ordinary cleanup. Check-in stages the saved original NetworkManager connection by UUID and restores DHCP/DNS only on Windows interfaces that originally used DHCP. Originally static Windows configurations stay static. Linux selects the normal kernel, removes the mobile entry/images, and verifies the original FIPS enforcement after reboot. A newer normal default is preserved; if the saved default has been removed, the first installed normal entry in grubby boot order is used. When originally enforcing FIPS, the selected normal entry and newly installed normal entries receive `fips=1`, including when they inherited mobile arguments during an update. Other pre-existing normal entries are retained.
+Reconnect to the original network, reboot, then use `-SmbStatus` to confirm `Restored`. The Linux status check uses the boot ID, original connection UUID, IPv4 availability and original FIPS enforcement to checkpoint restoration. The controller plan is retained until verified.
 
-Check-in reports `RestorePendingReboot`. Reconnect to the original network for DHCP, reboot the hosts, then run `-SmbStatus` to verify `Restored` and complete the controller lifecycle. Status first tries the saved hostname, then the captured IP, so a renewed DHCP address can be reached through restored DNS. Retain the controller plan until restoration is verified. The endpoint copies of state/history remain available for inspection.
+Saved deployments from the old Linux service implementation can be checked in with this version. Cleanup disables/removes that service and deletes its worker without executing it, so CRLF in the old worker does not block check-in. The old active mobile connection is disabled for autoconnect; its untouched original connection is used after reboot. The disabled legacy profile is retained to avoid interrupting the current SSH session; it can be deleted manually after restoration. Fresh checkouts create no such profile or service. An old service still running with its deployment lock must be stopped before check-in.
 
-## Endpoint results and management access
+Controller plans live under `MobileDeployments/smb/<id>.json`. Linux restoration data lives under `/var/lib/mobiles/smb/<id>`; credential files are mode 0600 inside a mode-0700 directory. Windows state/history remains under `C:\ProgramData\Mobiles\Smb\<id>`. Passwords and generated payloads are excluded from controller plans/audits. Use `Preflight.LinuxToolDirectories` for custom tool locations.
 
-Windows stores `state.json` and `history.jsonl` under `C:\ProgramData\Mobiles\Smb\<id>`; its startup task is `Mobiles-Smb-<id>`. Linux stores state, history and options under `/var/lib/mobiles/smb/<id>`; its unit is `mobiles-smb-<id>.service`, with output in the system journal. Each `-SmbStatus` query collects current endpoint results into the regular `.log`/`.jsonl` audit pair. Earlier audit snapshots do not change when workers finish.
+Offline validation: `pwsh -NoProfile -File ./tests/Verify-SmbDeployment.ps1`. Native RHEL 7.9/8.10 boot and Windows ACL/WinRM behavior still require site validation.
 
-Check-in uses saved numeric addresses for management too. Existing WinRM authentication/trust or HTTPS certificate configuration must permit management by IP after domain departure, and SSH must remain authorized for the management account. The tool does not alter the controller's TrustedHosts or substitute the SMB data credential for management credentials. Status can show `Unreachable` separately from an endpoint's saved activation result. Native Windows SMB/ACL/WinRM behavior, RHEL 7.9/8.10 grubby/network behavior, FIPS interaction and site policies require on-site validation; offline tests mock native mutations.
-
-Run `pwsh -NoProfile -File ./tests/Verify-SmbDeployment.ps1` for the offline fixtures.
-
-References: [Red Hat SMB mounts and credential files](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/managing_file_systems/mounting-an-smb-share-on-red-hat-enterprise-linux_managing-file-systems), [grubby options](https://github.com/rhboot/grubby/blob/main/grubby.8), [NetworkManager profiles](https://networkmanager.dev/docs/api/latest/nmcli.html), [systemd mount behavior](https://www.freedesktop.org/software/systemd/man/latest/systemd.mount.html), [Windows address creation](https://learn.microsoft.com/en-us/powershell/module/nettcpip/new-netipaddress).
+References: [NetworkManager command behavior](https://networkmanager.dev/docs/api/latest/nmcli.html), [native fstab automount/nofail behavior](https://www.freedesktop.org/software/systemd/man/latest/systemd.mount.html), [Red Hat SMB authentication](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/managing_file_systems/mounting-an-smb-share-on-red-hat-enterprise-linux_managing-file-systems).

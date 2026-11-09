@@ -3157,7 +3157,8 @@ function Get-LinuxDeployScript {
         [switch]$SkipLogrotate,
         [array]$Hooks = @(),
         [string]$MobileName,
-        [string]$RunId
+        [string]$RunId,
+        [string]$SmbId
     )
 
     # 1. Resolve users according to metadata priority
@@ -3244,6 +3245,8 @@ jq -n \
             'AddUsers' { if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) } }
         }
     }
+
+    if ($SmbId) { $tasks.Add((New-LinuxTask-SmbGroup -Id $SmbId)) }
 
     if ($Hooks) {
         $tasks.Add((Get-LinuxProcedureHookScript -Hooks $Hooks -MobileName $MobileName -Procedure 'Check-out' -RunId $RunId))
@@ -5587,6 +5590,39 @@ function Get-WindowsMobileSmbWorker {
             $acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
             Set-Acl -LiteralPath $Path -AclObject $acl
         }
+        function Initialize-SmbAccount {
+            $existing = Get-LocalUser -Name $state.UserName -ErrorAction SilentlyContinue
+            $state.AccountOwned = -not [bool]$existing
+            $state.AccountWasEnabled = [bool]($existing -and $existing.Enabled)
+            if ($existing) {
+                $state.UserSid = $existing.SID.Value
+                Save-State
+                if (-not $existing.Enabled) { Enable-LocalUser -Name $state.UserName }
+            } else {
+                New-LocalUser -Name $state.UserName -Password $Credential.Password -Description 'Mobile deployment SMB access' -AccountNeverExpires -PasswordNeverExpires | Out-Null
+                $state.UserSid = (Get-LocalUser -Name $state.UserName).SID.Value
+            }
+            Save-State
+        }
+        function Get-AccountRules($Acl) {
+            @($Acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $state.UserSid } | ForEach-Object {
+                [pscustomobject]@{ Rights=[int]$_.FileSystemRights; Type=[int]$_.AccessControlType; Inheritance=[int]$_.InheritanceFlags; Propagation=[int]$_.PropagationFlags }
+            } | Sort-Object Type,Rights,Inheritance,Propagation)
+        }
+        function New-SmbAccountRule($Rule) {
+            [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($state.UserSid), $Rule.Rights, $Rule.Inheritance, $Rule.Propagation, $Rule.Type)
+        }
+        function Restore-AccountRules($Acl, $Snapshot) {
+            $current = ConvertTo-Json -InputObject @(Get-AccountRules $Acl) -Compress
+            $before = ConvertTo-Json -InputObject @($Snapshot.Before) -Compress
+            $applied = ConvertTo-Json -InputObject @($Snapshot.Applied) -Compress
+            if ($current -eq $before) { return } # Preparation may have failed before Set-Acl.
+            if ($current -ne $applied) { throw "SMB account ACL changed outside deployment on $($Snapshot.Drive); inspect before cleanup." }
+            foreach ($rule in @($Acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $state.UserSid })) { $Acl.RemoveAccessRuleSpecific($rule) }
+            foreach ($rule in $Snapshot.Before) {
+                $Acl.AddAccessRule((New-SmbAccountRule $rule))
+            }
+        }
         function Set-BootTask([string]$ActionMode) {
             $worker = Join-Path $Root 'worker.ps1'
             $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -5608,7 +5644,6 @@ function Get-WindowsMobileSmbWorker {
             }
             if ($Mode -eq 'Prepare') {
                 if ($state -and $state.Status -ne 'Restored') { throw 'SMB state already exists. Inspect or check in this deployment before preparing it again.' }
-                if (Get-LocalUser -Name $Options.UserName -ErrorAction SilentlyContinue) { throw "SMB account '$($Options.UserName)' already exists; refusing to change an unowned password." }
                 $adapter = Get-NetAdapter | Where-Object { $_.InterfaceGuid.ToString() -eq $Options.Interface.InterfaceGuid } | Select-Object -First 1
                 if (-not $adapter) { throw 'Selected interface is no longer present.' }
                 $index = $adapter.InterfaceIndex
@@ -5617,16 +5652,13 @@ function Get-WindowsMobileSmbWorker {
                 Protect-Directory (Split-Path $Root -Parent)
                 Protect-Directory $Root
                 $state = [pscustomobject]@{ Status = 'Preparing'; UpdatedUtc = ''; Error = $null
-                    UserName = $Options.UserName; UserSid = $null; AccountOwned = $false
+                    UserName = $Options.UserName; UserSid = $null; AccountOwned = $false; AccountWasEnabled = $false; AddedRights = @(); AclSnapshots = @()
                     Interface = $Options.Interface; OriginalDhcp = [string]$ipInterface.Dhcp
                     OriginalDnsStatic = [string]$dnsKey.NameServer
                     Shares = @(); AclDrives = @(); FirewallName = "Mobiles-Smb-$($Options.Id)"; TaskName = "Mobiles-Smb-$($Options.Id)" }
                 Save-State
                 $Options.Worker | Set-Content -LiteralPath (Join-Path $Root 'worker.ps1') -Encoding UTF8
-                New-LocalUser -Name $state.UserName -Password $Credential.Password -Description 'Mobile deployment SMB access' -AccountNeverExpires -PasswordNeverExpires | Out-Null
-                $state.UserSid = (Get-LocalUser -Name $state.UserName).SID.Value
-                $state.AccountOwned = $true
-                Save-State
+                Initialize-SmbAccount
                 # The account gets network logon, but cannot log on interactively.
                 $inf = Join-Path $Root 'rights.inf'; $db = Join-Path $Root 'rights.sdb'
                 & secedit /export /cfg $inf /areas USER_RIGHTS /quiet | Out-Null
@@ -5635,11 +5667,14 @@ function Get-WindowsMobileSmbWorker {
                 foreach ($right in @('SeNetworkLogonRight','SeDenyInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight')) {
                     $pattern = '(?m)^' + $right + '\s*=\s*([^\r\n]*)'
                     $match = [regex]::Match($cfg, $pattern)
+                    if ($match.Success -and "*$($state.UserSid)" -in @($match.Groups[1].Value -split ',' | ForEach-Object { $_.Trim() })) { continue }
+                    $state.AddedRights += $right
                     $values = if ($match.Success -and $match.Groups[1].Value.Trim()) { $match.Groups[1].Value.Trim() + ',' } else { '' }
                     $line = "$right = $values*$($state.UserSid)"
                     if ($match.Success) { $cfg = $cfg.Remove($match.Index, $match.Length).Insert($match.Index, $line) }
                     else { $cfg += "`r`n$line`r`n" }
                 }
+                Save-State
                 $cfg | Set-Content -LiteralPath $inf -Encoding Unicode
                 & secedit /configure /db $db /cfg $inf /areas USER_RIGHTS /quiet | Out-Null
                 if ($LASTEXITCODE -ne 0) { throw 'Could not set SMB account logon rights.' }
@@ -5647,12 +5682,18 @@ function Get-WindowsMobileSmbWorker {
                     $path = "${drive}:\"
                     $existing = Get-SmbShare -Name $drive -ErrorAction SilentlyContinue
                     if ($existing -and $existing.Path -ine $path) { throw "Share '$drive' already points somewhere else." }
-                    $state.Shares += [pscustomobject]@{ Name = $drive; Created = (-not [bool]$existing) }
+                    $account = "$env:COMPUTERNAME\$($state.UserName)"
+                    $originalAllow = @()
+                    if ($existing) { $originalAllow = @(Get-SmbShareAccess -Name $drive | Where-Object { $_.AccountName -ieq $account -and $_.AccessControlType -eq 'Allow' } | ForEach-Object { [string]$_.AccessRight }) }
+                    $state.Shares += [pscustomobject]@{ Name = $drive; Created = (-not [bool]$existing); OriginalAllow = @($originalAllow) }
                     $state.AclDrives += $drive
                     Save-State # Write intent before changing each resource, so partial preparation is recoverable.
                     $acl = Get-Acl -LiteralPath $path
-                    $rule = [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($state.UserSid), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+                    $beforeRules = @(Get-AccountRules $acl)
+                    $rule = New-SmbAccountRule ([pscustomobject]@{ Rights=[int][Security.AccessControl.FileSystemRights]::FullControl; Inheritance=3; Propagation=0; Type=0 })
                     $acl.AddAccessRule($rule)
+                    $state.AclSnapshots += [pscustomobject]@{ Drive=$drive; Before=@($beforeRules); Applied=@(Get-AccountRules $acl) }
+                    Save-State
                     Set-Acl -LiteralPath $path -AclObject $acl
                     $account = "$env:COMPUTERNAME\$($state.UserName)"
                     if ($existing) { Grant-SmbShareAccess -Name $drive -AccountName $account -AccessRight Full -Force | Out-Null }
@@ -5688,12 +5729,19 @@ function Get-WindowsMobileSmbWorker {
                     if (-not $existing) { continue }
                     if ($existing.Path -ine "$($share.Name):\") { throw "Share '$($share.Name)' changed outside deployment; inspect before cleanup." }
                     if ($share.Created) { Remove-SmbShare -Name $share.Name -Force }
-                    else { Revoke-SmbShareAccess -Name $share.Name -AccountName "$env:COMPUTERNAME\$($state.UserName)" -Force }
+                    else {
+                        $account = "$env:COMPUTERNAME\$($state.UserName)"
+                        Revoke-SmbShareAccess -Name $share.Name -AccountName $account -Force
+                        foreach ($access in $share.OriginalAllow) { Grant-SmbShareAccess -Name $share.Name -AccountName $account -AccessRight $access -Force | Out-Null }
+                    }
                 }
                 if ($state.UserSid) {
                     foreach ($drive in $state.AclDrives) {
                         $path = "${drive}:\"; $acl = Get-Acl -LiteralPath $path
-                        $acl.PurgeAccessRules([Security.Principal.SecurityIdentifier]::new($state.UserSid))
+                        $snapshot = $state.AclSnapshots | Where-Object Drive -eq $drive | Select-Object -First 1
+                        if ($snapshot) { Restore-AccountRules $acl $snapshot }
+                        elseif ($state.AccountOwned) { $acl.PurgeAccessRules([Security.Principal.SecurityIdentifier]::new($state.UserSid)) } # Legacy owned account.
+                        else { continue }
                         Set-Acl -LiteralPath $path -AclObject $acl
                     }
                 }
@@ -5703,8 +5751,11 @@ function Get-WindowsMobileSmbWorker {
                     if ($LASTEXITCODE -ne 0) { throw 'Could not read logon rights for cleanup.' }
                     $cfg = Get-Content -LiteralPath $inf -Raw
                     $sidToken = "*$($state.UserSid)"
+                    $addedRights = @($state.AddedRights)
+                    if (-not $state.PSObject.Properties['AddedRights'] -and $state.AccountOwned) { $addedRights = @('SeNetworkLogonRight','SeDenyInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight') }
                     $cfg = [regex]::Replace($cfg, '(?m)^(Se\w+Right\s*=\s*)([^\r\n]*)', {
                         param($match)
+                        if (($match.Groups[1].Value -split '\s*=')[0] -notin $addedRights) { return $match.Value }
                         $match.Groups[1].Value + ((@($match.Groups[2].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne $sidToken })) -join ',')
                     })
                     $cfg | Set-Content -LiteralPath $inf -Encoding Unicode
@@ -5715,6 +5766,11 @@ function Get-WindowsMobileSmbWorker {
                     $user = Get-LocalUser -Name $state.UserName -ErrorAction SilentlyContinue
                     if ($user -and $user.SID.Value -ne $state.UserSid) { throw 'SMB account identity changed; inspect before cleanup.' }
                     if ($user) { Remove-LocalUser -Name $state.UserName }
+                }
+                elseif ($state.AccountWasEnabled -eq $false) {
+                    $user = Get-LocalUser -Name $state.UserName -ErrorAction SilentlyContinue
+                    if ($user -and $user.SID.Value -ne $state.UserSid) { throw 'SMB account identity changed; inspect before cleanup.' }
+                    if ($user -and $user.Enabled) { Disable-LocalUser -Name $state.UserName }
                 }
                 Get-NetFirewallRule -Name $state.FirewallName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
                 Set-BootTask RestoreBoot
@@ -5735,295 +5791,274 @@ function Get-WindowsMobileSmbWorker {
             Save-State
             $state
         } catch {
-            if ($state) { $state.Error = $_.Exception.Message; if ($Mode -eq 'Activate') { $state.Status = 'ActivationFailed' }; Save-State }
+            if ($state) { $state.Error = $_.Exception.Message; if ($Mode -eq 'Activate') { $state.Status = 'ActivationFailed' } elseif ($Mode -in @('Restore','RestoreBoot')) { $state.Status = "${Mode}Failed" }; Save-State }
             throw
         } finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
     }
 }
 
-function Get-LinuxMobileSmbWorker {
+# Each fragment below performs one normal checkout/check-in task over SSH.
+# Nothing here is installed as a script or a custom startup service on Linux.
+function Get-LinuxSmbSessionScript {
     return @'
-#!/bin/bash
 set -euo pipefail
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-mobile_smb_main() {
-    mode="$1"; root="$2"
-    umask 077
-    if [[ -L /var/lib/mobiles || -L /var/lib/mobiles/smb || -L "$root" ]]; then echo 'Refusing a redirected SMB state directory' >&2; exit 2; fi
-    if [[ -e "$root" && ! -O "$root" ]]; then echo 'SMB state directory is not owned by this privileged account' >&2; exit 2; fi
-    mkdir -p "$root"
-    chmod 700 "$root"
-    exec 9>/run/lock/mobiles-smb.lock
-    if [[ "$mode" != Status ]]; then flock -n 9 || { echo 'Another SMB operation is in progress' >&2; exit 2; }; fi
-    [[ ! -f "$root/environment.sh" ]] || source "$root/environment.sh"
-    state="$root/state.json"
-    save_status() {
-        jq --arg status "$1" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.Status=$status | .UpdatedUtc=$now' "$state" > "$state.tmp"
-        mv -f "$state.tmp" "$state"
-        jq -c . "$state" >> "$root/history.jsonl"
-    }
-    failed() {
-        code=$?
-        trap - ERR
-        if [[ -f "$state" ]]; then save_status "${mode}Failed"; fi
-        echo "SMB $mode failed; inspect $root and journalctl -u mobiles-smb-$(basename "$root")" >&2
-        exit "$code"
-    }
-    trap failed ERR
-    trap 'exit 143' TERM
-    trap 'code=$?; if (( code != 0 )); then trap - EXIT; [[ ! -f "$state" ]] || save_status "${mode}Failed"; fi' EXIT
-    if [[ "$mode" == Status ]]; then
-        if [[ -f "$state" ]]; then cat "$state"; else printf '{"Status":"NotPrepared"}\n'; fi
-        return
-    fi
-    if [[ "$mode" == Prepare ]]; then
-        if [[ -f "$state" ]] && [[ "$(jq -r .Status "$state")" != Restored ]]; then echo 'SMB state already exists; inspect/check in before preparing again' >&2; exit 2; fi
-        for tool in jq nmcli ip mount.cifs findmnt grubby systemctl systemd-escape flock; do command -v "$tool" >/dev/null || { echo "SMB requires $tool; PATH=$PATH" >&2; exit 2; }; done
-        [[ -n "${payload_b64:-}" ]] || { echo 'Missing SMB preparation payload' >&2; exit 2; }
-        payload="$(printf '%s' "$payload_b64" | base64 -d)"
-        printf '%s' "$payload" | jq 'del(.Password,.Worker)' > "$root/options.json"
-        iface="$(jq -r .Interface.InterfaceName "$root/options.json")"
-        address="$(jq -r '.Interface | .IPAddress+"/"+(.PrefixLength|tostring)' "$root/options.json")"
-        # Match the active NetworkManager connection by device; do not choose a similarly named profile.
-        original_uuid="$(nmcli -t -f UUID,DEVICE connection show --active | awk -F: -v dev="$iface" '$2==dev {print $1}')"
-        [[ "$original_uuid" =~ ^[a-fA-F0-9-]{36}$ ]] || { echo 'Selected interface requires one active NetworkManager profile' >&2; exit 2; }
-        ip -o -4 addr show dev "$iface" | awk -v address="$address" '$4==address {found=1} END {exit !found}'
-        id="$(basename "$root")"; unit="mobiles-smb-$id.service"
-        mobile_name="mobiles-smb-$id"
-        getent group "$(jq -r .LinuxGroup "$root/options.json")" >/dev/null || { echo 'Configured SMBLinuxGroup does not exist' >&2; exit 2; }
-        [[ -z "$(nmcli -t -f NAME connection show | grep -Fx "$mobile_name" || true)" ]] || { echo 'Mobile connection name already exists' >&2; exit 2; }
-        fips_before="$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo 0)"
-        normal_kernel="$(grubby --default-kernel)"
-        jq -n --arg original "$original_uuid" --arg iface "$iface" --arg unit "$unit" --arg profile "$mobile_name" \
-            --arg kernel "$normal_kernel" --arg fips "$fips_before" \
-            '{Status:"Preparing",OriginalConnection:$original,InterfaceName:$iface,Unit:$unit,MobileConnection:$profile,OriginalKernel:$kernel,OriginalFips:$fips,MobileKernel:null,MobileInitrd:null,CreatedMountPoints:[],AddedGroupMembers:[],MountDropIns:[],Mounts:[]}' > "$state"
-        printf '%s' "$payload" | jq -r .Worker > "$root/worker.sh"
-        printf 'export PATH=%q\n' "$PATH" > "$root/environment.sh"
-        chmod 700 "$root/worker.sh"
-        while IFS= read -r mount_row; do
-            host="$(printf '%s' "$mount_row" | jq -r .HostName)"
-            target="$(printf '%s' "$mount_row" | jq -r .MountPoint)"
-            if [[ -L /share || -L "/share/$host" || -L "$target" ]] || findmnt -rn --mountpoint "$target" >/dev/null; then echo "Unsafe or mounted target $target" >&2; exit 2; fi
-            if [[ -e "$target" && ! -d "$target" ]]; then echo "Non-directory target $target" >&2; exit 2; fi
-            if [[ -d "$target" ]] && [[ -n "$(ls -A "$target")" ]]; then echo "Mount point $target is not empty" >&2; exit 2; fi
-            for directory in /share "/share/$host" "$target"; do
-                if [[ ! -d "$directory" ]]; then
-                    jq --arg path "$directory" '.CreatedMountPoints += [$path]' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
-                    mkdir "$directory"
-                fi
-            done
-            mount_unit="$(systemd-escape --path --suffix=mount "$target")"
-            drop_in="/etc/systemd/system/$mount_unit.d/50-mobiles-$id.conf"
-            [[ ! -e "$drop_in" ]]
-            jq --arg path "$drop_in" '.MountDropIns += [$path]' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
-            mkdir -p "$(dirname "$drop_in")"
-            printf '[Mount]\nTimeoutSec=30\n' > "$drop_in"
-            credential="$root/credentials-$host"
-            printf 'username=%s\npassword=%s\ndomain=%s\n' "$(printf '%s' "$payload" | jq -r .UserName)" "$(printf '%s' "$payload" | jq -r .Password)" "$(printf '%s' "$mount_row" | jq -r ' .CredentialDomain // .HostName')" > "$credential"
-            chmod 600 "$credential"
-        done < <(jq -c '.Mounts[]' "$root/options.json")
-        unset payload payload_b64
-        nmcli connection clone uuid "$original_uuid" "$mobile_name" >/dev/null
-        nmcli connection modify id "$mobile_name" ipv4.method manual ipv4.addresses "$address" ipv4.gateway '' ipv4.routes '' ipv4.dns '' ipv4.ignore-auto-dns yes ipv4.never-default yes connection.autoconnect no
-        # Keep the original profile unchanged; activate the mobile clone only at boot.
-        if [[ "$fips_before" == 1 ]]; then
-            grubby --info=ALL > "$root/kernel-entries.before"
-            info="$(grubby --info=DEFAULT)"
-            initrd="$(printf '%s\n' "$info" | sed -n 's/^initrd="\(.*\)"$/\1/p')"
-            [[ -f "$normal_kernel" && -f "$initrd" ]] || { echo 'Default kernel/initrd could not be resolved to files' >&2; exit 2; }
-            mobile_kernel="/boot/vmlinuz-mobiles-$id"; mobile_initrd="/boot/initramfs-mobiles-$id.img"
-            [[ ! -e "$mobile_kernel" && ! -e "$mobile_initrd" ]]
-            jq --arg kernel "$mobile_kernel" --arg initrd "$mobile_initrd" '.MobileKernel=$kernel | .MobileInitrd=$initrd' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
-            # Distinct image paths let grubby remove ONLY the mobile entry, even with the same kernel version.
-            cp -p -- "$normal_kernel" "$mobile_kernel"
-            cp -p -- "$initrd" "$mobile_initrd"
-            if command -v restorecon >/dev/null; then restorecon "$mobile_kernel" "$mobile_initrd"; fi
-            grubby --add-kernel="$mobile_kernel" --initrd="$mobile_initrd" --copy-default --title="Mobile SMB $id" --remove-args='fips' --args='fips=0'
-            info="$(grubby --info="$mobile_kernel")"
-            printf '%s\n' "$info" | grep -q 'fips=0'
-            if printf '%s\n' "$info" | grep -q 'fips=1'; then echo 'Mobile entry still enforces FIPS' >&2; exit 2; fi
-            grubby --set-default="$mobile_kernel"
-        fi
-        cat > "/etc/systemd/system/$unit" <<UNIT
-[Unit]
-Description=Mobile SMB network and mounts
-After=NetworkManager.service network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-ExecStart=/usr/bin/timeout 300 /bin/bash $root/worker.sh Activate $root
-RemainAfterExit=yes
-TimeoutStartSec=300
-[Install]
-WantedBy=multi-user.target
-UNIT
-        systemctl daemon-reload
-        systemctl enable "$unit" >/dev/null
-        save_status PreparedPendingReboot
-    else
-        [[ -f "$state" ]] || { echo 'No saved SMB state' >&2; exit 2; }
-        unit="$(jq -r .Unit "$state")"
-        original_uuid="$(jq -r .OriginalConnection "$state")"
-        mobile_name="$(jq -r .MobileConnection "$state")"
-        if [[ "$mode" == Activate ]]; then
-            status="$(jq -r .Status "$state")"
-            [[ "$status" == PreparedPendingReboot || "$status" == Active || "$status" == Activating || "$status" == ActivateFailed ]]
-            save_status Activating
-            [[ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo 0)" == 0 ]] || { echo 'FIPS remains enforced; SMB activation blocked' >&2; exit 2; }
-            nmcli connection modify id "$mobile_name" connection.autoconnect yes connection.autoconnect-priority 999
-            nmcli connection up id "$mobile_name" >/dev/null
-            group="$(jq -r .LinuxGroup "$root/options.json")"
-            while IFS= read -r local_user; do
-                awk -F: -v user="$local_user" '$1==user {found=1} END {exit !found}' /etc/passwd
-                if ! id -nG "$local_user" | tr ' ' '\n' | grep -Fxq "$group"; then
-                    jq --arg user "$local_user" '.AddedGroupMembers += [$user] | .AddedGroupMembers |= unique' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
-                    usermod -aG "$group" "$local_user"
-                fi
-            done < <(jq -r '.LinuxUsers[]' "$root/options.json")
-            # Replace only our own managed block; keep the fstab inode, ownership and SELinux label.
-            id="$(basename "$root")"
-            awk -v begin="# BEGIN MOBILES SMB $id" -v end="# END MOBILES SMB $id" '$0==begin {skip=1;next} $0==end {skip=0;next} !skip' /etc/fstab > "$root/fstab.base"
-            cp "$root/fstab.base" "$root/fstab.new"
-            printf '\n# BEGIN MOBILES SMB %s\n' "$id" >> "$root/fstab.new"
-            while IFS= read -r mount_row; do
-                source="$(printf '%s' "$mount_row" | jq -r .Source)"
-                target="$(printf '%s' "$mount_row" | jq -r .MountPoint)"
-                host="$(printf '%s' "$mount_row" | jq -r .HostName)"
-                # All components are validated controller-side; the address is numeric, never DNS.
-                printf '%s %s cifs credentials=%s/credentials-%s,sec=ntlmssp,vers=3.0,_netdev,nofail,x-systemd.device-timeout=15s,file_mode=0660,dir_mode=0770,gid=%s 0 0\n' \
-                    "$source" "$target" "$root" "$host" "$(jq -r .LinuxGroup "$root/options.json")" >> "$root/fstab.new"
-            done < <(jq -c '.Mounts[]' "$root/options.json")
-            printf '# END MOBILES SMB %s\n' "$id" >> "$root/fstab.new"
-            getent group "$(jq -r .LinuxGroup "$root/options.json")" >/dev/null
-            # Refuse conflicts with user-maintained mount entries.
-            while IFS= read -r target; do
-                if awk -v target="$target" '$1 !~ /^#/ && $2==target {found=1} END {exit !found}' "$root/fstab.base"; then echo "Existing fstab entry for $target" >&2; exit 2; fi
-            done < <(jq -r '.Mounts[].MountPoint' "$root/options.json")
-            cp -p /etc/fstab "$root/fstab.before-activation"
-            cat "$root/fstab.new" > /etc/fstab
-            systemctl daemon-reload
-            jq '.Mounts=[]' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
-            had_failure=false
-            while IFS= read -r mount_row; do
-                target="$(printf '%s' "$mount_row" | jq -r .MountPoint)"
-                success=false
-                mounted=false
-                source="$(printf '%s' "$mount_row" | jq -r .Source)"
-                if findmnt -rn --mountpoint "$target" >/dev/null; then
-                    if [[ "$(findmnt -rn --mountpoint "$target" -o SOURCE)" == "$source" ]]; then mounted=true; fi
-                elif timeout 40 mount "$target"; then mounted=true; fi
-                if [[ "$mounted" == true ]]; then
-                    if timeout 15 /bin/bash -c 'probe="$(mktemp "$1/.mobiles-write-test-XXXXXXXXXX")" && rm -- "$probe"' _ "$target"; then success=true; fi
-                fi
-                jq --arg target "$target" --argjson success "$success" '.Mounts += [{MountPoint:$target,Success:$success}]' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
-                [[ "$success" == true ]] || had_failure=true
-            done < <(jq -c '.Mounts[]' "$root/options.json")
-            [[ "$had_failure" == false ]]
-            save_status Active
-        elif [[ "$mode" == Restore ]]; then
-            [[ "$(jq -r .Status "$state")" != Restored ]] || { cat "$state"; return; }
-            save_status Restoring
-            # Abort if a mount is busy. Never use lazy/forced unmount for deployment data.
-            while IFS= read -r mount_row; do
-                target="$(printf '%s' "$mount_row" | jq -r .MountPoint)"
-                source="$(printf '%s' "$mount_row" | jq -r .Source)"
-                if findmnt -rn --mountpoint "$target" >/dev/null; then
-                    [[ "$(findmnt -rn --mountpoint "$target" -o SOURCE)" == "$source" ]] || { echo "Unexpected mount at $target" >&2; exit 2; }
-                    umount "$target"
-                fi
-            done < <(jq -c '.Mounts[]' "$root/options.json")
-            id="$(basename "$root")"
-            awk -v begin="# BEGIN MOBILES SMB $id" -v end="# END MOBILES SMB $id" '$0==begin {skip=1;next} $0==end {skip=0;next} !skip' /etc/fstab > "$root/fstab.new"
-            cat "$root/fstab.new" > /etc/fstab
-            while IFS= read -r local_user; do
-                if awk -F: -v user="$local_user" '$1==user {found=1} END {exit !found}' /etc/passwd; then
-                    if id -nG "$local_user" | tr ' ' '\n' | grep -Fxq "$(jq -r .LinuxGroup "$root/options.json")"; then gpasswd -d "$local_user" "$(jq -r .LinuxGroup "$root/options.json")" >/dev/null; fi
-                fi
-            done < <(jq -r '.AddedGroupMembers[]' "$state")
-            while IFS= read -r drop_in; do
-                rm -f -- "$drop_in"
-                rmdir -- "$(dirname "$drop_in")" 2>/dev/null || true
-            done < <(jq -r '.MountDropIns[]' "$state")
-            rm -f -- "$root"/credentials-*
-            mobile_kernel="$(jq -r '.MobileKernel // empty' "$state")"
-            if [[ -n "$mobile_kernel" ]]; then
-                current_default="$(grubby --default-kernel)"
-                if [[ "$current_default" == "$mobile_kernel" ]]; then
-                    normal_kernel="$(jq -r .OriginalKernel "$state")"
-                    # Kernel updates may remove the checkout default. Select the newest normal entry in boot order then.
-                    if [[ ! -f "$normal_kernel" ]] || ! grubby --info="$normal_kernel" >/dev/null 2>&1; then
-                        normal_kernel="$(grubby --info=ALL | sed -n 's/^kernel="\(.*\)"$/\1/p' | grep -v '/vmlinuz-mobiles-' | while IFS= read -r path; do [[ ! -f "$path" ]] || { printf '%s\n' "$path"; break; }; done)"
-                    fi
-                    [[ -n "$normal_kernel" && -f "$normal_kernel" ]] || { echo 'No normal kernel available for restoration' >&2; exit 2; }
-                    grubby --set-default="$normal_kernel"
-                fi
-                normal_kernel="$(grubby --default-kernel)"
-                if [[ "$(jq -r .OriginalFips "$state")" == 1 ]]; then
-                    grubby --update-kernel="$normal_kernel" --remove-args='fips' --args='fips=1'
-                    # New packaged entries can inherit the mobile default's fips=0 during updates.
-                    while IFS= read -r path; do
-                        [[ "$path" != *'/vmlinuz-mobiles-'* && -f "$path" ]] || continue
-                        if ! grep -Fxq "kernel=\"$path\"" "$root/kernel-entries.before"; then grubby --update-kernel="$path" --remove-args='fips' --args='fips=1'; fi
-                    done < <(grubby --info=ALL | sed -n 's/^kernel="\(.*\)"$/\1/p')
-                fi
-                if grubby --info="$mobile_kernel" >/dev/null 2>&1; then grubby --remove-kernel="$mobile_kernel"; fi
-                rm -f -- "$mobile_kernel" "$(jq -r .MobileInitrd "$state")"
-            fi
-            # The next boot restores the untouched original NM profile, so SSH stays up for cleanup now.
-            cat > "/etc/systemd/system/$unit" <<UNIT
-[Unit]
-Description=Restore mobile network configuration
-After=NetworkManager.service network-online.target
-Wants=network-online.target
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $root/worker.sh RestoreBoot $root
-RemainAfterExit=yes
-TimeoutStartSec=300
-[Install]
-WantedBy=multi-user.target
-UNIT
-            systemctl daemon-reload
-            systemctl enable "$unit" >/dev/null
-            save_status RestorePendingReboot
-        elif [[ "$mode" == RestoreBoot ]]; then
-            nmcli connection up uuid "$original_uuid" >/dev/null
-            if nmcli connection show id "$mobile_name" >/dev/null 2>&1; then nmcli connection delete id "$mobile_name" >/dev/null; fi
-            [[ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo 0)" == "$(jq -r .OriginalFips "$state")" ]] || { echo 'Original FIPS enforcement has not been restored' >&2; exit 2; }
-            while IFS= read -r target; do rmdir -- "$target" 2>/dev/null || true; done < <(jq -r '.CreatedMountPoints | reverse[]' "$state")
-            systemctl disable "$unit" >/dev/null
-            rm -f -- "/etc/systemd/system/$unit"
-            systemctl daemon-reload
-            save_status Restored
-        else
-            echo 'Unknown SMB worker mode' >&2; exit 2
-        fi
-    fi
-    cat "$state"
+export LC_ALL=C
+umask 077
+state="$root/state.json"
+if [[ -L /var/lib/mobiles || -L /var/lib/mobiles/smb || -L "$root" ]]; then echo 'Redirected SMB state directory' >&2; exit 2; fi
+if [[ -e "$root" && ! -O "$root" ]]; then echo 'SMB state is not owned by the privileged account' >&2; exit 2; fi
+mkdir -p "$root"; chmod 700 "$root"
+exec 9>/run/lock/mobiles-smb.lock
+flock -n 9 || { echo 'Another SMB operation is running; stop the old mobiles-smb service if necessary' >&2; exit 2; }
+save_state() { jq "$@" "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"; }
+finish() { save_state --arg status "$1" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.Status=$status | .UpdatedUtc=$now'; jq -c . "$state" >> "$root/history.jsonl"; cat "$state"; }
+'@
 }
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then mobile_smb_main "$@"; fi
+
+function Get-LinuxSmbNetworkScript {
+    param([switch]$Restore)
+    if ($Restore) { return @'
+original_uuid="$(jq -r .OriginalConnection "$state")"
+if jq -e '.OriginalNetwork != null' "$state" >/dev/null; then
+    settings=()
+    while IFS= read -r key; do settings+=("$key" "$(jq -r --arg key "$key" '.OriginalNetwork[$key]' "$state")"); done < <(jq -r '.OriginalNetwork | keys[]' "$state")
+    nmcli connection modify uuid "$original_uuid" "${settings[@]}"
+else
+    # Earlier deployments used an untouched original profile and a mobile clone.
+    mobile_name="$(jq -r '.MobileConnection // empty' "$state")"
+    if [[ -n "$mobile_name" ]] && nmcli connection show id "$mobile_name" >/dev/null 2>&1; then
+        nmcli connection modify id "$mobile_name" connection.autoconnect no
+        save_state '.LegacyProfileRetained=true'
+    fi
+fi
+'@ }
+    return @'
+iface="$(jq -r .Interface.InterfaceName "$root/options.json")"
+address="$(jq -r '.Interface | .IPAddress+"/"+(.PrefixLength|tostring)' "$root/options.json")"
+original_uuid="$(nmcli -t -f UUID,DEVICE connection show --active | awk -F: -v dev="$iface" '$2==dev {print $1}')"
+[[ "$original_uuid" =~ ^[a-fA-F0-9-]{36}$ ]] || { echo 'One active NetworkManager connection is required' >&2; exit 2; }
+ip -o -4 address show dev "$iface" | awk -v address="$address" '$4==address {found=1} END {exit !found}'
+save_state --arg uuid "$original_uuid" --arg iface "$iface" '.OriginalConnection=$uuid | .InterfaceName=$iface | .OriginalNetwork={}'
+for key in connection.autoconnect ipv4.method ipv4.addresses; do
+    value="$(nmcli -t --escape no -f "$key" connection show uuid "$original_uuid")"; value="${value#*:}"
+    save_state --arg key "$key" --arg value "$value" '.OriginalNetwork[$key]=$value'
+done
+# Modify the saved profile only. Do not call connection up/down or device reapply.
+nmcli connection modify uuid "$original_uuid" ipv4.method manual ipv4.addresses "$address" connection.autoconnect yes
+'@
+}
+
+function Get-LinuxSmbBootScript {
+    param([switch]$Restore)
+    if ($Restore) { return @'
+mobile_kernel="$(jq -r '.MobileKernel // empty' "$state")"
+if [[ -n "$mobile_kernel" ]]; then
+    normal_kernel="$(grubby --default-kernel)"
+    if [[ "$normal_kernel" == "$mobile_kernel" ]]; then
+        normal_kernel="$(jq -r .OriginalKernel "$state")"
+        if [[ ! -f "$normal_kernel" ]] || ! grubby --info="$normal_kernel" >/dev/null 2>&1; then
+            normal_kernel="$(grubby --info=ALL | sed -n 's/^kernel="\(.*\)"$/\1/p' | grep -v '/vmlinuz-mobiles-' | while IFS= read -r path; do [[ ! -f "$path" ]] || { printf '%s\n' "$path"; break; }; done)"
+        fi
+        [[ -n "$normal_kernel" && -f "$normal_kernel" ]] || { echo 'No normal kernel available' >&2; exit 2; }
+        grubby --set-default="$normal_kernel"
+    fi
+    if [[ "$(jq -r .OriginalFips "$state")" == 1 ]]; then
+        grubby --update-kernel="$normal_kernel" --remove-args=fips --args=fips=1
+        while IFS= read -r path; do
+            [[ "$path" != *'/vmlinuz-mobiles-'* && -f "$path" ]] || continue
+            if ! grep -Fxq "kernel=\"$path\"" "$root/kernel-entries.before"; then grubby --update-kernel="$path" --remove-args=fips --args=fips=1; fi
+        done < <(grubby --info=ALL | sed -n 's/^kernel="\(.*\)"$/\1/p')
+    fi
+    if grubby --info="$mobile_kernel" >/dev/null 2>&1; then grubby --remove-kernel="$mobile_kernel"; fi
+    rm -f -- "$mobile_kernel" "$(jq -r .MobileInitrd "$state")"
+fi
+'@ }
+    return @'
+fips="$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo 0)"
+normal_kernel="$(grubby --default-kernel)"
+save_state --arg fips "$fips" --arg kernel "$normal_kernel" '.OriginalFips=$fips | .OriginalKernel=$kernel'
+if [[ "$fips" == 1 ]]; then
+    grubby --info=ALL > "$root/kernel-entries.before"
+    initrd="$(grubby --info=DEFAULT | sed -n 's/^initrd="\(.*\)"$/\1/p')"
+    [[ -f "$normal_kernel" && -f "$initrd" ]] || { echo 'Default kernel/initramfs is not a single file' >&2; exit 2; }
+    mobile_kernel="/boot/vmlinuz-mobiles-$id"; mobile_initrd="/boot/initramfs-mobiles-$id.img"
+    [[ ! -e "$mobile_kernel" && ! -e "$mobile_initrd" ]]
+    save_state --arg kernel "$mobile_kernel" --arg initrd "$mobile_initrd" '.MobileKernel=$kernel | .MobileInitrd=$initrd'
+    cp -p -- "$normal_kernel" "$mobile_kernel"; cp -p -- "$initrd" "$mobile_initrd"
+    if command -v restorecon >/dev/null; then restorecon "$mobile_kernel" "$mobile_initrd"; fi
+    grubby --add-kernel="$mobile_kernel" --initrd="$mobile_initrd" --copy-default --title="Mobile SMB $id" --remove-args=fips --args=fips=0
+    info="$(grubby --info="$mobile_kernel")"
+    printf '%s\n' "$info" | grep -q 'fips=0'
+    if printf '%s\n' "$info" | grep -q 'fips=1'; then echo 'Mobile entry still enforces FIPS' >&2; exit 2; fi
+    grubby --set-default="$mobile_kernel"
+fi
+'@
+}
+
+function Get-LinuxSmbMountScript {
+    param([switch]$Restore)
+    # Build the fstab without our managed block; preserve its inode and other entries.
+    $removeBlock = @'
+awk -v begin="# BEGIN MOBILES SMB $id" -v end="# END MOBILES SMB $id" '$0==begin {skip=1;next} $0==end {skip=0;next} !skip' /etc/fstab > "$root/fstab.base"
+'@
+    if ($Restore) { return @'
+while IFS= read -r row; do
+    target="$(printf '%s' "$row" | jq -r .MountPoint)"; source="$(printf '%s' "$row" | jq -r .Source)"
+    if [[ "$(jq -r '.Version // 1' "$state")" == 2 ]] && ! jq -e --arg path "$target" '.ManagedMountPoints | index($path) != null' "$state" >/dev/null; then continue; fi
+    if findmnt -rn -t cifs --mountpoint "$target" >/dev/null; then
+        [[ "$(findmnt -rn -t cifs --mountpoint "$target" -o SOURCE)" == "$source" ]] || { echo "Unexpected mount at $target" >&2; exit 2; }
+        umount "$target" # A busy mount aborts cleanup. No force/lazy unmount.
+    fi
+    automount="$(systemd-escape --path --suffix=automount "$target")"
+    if systemctl is-active --quiet "$automount"; then systemctl stop "$automount"; fi
+done < <(jq -c '.Mounts[]' "$root/options.json")
+'@ + "`n" + $removeBlock + "`n" + @'
+cat "$root/fstab.base" > /etc/fstab
+while IFS= read -r drop_in; do rm -f -- "$drop_in"; rmdir -- "$(dirname "$drop_in")" 2>/dev/null || true; done < <(jq -r '.MountDropIns[]?' "$state")
+rm -f -- "$root"/credentials-*
+while IFS= read -r target; do rmdir -- "$target" 2>/dev/null || true; done < <(jq -r '.CreatedMountPoints | reverse[]' "$state")
+systemctl daemon-reload
+'@ }
+    return $removeBlock + "`n" + @'
+cp "$root/fstab.base" "$root/fstab.new"
+printf '\n# BEGIN MOBILES SMB %s\n' "$id" >> "$root/fstab.new"
+while IFS= read -r row; do
+    host="$(printf '%s' "$row" | jq -r .HostName)"; target="$(printf '%s' "$row" | jq -r .MountPoint)"
+    source="$(printf '%s' "$row" | jq -r .Source)"; authority="$(printf '%s' "$row" | jq -r '.CredentialDomain // .HostName')"
+    if [[ -L /share || -L "/share/$host" || -L "$target" ]] || findmnt -rn --mountpoint "$target" >/dev/null; then echo "Unsafe/mounted target $target" >&2; exit 2; fi
+    if [[ -e "$target" && ( ! -d "$target" || -n "$(ls -A "$target")" ) ]]; then echo "Mount target is not an empty directory: $target" >&2; exit 2; fi
+    if awk -v target="$target" '$1 !~ /^#/ && $2==target {found=1} END {exit !found}' "$root/fstab.base"; then echo "Existing fstab entry for $target" >&2; exit 2; fi
+    save_state --arg path "$target" '.ManagedMountPoints += [$path]'
+    for directory in /share "/share/$host" "$target"; do
+        if [[ ! -d "$directory" ]]; then save_state --arg path "$directory" '.CreatedMountPoints += [$path]'; mkdir -m 0755 "$directory"; fi
+    done
+    credential="$root/credentials-$host"
+    printf 'username=%s\npassword=%s\ndomain=%s\n' "$(printf '%s' "$payload" | jq -r .UserName)" "$(printf '%s' "$payload" | jq -r .Password)" "$authority" > "$credential"
+    chmod 600 "$credential"
+    printf '%s %s cifs credentials=%s,sec=ntlmssp,vers=3.0,_netdev,nofail,x-systemd.automount,file_mode=0660,dir_mode=0770,gid=%s 0 0\n' "$source" "$target" "$credential" "$(jq -r .LinuxGroup "$root/options.json")" >> "$root/fstab.new"
+done < <(jq -c '.Mounts[]' "$root/options.json")
+printf '# END MOBILES SMB %s\n' "$id" >> "$root/fstab.new"
+cat "$root/fstab.new" > /etc/fstab
+unset payload
+# fstab is picked up at reboot. Do not start mounts or reload units here.
+'@
+}
+
+function Get-LinuxSmbGroupScript {
+    param([switch]$Restore)
+    if ($Restore) { return @'
+while IFS= read -r user; do
+    if awk -F: -v user="$user" '$1==user {found=1} END {exit !found}' /etc/passwd && id -nG "$user" | tr ' ' '\n' | grep -Fxq "$(jq -r .LinuxGroup "$root/options.json")"; then
+        gpasswd -d "$user" "$(jq -r .LinuxGroup "$root/options.json")" >/dev/null
+    fi
+done < <(jq -r '.AddedGroupMembers[]?' "$state")
+'@ }
+    return @'
+group="$(jq -r .LinuxGroup "$root/options.json")"
+while IFS= read -r user; do
+    awk -F: -v user="$user" '$1==user {found=1} END {exit !found}' /etc/passwd
+    if ! id -nG "$user" | tr ' ' '\n' | grep -Fxq "$group"; then
+        save_state --arg user "$user" '.AddedGroupMembers += [$user] | .AddedGroupMembers |= unique'
+        usermod -aG "$group" "$user"
+    fi
+done < <(jq -r '.LinuxUsers[]' "$root/options.json")
+cat "$state"
+'@
+}
+
+function Get-LinuxSmbStatusScript {
+    param([switch]$VerifyMounts)
+    $verify = if ($VerifyMounts) { 'true' } else { 'false' }
+    return "verify_mounts=$verify`n" + @'
+boot_id="$(cat /proc/sys/kernel/random/boot_id)"; fips="$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo 0)"
+restoring="$(jq -r '.Status == "RestorePendingReboot" or .Status == "Restored"' "$state")"
+results='[]'; ready=true
+if [[ "$restoring" == true ]]; then
+    expected="$(jq -r .OriginalFips "$state")"
+    iface="$(jq -r .InterfaceName "$state")"
+    active_uuid="$(nmcli -t -f UUID,DEVICE connection show --active | awk -F: -v dev="$iface" '$2==dev {print $1}')"
+    if [[ "$boot_id" == "$(jq -r '.RestoreBootId // ""' "$state")" || "$fips" != "$expected" || "$active_uuid" != "$(jq -r .OriginalConnection "$state")" ]] || ! ip -o -4 address show up dev "$iface" scope global | awk 'END {exit NR==0}'; then status=RestorePendingReboot
+    else status=Restored; save_state '.Status="Restored"'; fi
+else
+    if [[ "$boot_id" == "$(jq -r '.PreparedBootId // ""' "$state")" ]]; then status=PreparedPendingReboot
+    elif [[ "$fips" != 0 ]] || ! ip -o -4 address show dev "$(jq -r .Interface.InterfaceName "$root/options.json")" | awk -v ip="$(jq -r .Interface.IPAddress "$root/options.json")" '$4 ~ "^" ip "/" {found=1} END {exit !found}'; then status=NeedsReview
+    else
+        if [[ "$verify_mounts" == true ]]; then systemctl daemon-reload; fi
+        while IFS= read -r row; do
+            target="$(printf '%s' "$row" | jq -r .MountPoint)"; source="$(printf '%s' "$row" | jq -r .Source)"; success=false
+            if [[ "$verify_mounts" == true ]]; then timeout 40 systemctl start "$(systemd-escape --path --suffix=mount "$target")" >/dev/null 2>&1 || true; fi
+            if [[ "$(findmnt -rn -t cifs --mountpoint "$target" -o SOURCE 2>/dev/null || true)" == "$source" ]]; then
+                success=true
+                if [[ "$verify_mounts" == true ]] && ! timeout 15 /bin/bash -c 'probe="$(mktemp "$1/.mobiles-write-test-XXXXXXXXXX")" && rm -- "$probe"' _ "$target"; then success=false; fi
+            fi
+            results="$(printf '%s' "$results" | jq --arg path "$target" --arg source "$source" --argjson success "$success" '. + [{MountPoint:$path,Source:$source,Success:$success}]')"
+            [[ "$success" == true ]] || ready=false
+        done < <(jq -c '.Mounts[]' "$root/options.json")
+        status=NeedsReview; [[ "$ready" != true ]] || status=Active
+    fi
+fi
+jq --arg status "$status" --arg fips "$fips" --argjson mounts "$results" '.Status=$status | .CurrentFips=$fips | .Mounts=$mounts' "$state"
 '@
 }
 
 function Get-LinuxMobileSmbScript {
-    param([Parameter(Mandatory)][ValidateSet('Prepare','Restore','Status')][string]$Mode,
+    param([Parameter(Mandatory)][ValidateSet('Prepare','Group','Restore','Status','Verify')][string]$Mode,
         [Parameter(Mandatory)][string]$Id, $Options, [pscredential]$Credential)
     if ($Id -notmatch '^[a-f0-9]{20}$') { throw 'Invalid SMB deployment state ID.' }
-    $root = "/var/lib/mobiles/smb/$Id"
-    $prefix = "export PATH=$(ConvertTo-BashArgument (Get-MobileSmbToolPath))`n"
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add("export PATH=$(ConvertTo-BashArgument (Get-MobileSmbToolPath))`nid='$Id'`nroot='/var/lib/mobiles/smb/$Id'")
+    $parts.Add((Get-LinuxSmbSessionScript))
     if ($Mode -eq 'Prepare') {
         $Options | Add-Member -NotePropertyName Password -NotePropertyValue $Credential.GetNetworkCredential().Password -Force
-        $Options | Add-Member -NotePropertyName Worker -NotePropertyValue (Get-LinuxMobileSmbWorker) -Force
         try { $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Options | ConvertTo-Json -Depth 12 -Compress))) }
-        finally { $Options.PSObject.Properties.Remove('Password'); $Options.PSObject.Properties.Remove('Worker') }
-        # Source definitions, rather than running the script's CLI footer during preparation.
-        $worker = (Get-LinuxMobileSmbWorker) -replace '(?m)^if \[\[ "\$\{BASH_SOURCE\[0\]\}" == "\$0" \]\]; then mobile_smb_main "\$@"; fi\s*$', ''
-        $body = $prefix + "payload_b64='$payload'`n" + $worker + "`n" + $prefix + "mobile_smb_main Prepare '$root'"
+        finally { $Options.PSObject.Properties.Remove('Password') }
+        $parts.Add("payload=`$(printf '%s' '$payload' | base64 -d)")
+        $parts.Add(@'
+if [[ -f "$state" ]] && [[ "$(jq -r .Status "$state")" != Restored ]]; then echo 'Saved SMB state exists; check it in first' >&2; exit 2; fi
+for tool in jq nmcli ip mount.cifs findmnt grubby systemctl systemd-escape flock; do command -v "$tool" >/dev/null || { echo "SMB requires $tool" >&2; exit 2; }; done
+printf '%s' "$payload" | jq 'del(.Password)' > "$root/options.json"
+getent group "$(jq -r .LinuxGroup "$root/options.json")" >/dev/null || { echo 'SMBLinuxGroup does not exist' >&2; exit 2; }
+jq -n --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --arg fips "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo 0)" '{Version:2,OriginalFips:$fips,Status:"Preparing",PreparedBootId:$boot,CreatedMountPoints:[],ManagedMountPoints:[],AddedGroupMembers:[],MobileKernel:null,MobileInitrd:null}' > "$state"
+'@)
+        $parts.Add((Get-LinuxSmbNetworkScript)); $parts.Add((Get-LinuxSmbBootScript)); $parts.Add((Get-LinuxSmbMountScript))
+        $parts.Add("finish PreparedPendingReboot")
     } else {
-        $body = $prefix + "if [[ -f '$root/worker.sh' ]]; then /bin/bash '$root/worker.sh' $Mode '$root'; else printf '{`"Status`":`"NotPrepared`"}\n'; fi"
+        $parts.Add('if [[ ! -f "$state" ]]; then printf ''{"Status":"NotPrepared"}\n''; exit 0; fi')
+        switch ($Mode) {
+            Group { $parts.Add((Get-LinuxSmbGroupScript)) }
+            Restore {
+                $parts.Add('if [[ "$(jq -r .Status "$state")" == Restored ]]; then cat "$state"; exit 0; fi')
+                $parts.Add(@'
+# Stop/remove the old deployment service if this host used the previous implementation.
+unit="mobiles-smb-$id.service"
+if [[ -f "/etc/systemd/system/$unit" ]]; then systemctl disable "$unit" >/dev/null; systemctl stop "$unit"; rm -f "/etc/systemd/system/$unit"; fi
+rm -f -- "$root/worker.sh" "$root/environment.sh"
+'@)
+                $parts.Add((Get-LinuxSmbMountScript -Restore)); $parts.Add((Get-LinuxSmbGroupScript -Restore)); $parts.Add((Get-LinuxSmbNetworkScript -Restore)); $parts.Add((Get-LinuxSmbBootScript -Restore))
+                $parts.Add('save_state --arg boot "$(cat /proc/sys/kernel/random/boot_id)" ''.RestoreBootId=$boot''')
+                $parts.Add('finish RestorePendingReboot')
+            }
+            Status { $parts.Add((Get-LinuxSmbStatusScript)) }
+            Verify { $parts.Add((Get-LinuxSmbStatusScript -VerifyMounts)) }
+        }
     }
     $delimiter = 'MOBILE_SMB_' + [guid]::NewGuid().ToString('N')
-    "dzdo bash <<'$delimiter'`n$body`n$delimiter`n"
+    # Normalize the entire outbound script; executable content is never encoded inside JSON.
+    ("dzdo bash <<'$delimiter'`n" + ($parts -join "`n") + "`n$delimiter`n").Replace("`r`n", "`n").Replace("`r", "`n")
+}
+
+function New-LinuxTask-SmbGroup {
+    param([Parameter(Mandatory)][string]$Id)
+    $scriptText = Get-LinuxMobileSmbScript -Mode Group -Id $Id
+    @"
+if smb_group_result=`$($scriptText
+); then
+    record_action 'SMB' 'Local mount access group' 'Success' "`$smb_group_result"
+else
+    record_failure 'Could not configure local SMB group membership'
+    record_action 'SMB' 'Local mount access group' 'Failed'
+fi
+"@
 }
 
 function Get-MobileSmbPlanPath {
@@ -6070,7 +6105,7 @@ function Initialize-MobileSmbDeployment {
         foreach ($computer in $MobileData.Windows) {
             $inventory = @(Invoke-Command -ComputerName $computer -ScriptBlock (Get-WindowsMobileSmbInventory) -ArgumentList $userName -ErrorAction Stop)
             if ($inventory.Count -ne 1 -or -not @($inventory[0].Drives).Count) { throw "Incomplete SMB inventory from '$computer'." }
-            if ($inventory[0].AccountExists) { throw "SMB account '$userName' already exists on $computer. No passwords were changed." }
+            if ($inventory[0].AccountExists) { Write-Host "[+] $computer will reuse SMB account '$userName'; supply its current password." }
             [pscustomobject]@{ HostName = $computer; Interface = (Select-MobileSmbInterface -HostName $computer -Candidates @($inventory[0].Interfaces)); Drives = @($inventory[0].Drives); LocalAuthority = $inventory[0].LocalAuthority; Status = 'NotPrepared' }
         }
     )
@@ -6198,10 +6233,11 @@ function Restore-MobileSmbDeployment {
 
 function Show-MobileSmbStatus {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$MobileName)
+    param([Parameter(Mandatory)][string]$MobileName, [switch]$VerifyMounts)
     $plan = Read-MobileSmbPlan $MobileName
     if (-not $plan) { throw "No saved SMB deployment for '$MobileName'." }
     $run = New-MobileRunLog -MobileName $MobileName -Procedure 'SMB-Status'
+    $linuxMode = if ($VerifyMounts) { 'Verify' } else { 'Status' }
     $states = @(
         foreach ($hostInfo in $plan.Windows) {
             try {
@@ -6213,8 +6249,8 @@ function Show-MobileSmbStatus {
         }
         foreach ($hostInfo in $plan.Linux) {
             try {
-                $raw = @(Invoke-Linux -Computers @($hostInfo.HostName) -Script (Get-LinuxMobileSmbScript -Mode Status -Id $plan.Id) -KeyPath $script:Config.SSHKeyPath)
-                if ($raw.Count -ne 1 -or $raw[0].ExitCode -ne 0) { $raw = @(Invoke-Linux -Computers @($hostInfo.Interface.IPAddress) -Script (Get-LinuxMobileSmbScript -Mode Status -Id $plan.Id) -KeyPath $script:Config.SSHKeyPath) }
+                $raw = @(Invoke-Linux -Computers @($hostInfo.HostName) -Script (Get-LinuxMobileSmbScript -Mode $linuxMode -Id $plan.Id) -KeyPath $script:Config.SSHKeyPath)
+                if ($raw.Count -ne 1 -or $raw[0].ExitCode -ne 0) { $raw = @(Invoke-Linux -Computers @($hostInfo.Interface.IPAddress) -Script (Get-LinuxMobileSmbScript -Mode $linuxMode -Id $plan.Id) -KeyPath $script:Config.SSHKeyPath) }
                 if ($raw.Count -ne 1) { throw 'No response.' }
                 $state = ConvertFrom-MobileSmbLinuxResult $raw[0]
                 [pscustomobject]@{ HostName = $hostInfo.HostName; IPAddress = $hostInfo.Interface.IPAddress; Platform = 'Linux'; Status = $state.Status; Details = $state }
@@ -6363,6 +6399,7 @@ function Register-MobileDeployment {
 
         if ($mobileData.Linux.Count -gt 0) {
             $linSplat = @{ allUsers = $mobileData.AllUsers; Hooks = $linuxHooks; MobileName = $MobileName; RunId = $run.Id }
+            if ($smbPlan) { $linSplat.SmbId = $smbPlan.Id }
             if ($disjoin) {
                 $linSplat['disjoin'] = $true
                 $linSplat['b64kt'] = $LinuxDisjoinKeytab
