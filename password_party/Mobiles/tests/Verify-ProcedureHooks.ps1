@@ -9,7 +9,7 @@ if ($errors.Count) { throw ($errors.Message -join '; ') }
 $names = @('ConvertTo-MobileLogLines', 'Format-MobileRunEvent', 'Show-MobileRunLog', 'Get-MobileProcedureHooks', 'Write-MobileRunEvent', 'New-MobileRunLog', 'Get-WindowsProcedureHookRunner',
     'Get-LinuxProcedureHookScript', 'ConvertTo-BashArgument', 'Get-LinuxDeployScript', 'Get-LinuxUnregisterScript',
     'New-LinuxTask-LeaveDomain', 'Get-DeploymentTaskSelection', 'Test-DeploymentTaskPlan',
-    'Register-MobileDeployment', 'Unregister-Deployment')
+    'Register-MobileDeployment', 'Unregister-Deployment', 'Read-MobileSmbPlan', 'Get-MobileSmbPlanPath', 'Get-MobileSmbId')
 $source = $ast.EndBlock.Statements | Where-Object {
     ($_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in $names) -or
     ($_ -is [System.Management.Automation.Language.TypeDefinitionAst] -and $_.Name -in @('GroupType', 'LinuxAccountType')) -or
@@ -134,6 +134,7 @@ try {
             [pscustomobject]@{ PSComputerName = 'fixture-host'; Success = $true
                 Actions = @([pscustomobject]@{ Category = 'Fixture'; Name = 'Built-in action'; Status = 'Success'; Details = [pscustomobject]@{ Nested = [pscustomobject]@{ Items = @('one', 'two') }; StdOut = "line one`nline two" } }); Failures = @() }
         }
+        $script:Config.DeploymentTasks.Windows.PostDeployment = @('UserRights')
         Register-MobileDeployment -MobileName fixture
         Unregister-Deployment -MobileName fixture
         $logs = @(Get-ChildItem "$fixture/logs" -Filter '*.jsonl')

@@ -5,6 +5,8 @@ Put self-contained scripts directly in these folders:
 - `Check-out`: runs during `Register-MobileDeployment`, after provisioning and before account verification/domain departure.
 - `Check-in`: runs during `Unregister-Deployment`, before archive/account cleanup.
 
+When restoring a saved SMB deployment, check-in hooks run once before all SMB teardown, followed by ordinary cleanup. See [SMB workflow](../SMB.md).
+
 Windows hosts receive only `.ps1` files. Linux hosts receive only `.sh` files. Other files and subdirectories are ignored. Scripts run in filename order; names such as `10-configure.ps1` and `20-verify.ps1` make the order clear. Discovery snapshots the content once per procedure run, so every applicable host receives the same version even if the local files change during deployment. Script hashes identify the executed snapshots in the audit log. Linux CRLF line endings are normalized to LF before hashing/execution.
 
 Hooks run on each target, not on the administrator machine. PowerShell uses a separate noninteractive process in the WinRM account context. Linux uses a separate Bash process via `dzdo`. Linux targets need `bash`, `base64`, `jq`, and the `timeout` utility. Each hook has a five-minute timeout. A PowerShell error or nonzero exit code, or a nonzero Bash exit code, fails that hook. All selected hooks are attempted; failure blocks check-out domain departure or check-in built-in cleanup on that host.

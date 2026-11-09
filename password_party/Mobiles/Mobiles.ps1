@@ -18,6 +18,9 @@ param(
     [Parameter(ParameterSetName = 'Preflight')]
     [ValidateRange(1, 1440)][int]$ScanTimeoutMinutes,
 
+    [Parameter(Mandatory = $true, ParameterSetName = 'SmbStatus')]
+    [switch]$SmbStatus,
+
     # --- Mode Switches ---
     [Parameter(Mandatory = $true, ParameterSetName = 'Info')]
     [switch]$Info,
@@ -47,6 +50,7 @@ param(
     [switch]$Archive,
 
     # --- Target Name ---
+    [Parameter(Mandatory = $true, ParameterSetName = 'SmbStatus', Position = 0)]
     [Parameter(Mandatory = $true, ParameterSetName = 'Preflight', Position = 0)]
     [Parameter(Mandatory = $false, ParameterSetName = 'Info', Position = 0)]
     [Parameter(Mandatory = $true, ParameterSetName = 'RegisterDeployment', Position = 0)]
@@ -61,6 +65,12 @@ param(
 
     [Parameter(ParameterSetName = 'RegisterDeployment')]
     [switch]$Disjoin,
+
+    [Parameter(ParameterSetName = 'RegisterDeployment')]
+    [string[]]$SmbHosts,
+
+    [Parameter(ParameterSetName = 'RegisterDeployment')]
+    [pscredential]$SmbCredential,
 
     # Prepared keytab credential for Linux departure; never a plaintext password.
     [Parameter(ParameterSetName = 'RegisterDeployment')]
@@ -115,6 +125,8 @@ if ($PSBoundParameters.ContainsKey('Verbose')) {
 }
 
 switch ($PSCmdlet.ParameterSetName) {
+    'SmbStatus' { Show-MobileSmbStatus -MobileName $Name @passThru }
+
     'Preflight' {
         foreach ($option in @('SkipScans', 'Rescan', 'ForceScan', 'DefinitionMaxAgeDays', 'ScanTimeoutMinutes')) {
             if ($PSBoundParameters.ContainsKey($option)) { $passThru[$option] = $PSBoundParameters[$option] }
@@ -134,7 +146,7 @@ switch ($PSCmdlet.ParameterSetName) {
 
     'GPORemove' { Set-MobileGpoPermission -MobileName $Name -Remove -Force:$Force @passThru }
 
-    'RegisterDeployment' { Register-MobileDeployment -MobileName $Name -Disjoin:$Disjoin -LinuxDisjoinKeytab $LinuxDisjoinKeytab -DomainController $DomainController -DomainPrincipal $DomainPrincipal -DomainKeyVersion $DomainKeyVersion @passThru }
+    'RegisterDeployment' { Register-MobileDeployment -MobileName $Name -SmbHosts $SmbHosts -SmbCredential $SmbCredential -Disjoin:$Disjoin -LinuxDisjoinKeytab $LinuxDisjoinKeytab -DomainController $DomainController -DomainPrincipal $DomainPrincipal -DomainKeyVersion $DomainKeyVersion @passThru }
 
     'UnRegisterDeployment' { UnRegister-Deployment -MobileName $Name -Archive:$Archive @passThru }
     'NewMobile' { New-MobileDeployment @passThru }

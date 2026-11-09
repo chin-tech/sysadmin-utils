@@ -29,6 +29,7 @@
         'Set-MobileConfig'
         'Show-MobileRunLog'
         'Invoke-MobilePreflight'
+        'Show-MobileSmbStatus'
         'Initialize-Environment'
     )
 
@@ -51,6 +52,7 @@
                 adminRoot = "C:\TEMP"
                 nfsHomeRoot   = "C:\TEMP\"
                 SMBUser       = 'mobile-smb-access'
+                SMBLinuxGroup = 'users' # Local Linux group allowed to access mounted shares.
 
                 Preflight = @{
                     DefinitionMaxAgeDays = 30

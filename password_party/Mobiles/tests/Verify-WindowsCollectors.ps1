@@ -8,7 +8,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
 if ($issues.Count) { throw ($issues.Message -join "`n") }
 $names = @('Test-DeploymentTaskPlan', 'Get-DeploymentTaskSelection', 'Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
     'Get-WindowsInformationBlock', 'Get-WindowsCollector-DiskSpace', 'Get-WindowsCollector-SecurityUpdates',
-    'Get-TaskData', 'New-WindowsPostTask-NetworkSharing', 'New-WindowsPostTask-UserRights', 'Get-PostDeployScript')
+    'Get-TaskData', 'New-WindowsPostTask-UserRights', 'Get-PostDeployScript')
 $definitions = $ast.FindAll({ param($node)
     ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names) -or
     ($node -is [System.Management.Automation.Language.TypeDefinitionAst] -and $node.Name -eq 'TaskTriggerType') -or
@@ -91,8 +91,6 @@ try {
         Assert ($block.ToString().Contains('IvantiCoreServer') -and $block.ToString().Contains('AVDefsRevision')) 'Composed summary omitted new telemetry'
         # Optional post-deployment fragments must compose into executable PowerShell.
         $payloads = @(
-            New-WindowsPostTask-NetworkSharing
-            New-WindowsPostTask-NetworkSharing -DriveLetters C, D
             foreach ($sharing in @($false, $true)) {
                 foreach ($linux in @($false, $true)) {
                     New-WindowsPostTask-UserRights -Sharing:$sharing -HasLinux:$linux
@@ -112,6 +110,9 @@ try {
         function Get-WindowsTask-LogArchiver { { 'fixture log archiver' } }
         $scheduled = @(Get-TaskData -hasLinux:$false)
         Assert (($scheduled.TaskName -join ',') -eq 'Mobile-LogArchiver,Mobile-DisjoinTask') 'Default scheduled selection changed'
+        $script:Config.DeploymentTasks.Windows.PostDeployment = @('NetworkSharing')
+        $scheduled = @(Get-TaskData -hasLinux:$false)
+        Assert ($scheduled.Count -eq 1 -and $scheduled[0].TaskName -eq 'Mobile-LogArchiver') 'Coordinated sharing registered an obsolete startup payload'
         $script:Config.DeploymentTasks.Windows.PostDeployment = @()
         $postScript = Get-PostDeployScript
         Assert (-not $postScript.Contains('secedit') -and -not $postScript.Contains('New-SmbShare')) 'Disabled post-deployment tasks were assembled'

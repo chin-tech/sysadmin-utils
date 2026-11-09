@@ -38,6 +38,7 @@ $script:Config = [PSCustomObject]@{
     DeploymentTasks    = $manifestCfg.DeploymentTasks
     Preflight          = $manifestCfg.Preflight
     SMBUser            = $manifestCfg.SMBUser
+    SMBLinuxGroup      = $manifestCfg.SMBLinuxGroup
     NfsHome            = (Join-Path $nfsRoot $env:USERNAME)
     MobileEntries      = (Join-Path $mobileRoot 'entries')
     mobileDefaultUsers = (Join-Path $mobileRoot '.default')
@@ -480,6 +481,9 @@ function Show-TerminalSinglePicker {
         [Parameter(Mandatory = $true)][string]$DisplayProperty
     )
 
+    if (-not $Options.Count) { return }
+    if ([Console]::IsInputRedirected) { throw 'Selection requires an interactive terminal. Supply valid explicit selections when running unattended.' }
+
     $esc = [char]27
     $currentIndex = 0
     $total = $Options.Count
@@ -520,6 +524,7 @@ function Show-TerminalSinglePicker {
                 'DownArrow' {
                     $currentIndex = ($currentIndex + 1) % $total
                 }
+                'Escape' { return }
                 'Enter' {
                     # Wipe interactive menu
                     [Console]::Write("$esc[${total}A")
@@ -543,16 +548,21 @@ function Show-TerminalMultiPicker {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Title,
-        [Parameter(Mandatory = $true)][string[]]$Options
+        [Parameter(Mandatory = $true)][string[]]$Options,
+        [string[]]$SelectedOptions = @()
     )
+
+    if (-not $Options.Count) { return }
+    if ([Console]::IsInputRedirected) { throw 'Selection requires an interactive terminal. Supply valid explicit selections when running unattended.' }
 
     $esc = [char]27
     $selectedIndices = [System.Collections.Generic.HashSet[int]]::new()
+    for ($i = 0; $i -lt $Options.Count; $i++) { if ($Options[$i] -in $SelectedOptions) { [void]$selectedIndices.Add($i) } }
     $currentIndex = 0
     $total = $Options.Count
 
     Write-Host "`n=== $Title ===" -ForegroundColor Cyan
-    Write-Host "[Up/Down] Navigate | [Space] Toggle | [A] All | [C] Clear | [Enter] Confirm" -ForegroundColor DarkGray
+    Write-Host "[Up/Down] Navigate | [Space] Toggle | [A] All | [C] Clear | [Enter] Confirm | [Esc] Cancel" -ForegroundColor DarkGray
 
     # Pre-allocate buffer lines
     1..$total | ForEach-Object { [Console]::WriteLine("") }
@@ -604,6 +614,7 @@ function Show-TerminalMultiPicker {
                 'C' {
                     $selectedIndices.Clear()
                 }
+                'Escape' { return @() }
                 'Enter' {
                     # Wipe interactive menu
                     [Console]::Write("$esc[${total}A")
@@ -616,7 +627,7 @@ function Show-TerminalMultiPicker {
                     $summary = if ($picked.Count -gt 0) { $picked -join ';'
                     } else { "(none)"
                     }
-                    Write-Host "Selected Groups: $summary" -ForegroundColor Green
+                    Write-Host "Selected: $summary" -ForegroundColor Green
                     return $picked
                 }
             }
@@ -2171,7 +2182,7 @@ function New-MobileRunLog {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')][string]$MobileName,
-        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out', 'Preflight')][string]$Procedure,
+        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out', 'Preflight', 'SMB-Status')][string]$Procedure,
         [string]$LogRoot = $script:Config.MobileDeployments
     )
     New-Item -ItemType Directory -Path $LogRoot -Force -ErrorAction Stop | Out-Null
@@ -2348,74 +2359,6 @@ function Get-WindowsTask-LogArchiver {
     }
 }
 
-function New-WindowsPostTask-NetworkSharing {
-    [CmdletBinding()]
-    param(
-        [string[]]$DriveLetters
-    )
-
-    $driveInit = if ($DriveLetters) {
-        '$driveList = @(' +
-        (($DriveLetters | ForEach-Object { "'$_'" }) -join ',') +
-        ')'
-    } else {
-        ({
-            $driveList = @(
-                Get-PSDrive -PSProvider FileSystem |
-                    Select-Object -ExpandProperty Name
-            )
-        }).ToString()
-    }
-
-    return  $driveInit + ({
-            # Task: Network Sharing
-
-
-            try {
-                Enable-NetFirewallRule `
-                    -DisplayGroup 'File and Printer Sharing' `
-                    -ErrorAction Stop
-
-                $failedShares = @()
-
-                foreach ($d in $driveList) {
-                    $path = "${d}:\"
-
-                    if (-not (Test-Path $path)) {
-                        $failedShares += "$path does not exist"
-                        continue
-                    }
-
-                    if (-not (Get-SmbShare -Name $d -ErrorAction SilentlyContinue)) {
-                        try {
-                            New-SmbShare `
-                                -Name $d `
-                                -Path $path `
-                                -FullAccess 'Authenticated Users','mobile-smb-access' `
-                                -ErrorAction Stop |
-                                Out-Null
-                        } catch {
-                            $failedShares += "$d : $($_.Exception.Message)"
-                        }
-                    }
-                }
-
-                if ($failedShares.Count -eq 0) {
-                    record_action 'NetworkSharing' 'SMB' 'Success'
-                } else {
-                    record_action 'NetworkSharing' 'SMB' 'Failed'
-
-                    foreach ($failure in $failedShares) {
-                        record_failure "Network sharing: $failure"
-                    }
-                }
-            } catch {
-                record_action 'NetworkSharing' 'SMB' 'Failed'
-                record_failure "Network sharing failed: $($_.Exception.Message)"
-            }
-        }).ToString()
-}
-
 function New-WindowsPostTask-UserRights {
     [CmdletBinding()]
     param(
@@ -2423,24 +2366,7 @@ function New-WindowsPostTask-UserRights {
         [switch]$HasLinux
     )
 
-    $sharingSetup = ''
-
-    if ($Sharing -and $HasLinux) {
-        $sharingSetup = ({
-                $smbPass = ConvertTo-SecureString 'SupeSecretSMBP@ssw0rd99' -AsPlainText -Force
-
-                if (-not (Get-LocalUser -Name 'mobile-smb-access' -ErrorAction SilentlyContinue)) {
-                    New-LocalUser `
-                        -Name 'mobile-smb-access' `
-                        -Password $smbPass |
-                        Out-Null
-                }
-
-                $sharingSid = (Get-LocalUser -Name 'mobile-smb-access').Sid.Value
-            }).ToString()
-    }
-
-    return $sharingSetup + {
+    return {
         # Task: User Rights
 
 
@@ -2457,13 +2383,6 @@ function New-WindowsPostTask-UserRights {
             'SeInteractiveLogonRight',
             'SeRemoteInteractiveLogonRight',
             'SeNetworkLogonRight'
-        )
-
-        $denyRights = @(
-            'SeDenyInteractiveLogonRight',
-            'SeDenyRemoteInteractiveLogonRight',
-            'SeDenyBatchLogonRight',
-            'SeDenyServiceLogonRight'
         )
 
         $cfg = Get-Content -Path $tmpSec -Raw -Encoding Unicode
@@ -2515,16 +2434,6 @@ function New-WindowsPostTask-UserRights {
                 -ConfigText $cfg `
                 -RightName $r `
                 -RawSid $objSid
-        }
-
-        # 2. Apply deny rights
-        if ($sharingSid) {
-            foreach ($r in $denyRights) {
-                $cfg = Add-PrivilegeRight `
-                    -ConfigText $cfg `
-                    -RightName $r `
-                    -RawSid $sharingSid
-            }
         }
 
         # Write configuration
@@ -2597,7 +2506,7 @@ function Get-PostDeployScript {
 
     if ($UserRights) { $tasks.Add( (New-WindowsPostTask-UserRights  -Sharing:$Sharing  -HasLinux:$HasLinux)) }
 
-    if ($Sharing) { $tasks.Add( (New-WindowsPostTask-NetworkSharing  -DriveLetters $DriveLetters)) }
+    # NetworkSharing is prepared by the SMB coordinator, independently of this optional task.
 
     $tasks.Add(({
                 "[ Post Deployment Ran - $(Get-Date) ]" |
@@ -2637,7 +2546,7 @@ function Get-TaskData {
             }
             'PostDeploy' {
                 # Do not register an otherwise empty post-deployment task.
-                if ($postTasks.Count -eq 0) { continue }
+                if ('UserRights' -notin $postTasks) { continue }
                 $scriptText = Get-PostDeployScript -HasLinux:$hasLinux
                 $trigger = @{ Type = [TaskTriggerType]::Boot; Delay = 'PT1M' }
                 $xml = New-TaskXML -Description 'Runs after deployment' -Author '[Mobile Administration]' `
@@ -5557,6 +5466,770 @@ function Get-MobileOverview {
 
 #endregion
 
+#region SMB deployment coordination
+
+function Get-MobileSmbId {
+    param([Parameter(Mandatory)][string]$MobileName)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($MobileName.ToLowerInvariant())))).Replace('-', '').Substring(0, 20).ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Resolve-MobileSmbHosts {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$MobileData, [AllowEmptyCollection()][string[]]$SmbHosts)
+    $available = @($MobileData.Windows | Sort-Object -Unique)
+    if (-not $available.Count) { throw 'SMB storage selection requires Windows computers in the mobile.' }
+    $valid = @(); $invalid = @()
+    foreach ($name in $SmbHosts) {
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $match = @($available | Where-Object { $_ -ieq $name.Trim() })
+        if ($match.Count) { $valid += $match[0] } elseif (-not [string]::IsNullOrWhiteSpace($name)) { $invalid += $name }
+    }
+    if (-not $valid.Count -or $invalid.Count) {
+        if ($invalid.Count) { Write-Warning "SMB hosts outside this mobile: $($invalid -join ', '). Select from the mobile's Windows computers." }
+        $valid = @(Show-TerminalMultiPicker -Title 'Windows storage hosts to mount on Linux' -Options $available -SelectedOptions $valid)
+    }
+    if (-not $valid.Count) { throw 'No SMB storage hosts selected; checkout stopped before provisioning.' }
+    foreach ($name in ($valid | Sort-Object -Unique)) {
+        if ($name -notin $available) { throw "Invalid SMB host selection '$name'." }
+        $name
+    }
+}
+
+function Select-MobileSmbInterface {
+    param([Parameter(Mandatory)][string]$HostName, [Parameter(Mandatory)][array]$Candidates)
+    $candidates10 = @($Candidates | Where-Object { $_.IPAddress -match '^10\.(?:\d{1,3}\.){2}\d{1,3}$' })
+    if (-not $candidates10.Count) { throw "${HostName}: no active interface with a 10.x IPv4 address. Configure the deployment interface before checkout." }
+    if ($candidates10.Count -eq 1) { return $candidates10[0] }
+    foreach ($candidate in $candidates10) {
+        $candidate | Add-Member -NotePropertyName DisplayText -NotePropertyValue "$($candidate.InterfaceName): $($candidate.IPAddress)/$($candidate.PrefixLength)" -Force
+    }
+    $picked = Show-TerminalSinglePicker -Title "Deployment interface on $HostName" -Options $candidates10 -DisplayProperty DisplayText
+    if (-not $picked -or $picked.IPAddress -notin $candidates10.IPAddress) { throw "${HostName}: interface selection cancelled." }
+    $picked
+}
+
+function Get-MobileSmbMountPlan {
+    param([Parameter(Mandatory)][array]$Windows, [Parameter(Mandatory)][string[]]$SmbHosts)
+    foreach ($name in $SmbHosts) {
+        if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { throw "Unsafe SMB hostname '$name'." }
+        $hostInfo = @($Windows | Where-Object HostName -eq $name)
+        if ($hostInfo.Count -ne 1) { throw "Missing or duplicate SMB inventory for '$name'." }
+        $ip = [Net.IPAddress]::Parse($hostInfo[0].Interface.IPAddress)
+        if ($ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or $ip.GetAddressBytes()[0] -ne 10) { throw "Invalid storage IPv4 address for '$name'." }
+        foreach ($drive in $hostInfo[0].Drives) {
+            if ($drive -notmatch '^[A-Z]$') { throw "Invalid drive '$drive' on '$name'." }
+            $authority = if ($hostInfo[0].LocalAuthority) { [string]$hostInfo[0].LocalAuthority } else { $name.Split('.')[0] }
+            if ($authority -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { throw "Invalid local account authority on '$name'." }
+            [pscustomobject]@{ HostName = $name; CredentialDomain = $authority; IPAddress = $ip.ToString(); Share = $drive; Source = "//$ip/$drive"; MountPoint = "/share/$name/$drive" }
+        }
+        if (-not @($hostInfo[0].Drives).Count) { throw "No fixed drives discovered on '$name'." }
+    }
+}
+
+function Get-WindowsMobileSmbInventory {
+    return {
+        param([string]$SmbUser)
+        $interfaces = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+            $_.IPAddress -like '10.*' -and $_.AddressState -eq 'Preferred'
+        } | ForEach-Object {
+            $adapter = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction Stop
+            if ($adapter.Status -eq 'Up') {
+                [pscustomobject]@{ InterfaceName = $adapter.Name; InterfaceGuid = $adapter.InterfaceGuid.ToString()
+                    IPAddress = $_.IPAddress; PrefixLength = [int]$_.PrefixLength }
+            }
+        })
+        [pscustomobject]@{ Interfaces = $interfaces; LocalAuthority = $env:COMPUTERNAME; AccountExists = [bool](Get-LocalUser -Name $SmbUser -ErrorAction SilentlyContinue)
+            Drives = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | ForEach-Object { $_.DeviceID.TrimEnd(':').ToUpperInvariant() }) }
+    }
+}
+
+function Get-MobileSmbToolPath {
+    $directories = if ($script:Config.Preflight.LinuxToolDirectories) { $script:Config.Preflight.LinuxToolDirectories } else { @('/usr/local/sbin','/usr/local/bin','/usr/sbin','/usr/bin','/sbin','/bin') }
+    foreach ($directory in $directories) {
+        if ([string]::IsNullOrWhiteSpace($directory) -or -not $directory.StartsWith('/') -or $directory -match '[:\r\n]') { throw 'Invalid Linux tool directory.' }
+    }
+    $directories -join ':'
+}
+
+function Get-LinuxMobileSmbInventory {
+    $body = @'
+ip -o -4 address show up scope global | awk '$4 ~ /^10\./ {print $2, $4}' | jq -Rn '[inputs | split(" ") | {InterfaceName:.[0],IPAddress:(.[1]|split("/")[0]),PrefixLength:(.[1]|split("/")[1]|tonumber)}] | {Interfaces:.}'
+'@
+    'export PATH=' + (ConvertTo-BashArgument (Get-MobileSmbToolPath)) + "`n" + $body
+}
+
+function Get-WindowsMobileSmbWorker {
+    return {
+        param([ValidateSet('Prepare','Activate','Restore','RestoreBoot','Status')][string]$Mode,
+            [string]$Root, $Options, [pscredential]$Credential)
+        $ErrorActionPreference = 'Stop'
+        $statePath = Join-Path $Root 'state.json'
+        $state = $null
+        $mutex = [Threading.Mutex]::new($false, 'Global\Mobiles-Smb')
+        $locked = $false
+        function Save-State {
+            $state.UpdatedUtc = [datetime]::UtcNow.ToString('o')
+            $state | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath "$statePath.tmp" -Encoding UTF8
+            Move-Item -LiteralPath "$statePath.tmp" -Destination $statePath -Force
+            $state | ConvertTo-Json -Depth 12 -Compress | Add-Content -LiteralPath (Join-Path $Root 'history.jsonl') -Encoding UTF8
+        }
+        function Protect-Directory([string]$Path) {
+            if ((Test-Path -LiteralPath $Path) -and ((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Refusing a redirected SMB state directory.' }
+            New-Item -ItemType Directory -Path $Path -Force | Out-Null
+            $acl = [Security.AccessControl.DirectorySecurity]::new()
+            $acl.SetAccessRuleProtection($true, $false)
+            foreach ($sidText in @('S-1-5-18','S-1-5-32-544')) {
+                $sid = [Security.Principal.SecurityIdentifier]::new($sidText)
+                $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+            }
+            $acl.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+            Set-Acl -LiteralPath $Path -AclObject $acl
+        }
+        function Set-BootTask([string]$ActionMode) {
+            $worker = Join-Path $Root 'worker.ps1'
+            $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $action = New-ScheduledTaskAction -Execute $shell -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$worker`" -Mode $ActionMode -Root `"$Root`""
+            $trigger = New-ScheduledTaskTrigger -AtStartup
+            $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+            Register-ScheduledTask -TaskName $state.TaskName -Action $action -Trigger $trigger -Settings $settings -User SYSTEM -RunLevel Highest -Force | Out-Null
+        }
+        try {
+            try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
+            if (-not $locked) {
+                if ($Mode -eq 'Status') { return [pscustomobject]@{ Status = 'Busy' } }
+                throw 'Another SMB operation is in progress.'
+            }
+            if (Test-Path -LiteralPath $statePath) { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json }
+            if ($Mode -eq 'Status') {
+                if ($state) { return $state }
+                return [pscustomobject]@{ Status = 'NotPrepared' }
+            }
+            if ($Mode -eq 'Prepare') {
+                if ($state -and $state.Status -ne 'Restored') { throw 'SMB state already exists. Inspect or check in this deployment before preparing it again.' }
+                if (Get-LocalUser -Name $Options.UserName -ErrorAction SilentlyContinue) { throw "SMB account '$($Options.UserName)' already exists; refusing to change an unowned password." }
+                $adapter = Get-NetAdapter | Where-Object { $_.InterfaceGuid.ToString() -eq $Options.Interface.InterfaceGuid } | Select-Object -First 1
+                if (-not $adapter) { throw 'Selected interface is no longer present.' }
+                $index = $adapter.InterfaceIndex
+                $ipInterface = Get-NetIPInterface -InterfaceIndex $index -AddressFamily IPv4
+                $dnsKey = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{$($Options.Interface.InterfaceGuid.Trim('{}'))}"
+                Protect-Directory (Split-Path $Root -Parent)
+                Protect-Directory $Root
+                $state = [pscustomobject]@{ Status = 'Preparing'; UpdatedUtc = ''; Error = $null
+                    UserName = $Options.UserName; UserSid = $null; AccountOwned = $false
+                    Interface = $Options.Interface; OriginalDhcp = [string]$ipInterface.Dhcp
+                    OriginalDnsStatic = [string]$dnsKey.NameServer
+                    Shares = @(); AclDrives = @(); FirewallName = "Mobiles-Smb-$($Options.Id)"; TaskName = "Mobiles-Smb-$($Options.Id)" }
+                Save-State
+                $Options.Worker | Set-Content -LiteralPath (Join-Path $Root 'worker.ps1') -Encoding UTF8
+                New-LocalUser -Name $state.UserName -Password $Credential.Password -Description 'Mobile deployment SMB access' -AccountNeverExpires -PasswordNeverExpires | Out-Null
+                $state.UserSid = (Get-LocalUser -Name $state.UserName).SID.Value
+                $state.AccountOwned = $true
+                Save-State
+                # The account gets network logon, but cannot log on interactively.
+                $inf = Join-Path $Root 'rights.inf'; $db = Join-Path $Root 'rights.sdb'
+                & secedit /export /cfg $inf /areas USER_RIGHTS /quiet | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw 'Could not read local logon rights.' }
+                $cfg = Get-Content -LiteralPath $inf -Raw
+                foreach ($right in @('SeNetworkLogonRight','SeDenyInteractiveLogonRight','SeDenyRemoteInteractiveLogonRight')) {
+                    $pattern = '(?m)^' + $right + '\s*=\s*([^\r\n]*)'
+                    $match = [regex]::Match($cfg, $pattern)
+                    $values = if ($match.Success -and $match.Groups[1].Value.Trim()) { $match.Groups[1].Value.Trim() + ',' } else { '' }
+                    $line = "$right = $values*$($state.UserSid)"
+                    if ($match.Success) { $cfg = $cfg.Remove($match.Index, $match.Length).Insert($match.Index, $line) }
+                    else { $cfg += "`r`n$line`r`n" }
+                }
+                $cfg | Set-Content -LiteralPath $inf -Encoding Unicode
+                & secedit /configure /db $db /cfg $inf /areas USER_RIGHTS /quiet | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw 'Could not set SMB account logon rights.' }
+                foreach ($drive in $Options.Drives) {
+                    $path = "${drive}:\"
+                    $existing = Get-SmbShare -Name $drive -ErrorAction SilentlyContinue
+                    if ($existing -and $existing.Path -ine $path) { throw "Share '$drive' already points somewhere else." }
+                    $state.Shares += [pscustomobject]@{ Name = $drive; Created = (-not [bool]$existing) }
+                    $state.AclDrives += $drive
+                    Save-State # Write intent before changing each resource, so partial preparation is recoverable.
+                    $acl = Get-Acl -LiteralPath $path
+                    $rule = [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($state.UserSid), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+                    $acl.AddAccessRule($rule)
+                    Set-Acl -LiteralPath $path -AclObject $acl
+                    $account = "$env:COMPUTERNAME\$($state.UserName)"
+                    if ($existing) { Grant-SmbShareAccess -Name $drive -AccountName $account -AccessRight Full -Force | Out-Null }
+                    else { New-SmbShare -Name $drive -Path $path -FullAccess $account | Out-Null }
+                }
+                New-NetFirewallRule -Name $state.FirewallName -DisplayName 'Mobile SMB access' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 445 -RemoteAddress '10.0.0.0/8' -Profile Any | Out-Null
+                Set-BootTask Activate
+                $state.Status = 'PreparedPendingReboot'
+            } elseif ($Mode -eq 'Activate') {
+                if ($state.Status -notin @('PreparedPendingReboot','Active','ActivationFailed')) { throw 'SMB activation is not prepared.' }
+                $adapter = Get-NetAdapter | Where-Object { $_.InterfaceGuid.ToString() -eq $state.Interface.InterfaceGuid } | Select-Object -First 1
+                if (-not $adapter) { throw 'Saved network adapter is missing.' }
+                # Changing addressing happens at startup, never in the management session.
+                if ($state.OriginalDhcp -eq 'Enabled') {
+                    Set-NetIPInterface -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -Dhcp Disabled
+                    $activeAddress = Get-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -IPAddress $state.Interface.IPAddress -ErrorAction SilentlyContinue
+                    if ($activeAddress -and $activeAddress.PrefixOrigin -ne 'Manual') { $activeAddress | Remove-NetIPAddress -Confirm:$false; $activeAddress = $null }
+                    if (-not $activeAddress) { New-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex -IPAddress $state.Interface.IPAddress -PrefixLength $state.Interface.PrefixLength | Out-Null }
+                    # Only this interface is modified. Original DNS settings are retained.
+                }
+                $ready = $false
+                for ($attempt = 0; $attempt -lt 15; $attempt++) {
+                    $installed = Get-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -IPAddress $state.Interface.IPAddress -ErrorAction SilentlyContinue
+                    if ($installed -and $installed.AddressState -eq 'Preferred' -and $installed.PrefixLength -eq $state.Interface.PrefixLength) { $ready = $true; break }
+                    Start-Sleep -Seconds 1
+                }
+                if (-not $ready) { throw 'Selected IPv4 address is not preferred after activation; inspect for duplicate-address or adapter failures.' }
+                $state.Status = 'Active'
+            } elseif ($Mode -eq 'Restore') {
+                if (-not $state -or $state.Status -eq 'Restored') { return $state }
+                foreach ($share in $state.Shares) {
+                    $existing = Get-SmbShare -Name $share.Name -ErrorAction SilentlyContinue
+                    if (-not $existing) { continue }
+                    if ($existing.Path -ine "$($share.Name):\") { throw "Share '$($share.Name)' changed outside deployment; inspect before cleanup." }
+                    if ($share.Created) { Remove-SmbShare -Name $share.Name -Force }
+                    else { Revoke-SmbShareAccess -Name $share.Name -AccountName "$env:COMPUTERNAME\$($state.UserName)" -Force }
+                }
+                if ($state.UserSid) {
+                    foreach ($drive in $state.AclDrives) {
+                        $path = "${drive}:\"; $acl = Get-Acl -LiteralPath $path
+                        $acl.PurgeAccessRules([Security.Principal.SecurityIdentifier]::new($state.UserSid))
+                        Set-Acl -LiteralPath $path -AclObject $acl
+                    }
+                }
+                if ($state.UserSid) {
+                    $inf = Join-Path $Root 'rights.inf'; $db = Join-Path $Root 'rights.sdb'
+                    & secedit /export /cfg $inf /areas USER_RIGHTS /quiet | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw 'Could not read logon rights for cleanup.' }
+                    $cfg = Get-Content -LiteralPath $inf -Raw
+                    $sidToken = "*$($state.UserSid)"
+                    $cfg = [regex]::Replace($cfg, '(?m)^(Se\w+Right\s*=\s*)([^\r\n]*)', {
+                        param($match)
+                        $match.Groups[1].Value + ((@($match.Groups[2].Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne $sidToken })) -join ',')
+                    })
+                    $cfg | Set-Content -LiteralPath $inf -Encoding Unicode
+                    & secedit /configure /db $db /cfg $inf /areas USER_RIGHTS /quiet | Out-Null
+                    if ($LASTEXITCODE -ne 0) { throw 'Could not remove SMB account logon rights.' }
+                }
+                if ($state.AccountOwned) {
+                    $user = Get-LocalUser -Name $state.UserName -ErrorAction SilentlyContinue
+                    if ($user -and $user.SID.Value -ne $state.UserSid) { throw 'SMB account identity changed; inspect before cleanup.' }
+                    if ($user) { Remove-LocalUser -Name $state.UserName }
+                }
+                Get-NetFirewallRule -Name $state.FirewallName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+                Set-BootTask RestoreBoot
+                $state.Status = 'RestorePendingReboot'
+            } elseif ($Mode -eq 'RestoreBoot') {
+                $adapter = Get-NetAdapter | Where-Object { $_.InterfaceGuid.ToString() -eq $state.Interface.InterfaceGuid } | Select-Object -First 1
+                if (-not $adapter) { throw 'Saved network adapter is missing.' }
+                if ($state.OriginalDhcp -eq 'Enabled') {
+                    Get-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -IPAddress $state.Interface.IPAddress -ErrorAction SilentlyContinue | Where-Object PrefixOrigin -eq Manual | Remove-NetIPAddress -Confirm:$false
+                    Set-NetIPInterface -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -Dhcp Enabled
+                    if ($state.OriginalDnsStatic) { Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses ($state.OriginalDnsStatic -split '[, ]+' | Where-Object { $_ }) }
+                    else { Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ResetServerAddresses }
+                }
+                Unregister-ScheduledTask -TaskName $state.TaskName -Confirm:$false
+                $state.Status = 'Restored'
+            }
+            $state.Error = $null
+            Save-State
+            $state
+        } catch {
+            if ($state) { $state.Error = $_.Exception.Message; if ($Mode -eq 'Activate') { $state.Status = 'ActivationFailed' }; Save-State }
+            throw
+        } finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
+    }
+}
+
+function Get-LinuxMobileSmbWorker {
+    return @'
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mobile_smb_main() {
+    mode="$1"; root="$2"
+    umask 077
+    if [[ -L /var/lib/mobiles || -L /var/lib/mobiles/smb || -L "$root" ]]; then echo 'Refusing a redirected SMB state directory' >&2; exit 2; fi
+    if [[ -e "$root" && ! -O "$root" ]]; then echo 'SMB state directory is not owned by this privileged account' >&2; exit 2; fi
+    mkdir -p "$root"
+    chmod 700 "$root"
+    exec 9>/run/lock/mobiles-smb.lock
+    if [[ "$mode" != Status ]]; then flock -n 9 || { echo 'Another SMB operation is in progress' >&2; exit 2; }; fi
+    [[ ! -f "$root/environment.sh" ]] || source "$root/environment.sh"
+    state="$root/state.json"
+    save_status() {
+        jq --arg status "$1" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.Status=$status | .UpdatedUtc=$now' "$state" > "$state.tmp"
+        mv -f "$state.tmp" "$state"
+        jq -c . "$state" >> "$root/history.jsonl"
+    }
+    failed() {
+        code=$?
+        trap - ERR
+        if [[ -f "$state" ]]; then save_status "${mode}Failed"; fi
+        echo "SMB $mode failed; inspect $root and journalctl -u mobiles-smb-$(basename "$root")" >&2
+        exit "$code"
+    }
+    trap failed ERR
+    trap 'exit 143' TERM
+    trap 'code=$?; if (( code != 0 )); then trap - EXIT; [[ ! -f "$state" ]] || save_status "${mode}Failed"; fi' EXIT
+    if [[ "$mode" == Status ]]; then
+        if [[ -f "$state" ]]; then cat "$state"; else printf '{"Status":"NotPrepared"}\n'; fi
+        return
+    fi
+    if [[ "$mode" == Prepare ]]; then
+        if [[ -f "$state" ]] && [[ "$(jq -r .Status "$state")" != Restored ]]; then echo 'SMB state already exists; inspect/check in before preparing again' >&2; exit 2; fi
+        for tool in jq nmcli ip mount.cifs findmnt grubby systemctl systemd-escape flock; do command -v "$tool" >/dev/null || { echo "SMB requires $tool; PATH=$PATH" >&2; exit 2; }; done
+        [[ -n "${payload_b64:-}" ]] || { echo 'Missing SMB preparation payload' >&2; exit 2; }
+        payload="$(printf '%s' "$payload_b64" | base64 -d)"
+        printf '%s' "$payload" | jq 'del(.Password,.Worker)' > "$root/options.json"
+        iface="$(jq -r .Interface.InterfaceName "$root/options.json")"
+        address="$(jq -r '.Interface | .IPAddress+"/"+(.PrefixLength|tostring)' "$root/options.json")"
+        # Match the active NetworkManager connection by device; do not choose a similarly named profile.
+        original_uuid="$(nmcli -t -f UUID,DEVICE connection show --active | awk -F: -v dev="$iface" '$2==dev {print $1}')"
+        [[ "$original_uuid" =~ ^[a-fA-F0-9-]{36}$ ]] || { echo 'Selected interface requires one active NetworkManager profile' >&2; exit 2; }
+        ip -o -4 addr show dev "$iface" | awk -v address="$address" '$4==address {found=1} END {exit !found}'
+        id="$(basename "$root")"; unit="mobiles-smb-$id.service"
+        mobile_name="mobiles-smb-$id"
+        getent group "$(jq -r .LinuxGroup "$root/options.json")" >/dev/null || { echo 'Configured SMBLinuxGroup does not exist' >&2; exit 2; }
+        [[ -z "$(nmcli -t -f NAME connection show | grep -Fx "$mobile_name" || true)" ]] || { echo 'Mobile connection name already exists' >&2; exit 2; }
+        fips_before="$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo 0)"
+        normal_kernel="$(grubby --default-kernel)"
+        jq -n --arg original "$original_uuid" --arg iface "$iface" --arg unit "$unit" --arg profile "$mobile_name" \
+            --arg kernel "$normal_kernel" --arg fips "$fips_before" \
+            '{Status:"Preparing",OriginalConnection:$original,InterfaceName:$iface,Unit:$unit,MobileConnection:$profile,OriginalKernel:$kernel,OriginalFips:$fips,MobileKernel:null,MobileInitrd:null,CreatedMountPoints:[],AddedGroupMembers:[],MountDropIns:[],Mounts:[]}' > "$state"
+        printf '%s' "$payload" | jq -r .Worker > "$root/worker.sh"
+        printf 'export PATH=%q\n' "$PATH" > "$root/environment.sh"
+        chmod 700 "$root/worker.sh"
+        while IFS= read -r mount_row; do
+            host="$(printf '%s' "$mount_row" | jq -r .HostName)"
+            target="$(printf '%s' "$mount_row" | jq -r .MountPoint)"
+            if [[ -L /share || -L "/share/$host" || -L "$target" ]] || findmnt -rn --mountpoint "$target" >/dev/null; then echo "Unsafe or mounted target $target" >&2; exit 2; fi
+            if [[ -e "$target" && ! -d "$target" ]]; then echo "Non-directory target $target" >&2; exit 2; fi
+            if [[ -d "$target" ]] && [[ -n "$(ls -A "$target")" ]]; then echo "Mount point $target is not empty" >&2; exit 2; fi
+            for directory in /share "/share/$host" "$target"; do
+                if [[ ! -d "$directory" ]]; then
+                    jq --arg path "$directory" '.CreatedMountPoints += [$path]' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
+                    mkdir "$directory"
+                fi
+            done
+            mount_unit="$(systemd-escape --path --suffix=mount "$target")"
+            drop_in="/etc/systemd/system/$mount_unit.d/50-mobiles-$id.conf"
+            [[ ! -e "$drop_in" ]]
+            jq --arg path "$drop_in" '.MountDropIns += [$path]' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
+            mkdir -p "$(dirname "$drop_in")"
+            printf '[Mount]\nTimeoutSec=30\n' > "$drop_in"
+            credential="$root/credentials-$host"
+            printf 'username=%s\npassword=%s\ndomain=%s\n' "$(printf '%s' "$payload" | jq -r .UserName)" "$(printf '%s' "$payload" | jq -r .Password)" "$(printf '%s' "$mount_row" | jq -r ' .CredentialDomain // .HostName')" > "$credential"
+            chmod 600 "$credential"
+        done < <(jq -c '.Mounts[]' "$root/options.json")
+        unset payload payload_b64
+        nmcli connection clone uuid "$original_uuid" "$mobile_name" >/dev/null
+        nmcli connection modify id "$mobile_name" ipv4.method manual ipv4.addresses "$address" ipv4.gateway '' ipv4.routes '' ipv4.dns '' ipv4.ignore-auto-dns yes ipv4.never-default yes connection.autoconnect no
+        # Keep the original profile unchanged; activate the mobile clone only at boot.
+        if [[ "$fips_before" == 1 ]]; then
+            grubby --info=ALL > "$root/kernel-entries.before"
+            info="$(grubby --info=DEFAULT)"
+            initrd="$(printf '%s\n' "$info" | sed -n 's/^initrd="\(.*\)"$/\1/p')"
+            [[ -f "$normal_kernel" && -f "$initrd" ]] || { echo 'Default kernel/initrd could not be resolved to files' >&2; exit 2; }
+            mobile_kernel="/boot/vmlinuz-mobiles-$id"; mobile_initrd="/boot/initramfs-mobiles-$id.img"
+            [[ ! -e "$mobile_kernel" && ! -e "$mobile_initrd" ]]
+            jq --arg kernel "$mobile_kernel" --arg initrd "$mobile_initrd" '.MobileKernel=$kernel | .MobileInitrd=$initrd' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
+            # Distinct image paths let grubby remove ONLY the mobile entry, even with the same kernel version.
+            cp -p -- "$normal_kernel" "$mobile_kernel"
+            cp -p -- "$initrd" "$mobile_initrd"
+            if command -v restorecon >/dev/null; then restorecon "$mobile_kernel" "$mobile_initrd"; fi
+            grubby --add-kernel="$mobile_kernel" --initrd="$mobile_initrd" --copy-default --title="Mobile SMB $id" --remove-args='fips' --args='fips=0'
+            info="$(grubby --info="$mobile_kernel")"
+            printf '%s\n' "$info" | grep -q 'fips=0'
+            if printf '%s\n' "$info" | grep -q 'fips=1'; then echo 'Mobile entry still enforces FIPS' >&2; exit 2; fi
+            grubby --set-default="$mobile_kernel"
+        fi
+        cat > "/etc/systemd/system/$unit" <<UNIT
+[Unit]
+Description=Mobile SMB network and mounts
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/bin/timeout 300 /bin/bash $root/worker.sh Activate $root
+RemainAfterExit=yes
+TimeoutStartSec=300
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+        systemctl enable "$unit" >/dev/null
+        save_status PreparedPendingReboot
+    else
+        [[ -f "$state" ]] || { echo 'No saved SMB state' >&2; exit 2; }
+        unit="$(jq -r .Unit "$state")"
+        original_uuid="$(jq -r .OriginalConnection "$state")"
+        mobile_name="$(jq -r .MobileConnection "$state")"
+        if [[ "$mode" == Activate ]]; then
+            status="$(jq -r .Status "$state")"
+            [[ "$status" == PreparedPendingReboot || "$status" == Active || "$status" == Activating || "$status" == ActivateFailed ]]
+            save_status Activating
+            [[ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo 0)" == 0 ]] || { echo 'FIPS remains enforced; SMB activation blocked' >&2; exit 2; }
+            nmcli connection modify id "$mobile_name" connection.autoconnect yes connection.autoconnect-priority 999
+            nmcli connection up id "$mobile_name" >/dev/null
+            group="$(jq -r .LinuxGroup "$root/options.json")"
+            while IFS= read -r local_user; do
+                awk -F: -v user="$local_user" '$1==user {found=1} END {exit !found}' /etc/passwd
+                if ! id -nG "$local_user" | tr ' ' '\n' | grep -Fxq "$group"; then
+                    jq --arg user "$local_user" '.AddedGroupMembers += [$user] | .AddedGroupMembers |= unique' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
+                    usermod -aG "$group" "$local_user"
+                fi
+            done < <(jq -r '.LinuxUsers[]' "$root/options.json")
+            # Replace only our own managed block; keep the fstab inode, ownership and SELinux label.
+            id="$(basename "$root")"
+            awk -v begin="# BEGIN MOBILES SMB $id" -v end="# END MOBILES SMB $id" '$0==begin {skip=1;next} $0==end {skip=0;next} !skip' /etc/fstab > "$root/fstab.base"
+            cp "$root/fstab.base" "$root/fstab.new"
+            printf '\n# BEGIN MOBILES SMB %s\n' "$id" >> "$root/fstab.new"
+            while IFS= read -r mount_row; do
+                source="$(printf '%s' "$mount_row" | jq -r .Source)"
+                target="$(printf '%s' "$mount_row" | jq -r .MountPoint)"
+                host="$(printf '%s' "$mount_row" | jq -r .HostName)"
+                # All components are validated controller-side; the address is numeric, never DNS.
+                printf '%s %s cifs credentials=%s/credentials-%s,sec=ntlmssp,vers=3.0,_netdev,nofail,x-systemd.device-timeout=15s,file_mode=0660,dir_mode=0770,gid=%s 0 0\n' \
+                    "$source" "$target" "$root" "$host" "$(jq -r .LinuxGroup "$root/options.json")" >> "$root/fstab.new"
+            done < <(jq -c '.Mounts[]' "$root/options.json")
+            printf '# END MOBILES SMB %s\n' "$id" >> "$root/fstab.new"
+            getent group "$(jq -r .LinuxGroup "$root/options.json")" >/dev/null
+            # Refuse conflicts with user-maintained mount entries.
+            while IFS= read -r target; do
+                if awk -v target="$target" '$1 !~ /^#/ && $2==target {found=1} END {exit !found}' "$root/fstab.base"; then echo "Existing fstab entry for $target" >&2; exit 2; fi
+            done < <(jq -r '.Mounts[].MountPoint' "$root/options.json")
+            cp -p /etc/fstab "$root/fstab.before-activation"
+            cat "$root/fstab.new" > /etc/fstab
+            systemctl daemon-reload
+            jq '.Mounts=[]' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
+            had_failure=false
+            while IFS= read -r mount_row; do
+                target="$(printf '%s' "$mount_row" | jq -r .MountPoint)"
+                success=false
+                mounted=false
+                source="$(printf '%s' "$mount_row" | jq -r .Source)"
+                if findmnt -rn --mountpoint "$target" >/dev/null; then
+                    if [[ "$(findmnt -rn --mountpoint "$target" -o SOURCE)" == "$source" ]]; then mounted=true; fi
+                elif timeout 40 mount "$target"; then mounted=true; fi
+                if [[ "$mounted" == true ]]; then
+                    if timeout 15 /bin/bash -c 'probe="$(mktemp "$1/.mobiles-write-test-XXXXXXXXXX")" && rm -- "$probe"' _ "$target"; then success=true; fi
+                fi
+                jq --arg target "$target" --argjson success "$success" '.Mounts += [{MountPoint:$target,Success:$success}]' "$state" > "$state.tmp"; mv -f "$state.tmp" "$state"
+                [[ "$success" == true ]] || had_failure=true
+            done < <(jq -c '.Mounts[]' "$root/options.json")
+            [[ "$had_failure" == false ]]
+            save_status Active
+        elif [[ "$mode" == Restore ]]; then
+            [[ "$(jq -r .Status "$state")" != Restored ]] || { cat "$state"; return; }
+            save_status Restoring
+            # Abort if a mount is busy. Never use lazy/forced unmount for deployment data.
+            while IFS= read -r mount_row; do
+                target="$(printf '%s' "$mount_row" | jq -r .MountPoint)"
+                source="$(printf '%s' "$mount_row" | jq -r .Source)"
+                if findmnt -rn --mountpoint "$target" >/dev/null; then
+                    [[ "$(findmnt -rn --mountpoint "$target" -o SOURCE)" == "$source" ]] || { echo "Unexpected mount at $target" >&2; exit 2; }
+                    umount "$target"
+                fi
+            done < <(jq -c '.Mounts[]' "$root/options.json")
+            id="$(basename "$root")"
+            awk -v begin="# BEGIN MOBILES SMB $id" -v end="# END MOBILES SMB $id" '$0==begin {skip=1;next} $0==end {skip=0;next} !skip' /etc/fstab > "$root/fstab.new"
+            cat "$root/fstab.new" > /etc/fstab
+            while IFS= read -r local_user; do
+                if awk -F: -v user="$local_user" '$1==user {found=1} END {exit !found}' /etc/passwd; then
+                    if id -nG "$local_user" | tr ' ' '\n' | grep -Fxq "$(jq -r .LinuxGroup "$root/options.json")"; then gpasswd -d "$local_user" "$(jq -r .LinuxGroup "$root/options.json")" >/dev/null; fi
+                fi
+            done < <(jq -r '.AddedGroupMembers[]' "$state")
+            while IFS= read -r drop_in; do
+                rm -f -- "$drop_in"
+                rmdir -- "$(dirname "$drop_in")" 2>/dev/null || true
+            done < <(jq -r '.MountDropIns[]' "$state")
+            rm -f -- "$root"/credentials-*
+            mobile_kernel="$(jq -r '.MobileKernel // empty' "$state")"
+            if [[ -n "$mobile_kernel" ]]; then
+                current_default="$(grubby --default-kernel)"
+                if [[ "$current_default" == "$mobile_kernel" ]]; then
+                    normal_kernel="$(jq -r .OriginalKernel "$state")"
+                    # Kernel updates may remove the checkout default. Select the newest normal entry in boot order then.
+                    if [[ ! -f "$normal_kernel" ]] || ! grubby --info="$normal_kernel" >/dev/null 2>&1; then
+                        normal_kernel="$(grubby --info=ALL | sed -n 's/^kernel="\(.*\)"$/\1/p' | grep -v '/vmlinuz-mobiles-' | while IFS= read -r path; do [[ ! -f "$path" ]] || { printf '%s\n' "$path"; break; }; done)"
+                    fi
+                    [[ -n "$normal_kernel" && -f "$normal_kernel" ]] || { echo 'No normal kernel available for restoration' >&2; exit 2; }
+                    grubby --set-default="$normal_kernel"
+                fi
+                normal_kernel="$(grubby --default-kernel)"
+                if [[ "$(jq -r .OriginalFips "$state")" == 1 ]]; then
+                    grubby --update-kernel="$normal_kernel" --remove-args='fips' --args='fips=1'
+                    # New packaged entries can inherit the mobile default's fips=0 during updates.
+                    while IFS= read -r path; do
+                        [[ "$path" != *'/vmlinuz-mobiles-'* && -f "$path" ]] || continue
+                        if ! grep -Fxq "kernel=\"$path\"" "$root/kernel-entries.before"; then grubby --update-kernel="$path" --remove-args='fips' --args='fips=1'; fi
+                    done < <(grubby --info=ALL | sed -n 's/^kernel="\(.*\)"$/\1/p')
+                fi
+                if grubby --info="$mobile_kernel" >/dev/null 2>&1; then grubby --remove-kernel="$mobile_kernel"; fi
+                rm -f -- "$mobile_kernel" "$(jq -r .MobileInitrd "$state")"
+            fi
+            # The next boot restores the untouched original NM profile, so SSH stays up for cleanup now.
+            cat > "/etc/systemd/system/$unit" <<UNIT
+[Unit]
+Description=Restore mobile network configuration
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $root/worker.sh RestoreBoot $root
+RemainAfterExit=yes
+TimeoutStartSec=300
+[Install]
+WantedBy=multi-user.target
+UNIT
+            systemctl daemon-reload
+            systemctl enable "$unit" >/dev/null
+            save_status RestorePendingReboot
+        elif [[ "$mode" == RestoreBoot ]]; then
+            nmcli connection up uuid "$original_uuid" >/dev/null
+            if nmcli connection show id "$mobile_name" >/dev/null 2>&1; then nmcli connection delete id "$mobile_name" >/dev/null; fi
+            [[ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo 0)" == "$(jq -r .OriginalFips "$state")" ]] || { echo 'Original FIPS enforcement has not been restored' >&2; exit 2; }
+            while IFS= read -r target; do rmdir -- "$target" 2>/dev/null || true; done < <(jq -r '.CreatedMountPoints | reverse[]' "$state")
+            systemctl disable "$unit" >/dev/null
+            rm -f -- "/etc/systemd/system/$unit"
+            systemctl daemon-reload
+            save_status Restored
+        else
+            echo 'Unknown SMB worker mode' >&2; exit 2
+        fi
+    fi
+    cat "$state"
+}
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then mobile_smb_main "$@"; fi
+'@
+}
+
+function Get-LinuxMobileSmbScript {
+    param([Parameter(Mandatory)][ValidateSet('Prepare','Restore','Status')][string]$Mode,
+        [Parameter(Mandatory)][string]$Id, $Options, [pscredential]$Credential)
+    if ($Id -notmatch '^[a-f0-9]{20}$') { throw 'Invalid SMB deployment state ID.' }
+    $root = "/var/lib/mobiles/smb/$Id"
+    $prefix = "export PATH=$(ConvertTo-BashArgument (Get-MobileSmbToolPath))`n"
+    if ($Mode -eq 'Prepare') {
+        $Options | Add-Member -NotePropertyName Password -NotePropertyValue $Credential.GetNetworkCredential().Password -Force
+        $Options | Add-Member -NotePropertyName Worker -NotePropertyValue (Get-LinuxMobileSmbWorker) -Force
+        try { $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Options | ConvertTo-Json -Depth 12 -Compress))) }
+        finally { $Options.PSObject.Properties.Remove('Password'); $Options.PSObject.Properties.Remove('Worker') }
+        # Source definitions, rather than running the script's CLI footer during preparation.
+        $worker = (Get-LinuxMobileSmbWorker) -replace '(?m)^if \[\[ "\$\{BASH_SOURCE\[0\]\}" == "\$0" \]\]; then mobile_smb_main "\$@"; fi\s*$', ''
+        $body = $prefix + "payload_b64='$payload'`n" + $worker + "`n" + $prefix + "mobile_smb_main Prepare '$root'"
+    } else {
+        $body = $prefix + "if [[ -f '$root/worker.sh' ]]; then /bin/bash '$root/worker.sh' $Mode '$root'; else printf '{`"Status`":`"NotPrepared`"}\n'; fi"
+    }
+    $delimiter = 'MOBILE_SMB_' + [guid]::NewGuid().ToString('N')
+    "dzdo bash <<'$delimiter'`n$body`n$delimiter`n"
+}
+
+function Get-MobileSmbPlanPath {
+    param([Parameter(Mandatory)][string]$MobileName)
+    Join-Path (Join-Path $script:Config.MobileDeployments 'smb') ((Get-MobileSmbId $MobileName) + '.json')
+}
+
+function Save-MobileSmbPlan {
+    param([Parameter(Mandatory)]$Plan)
+    $path = Get-MobileSmbPlanPath $Plan.MobileName
+    New-Item -ItemType Directory -Path (Split-Path $path -Parent) -Force | Out-Null
+    $Plan | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath "$path.tmp" -Encoding UTF8
+    Move-Item -LiteralPath "$path.tmp" -Destination $path -Force
+}
+
+function Read-MobileSmbPlan {
+    param([Parameter(Mandatory)][string]$MobileName)
+    $path = Get-MobileSmbPlanPath $MobileName
+    if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
+}
+
+function ConvertFrom-MobileSmbLinuxResult {
+    param([Parameter(Mandatory)]$Result)
+    if ($Result.ExitCode -ne 0 -or -not $Result.StdOut) { throw "SMB SSH operation failed on $($Result.Target) (exit $($Result.ExitCode)): $($Result.StdErr)" }
+    try { $Result.StdOut | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "Invalid SMB response from $($Result.Target)." }
+}
+
+function Initialize-MobileSmbDeployment {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$MobileData, [Parameter(Mandatory)][string]$MobileName,
+        [string[]]$SmbHosts, [pscredential]$SmbCredential, [Parameter(Mandatory)]$Run)
+    $previous = Read-MobileSmbPlan $MobileName
+    if ($previous -and $previous.Status -ne 'Restored') { throw 'This mobile already has saved SMB state. Use -SmbStatus or check it in before preparing again.' }
+    $userName = [string]$script:Config.SMBUser
+    if ($userName -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,19}$') { throw 'SMBUser must be a Windows local account name of 1-20 letters, digits, dots, underscores or hyphens.' }
+    if ($userName -in @($MobileData.AllUsers.Name)) { throw 'SMBUser must be distinct from mobile user accounts.' }
+    $linuxGroup = if ($script:Config.SMBLinuxGroup) { [string]$script:Config.SMBLinuxGroup } else { 'users' }
+    if ($linuxGroup -notmatch '^[a-z_][a-z0-9_-]*[$]?$') { throw 'SMBLinuxGroup must be a Linux group name.' }
+    $storageHosts = @()
+    if (@($MobileData.Linux).Count) { $storageHosts = @(Resolve-MobileSmbHosts -MobileData $MobileData -SmbHosts $SmbHosts) }
+    if ($SmbHosts -and -not @($MobileData.Linux).Count) { throw '-SmbHosts selects storage for Linux; this mobile has no Linux computers.' }
+    $windows = @(
+        foreach ($computer in $MobileData.Windows) {
+            $inventory = @(Invoke-Command -ComputerName $computer -ScriptBlock (Get-WindowsMobileSmbInventory) -ArgumentList $userName -ErrorAction Stop)
+            if ($inventory.Count -ne 1 -or -not @($inventory[0].Drives).Count) { throw "Incomplete SMB inventory from '$computer'." }
+            if ($inventory[0].AccountExists) { throw "SMB account '$userName' already exists on $computer. No passwords were changed." }
+            [pscustomobject]@{ HostName = $computer; Interface = (Select-MobileSmbInterface -HostName $computer -Candidates @($inventory[0].Interfaces)); Drives = @($inventory[0].Drives); LocalAuthority = $inventory[0].LocalAuthority; Status = 'NotPrepared' }
+        }
+    )
+    $linux = @(
+        foreach ($computer in $MobileData.Linux) {
+            $raw = @(Invoke-Linux -Computers @($computer) -Script (Get-LinuxMobileSmbInventory) -KeyPath $script:Config.SSHKeyPath)
+            if ($raw.Count -ne 1) { throw "No SMB interface inventory from '$computer'." }
+            $inventory = ConvertFrom-MobileSmbLinuxResult $raw[0]
+            [pscustomobject]@{ HostName = $computer; Interface = (Select-MobileSmbInterface -HostName $computer -Candidates @($inventory.Interfaces)); Status = 'NotPrepared' }
+        }
+    )
+    $mounts = @()
+    if ($storageHosts.Count) { $mounts = @(Get-MobileSmbMountPlan -Windows $windows -SmbHosts $storageHosts) }
+    $allHosts = @($windows) + @($linux)
+    if (@($allHosts.Interface.IPAddress | Sort-Object -Unique).Count -ne $allHosts.Count) { throw 'Selected deployment interfaces have duplicate IPv4 addresses.' }
+    # Isolated deployments have no assumed router. Verify direct reachability in both directions.
+    foreach ($client in $allHosts) {
+        $prefix = [int]$client.Interface.PrefixLength
+        if ($prefix -lt 1 -or $prefix -gt 30) { throw "Unsupported deployment prefix on $($client.HostName)." }
+        $own = [Net.IPAddress]::Parse($client.Interface.IPAddress).GetAddressBytes()
+        foreach ($server in $allHosts) {
+            $other = [Net.IPAddress]::Parse($server.Interface.IPAddress).GetAddressBytes()
+            for ($bit = 0; $bit -lt $prefix; $bit++) {
+                $mask = 1 -shl (7 - ($bit % 8)); $index = [int][math]::Floor($bit / 8)
+                if (($own[$index] -band $mask) -ne ($other[$index] -band $mask)) { throw "$($client.HostName) and $($server.HostName) are outside the selected interface's subnet; an isolated routed network must be configured explicitly." }
+            }
+        }
+    }
+    if (-not $SmbCredential) {
+        $password = Read-Host -Prompt "Password for deployment SMB account '$userName'" -AsSecureString
+        $SmbCredential = [pscredential]::new($userName, $password)
+    }
+    if ($SmbCredential.UserName -ine $userName) { throw "The SMB credential username must match configured SMBUser '$userName'." }
+    $clearPassword = $SmbCredential.GetNetworkCredential().Password
+    if ([string]::IsNullOrEmpty($clearPassword) -or $clearPassword -match '[\r\n]') { throw 'SMB passwords must be nonempty and cannot contain line breaks.' }
+    $clearPassword = $null
+    $plan = [pscustomobject]@{ Version = 1; Id = Get-MobileSmbId $MobileName; MobileName = $MobileName
+        Status = 'Preparing'; UserName = $userName; LinuxGroup = $linuxGroup; StorageHosts = $storageHosts
+        Windows = @($windows); Linux = @($linux); Mounts = @($mounts) }
+    Save-MobileSmbPlan $plan
+    Write-MobileRunEvent -Run $Run -Event 'SmbPlan' -Data $plan # Contains no credentials or worker source.
+    try {
+        foreach ($hostInfo in $plan.Windows) {
+            $options = [pscustomobject]@{ Id = $plan.Id; UserName = $userName; Interface = $hostInfo.Interface; Drives = $hostInfo.Drives; Worker = (Get-WindowsMobileSmbWorker).ToString() }
+            $root = "C:\ProgramData\Mobiles\Smb\$($plan.Id)"
+            $result = Invoke-Command -ComputerName $hostInfo.HostName -ScriptBlock (Get-WindowsMobileSmbWorker) -ArgumentList 'Prepare', $root, $options, $SmbCredential -ErrorAction Stop
+            if ($result.Status -ne 'PreparedPendingReboot') { throw "SMB preparation did not complete on $($hostInfo.HostName)." }
+            $hostInfo.Status = $result.Status
+            Save-MobileSmbPlan $plan
+            Write-MobileRunEvent -Run $Run -Event 'SmbPrepared' -Data @{ HostName = $hostInfo.HostName; Platform = 'Windows'; State = $result }
+        }
+        foreach ($hostInfo in $plan.Linux) {
+            $options = [pscustomobject]@{ UserName = $userName; Interface = $hostInfo.Interface; Mounts = $plan.Mounts; LinuxGroup = $linuxGroup; LinuxUsers = @($MobileData.AllUsers | Where-Object { $null -ne $_.LinuxAccountType } | ForEach-Object LinuxName | Sort-Object -Unique) }
+            $scriptText = Get-LinuxMobileSmbScript -Mode Prepare -Id $plan.Id -Options $options -Credential $SmbCredential
+            $raw = @(Invoke-Linux -Computers @($hostInfo.HostName) -Script $scriptText -KeyPath $script:Config.SSHKeyPath)
+            if ($raw.Count -ne 1) { throw "No SMB preparation response from $($hostInfo.HostName)." }
+            $result = ConvertFrom-MobileSmbLinuxResult $raw[0]
+            if ($result.Status -ne 'PreparedPendingReboot') { throw "SMB preparation did not complete on $($hostInfo.HostName)." }
+            $hostInfo.Status = $result.Status
+            Save-MobileSmbPlan $plan
+            Write-MobileRunEvent -Run $Run -Event 'SmbPrepared' -Data @{ HostName = $hostInfo.HostName; Platform = 'Linux'; State = $result }
+        }
+        $plan.Status = 'PreparedPendingReboot'
+        Save-MobileSmbPlan $plan
+        Write-Host '[+] SMB prepared. Disconnect the mobile from the domain network before rebooting; static addressing and mounts activate at boot.'
+        $plan
+    } catch { $plan.Status = 'PreparationFailed'; Save-MobileSmbPlan $plan; throw }
+}
+
+function Invoke-MobileSmbCheckInHooks {
+    param([Parameter(Mandatory)]$Plan, [Parameter(Mandatory)]$Run, [array]$WindowsHooks, [array]$LinuxHooks)
+    foreach ($hostInfo in $Plan.Windows) {
+        if (-not $WindowsHooks.Count) { break }
+        $runner = { param($Hooks, $Runner, $MobileName, $RunId)
+            & ([scriptblock]::Create($Runner)) -Hooks $Hooks -MobileName $MobileName -Procedure 'Check-in' -RunId $RunId }
+        $result = Invoke-Command -ComputerName $hostInfo.Interface.IPAddress -ScriptBlock $runner -ArgumentList $WindowsHooks, (Get-WindowsProcedureHookRunner).ToString(), $Plan.MobileName, $Run.Id -ErrorAction Stop
+        Write-MobileRunEvent -Run $Run -Event 'HostResult' -Data @{ HostName = $hostInfo.HostName; Platform = 'Windows'; Success = (-not $result.Failures.Count); Actions = $result.Actions; Failures = $result.Failures }
+        if ($result.Failures.Count) { throw "Check-in hooks failed on $($hostInfo.HostName); SMB cleanup was not started." }
+    }
+    foreach ($hostInfo in $Plan.Linux) {
+        if (-not $LinuxHooks.Count) { break }
+        $header = @'
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+set -o pipefail
+actions_json=(); failures=()
+record_failure() { failures+=("$1"); }
+record_action() { actions_json+=("$(jq -cn --arg category "$1" --arg name "$2" --arg status "$3" '{Category:$category,Name:$name,Status:$status}')"); }
+'@
+        $footer = @'
+jq -n --argjson actions "[$(IFS=,; echo "${actions_json[*]}")]" --argjson failures "$(printf '%s\n' "${failures[@]}" | jq -R . | jq -s 'map(select(length>0))')" '{Actions:$actions,Failures:$failures}'
+'@
+        $scriptText = $header + "`nexport PATH=" + (ConvertTo-BashArgument (Get-MobileSmbToolPath)) + "`n" + (Get-LinuxProcedureHookScript -Hooks $LinuxHooks -MobileName $Plan.MobileName -Procedure Check-in -RunId $Run.Id) + "`n" + $footer
+        $raw = @(Invoke-Linux -Computers @($hostInfo.Interface.IPAddress) -Script $scriptText -KeyPath $script:Config.SSHKeyPath)
+        if ($raw.Count -ne 1) { throw "No hook response from $($hostInfo.HostName)." }
+        $result = ConvertFrom-MobileSmbLinuxResult $raw[0]
+        Write-MobileRunEvent -Run $Run -Event 'HostResult' -Data @{ HostName = $hostInfo.HostName; Platform = 'Linux'; Success = (-not $result.Failures.Count); Actions = $result.Actions; Failures = $result.Failures }
+        if ($result.Failures.Count) { throw "Check-in hooks failed on $($hostInfo.HostName); SMB cleanup was not started." }
+    }
+}
+
+function Restore-MobileSmbDeployment {
+    param([Parameter(Mandatory)]$Plan, [Parameter(Mandatory)]$Run)
+    # Storage must remain available until every Linux client has unmounted successfully.
+    foreach ($hostInfo in $Plan.Linux) {
+        $raw = @(Invoke-Linux -Computers @($hostInfo.Interface.IPAddress) -Script (Get-LinuxMobileSmbScript -Mode Restore -Id $Plan.Id) -KeyPath $script:Config.SSHKeyPath)
+        if ($raw.Count -ne 1) { throw "No SMB restoration response from $($hostInfo.HostName)." }
+        $result = ConvertFrom-MobileSmbLinuxResult $raw[0]
+        if ($result.Status -notin @('RestorePendingReboot','Restored','NotPrepared')) { throw "SMB restoration incomplete on $($hostInfo.HostName)." }
+        $hostInfo.Status = $result.Status
+        Save-MobileSmbPlan $Plan
+        Write-MobileRunEvent -Run $Run -Event 'SmbRestored' -Data @{ HostName = $hostInfo.HostName; Platform = 'Linux'; State = $result }
+    }
+    foreach ($hostInfo in $Plan.Windows) {
+        $root = "C:\ProgramData\Mobiles\Smb\$($Plan.Id)"
+        $result = Invoke-Command -ComputerName $hostInfo.Interface.IPAddress -ScriptBlock (Get-WindowsMobileSmbWorker) -ArgumentList 'Restore', $root -ErrorAction Stop
+        if ($result.Status -notin @('RestorePendingReboot','Restored') -and $null -ne $result) { throw "SMB restoration incomplete on $($hostInfo.HostName)." }
+        $hostInfo.Status = if ($result) { $result.Status } else { 'NotPrepared' }
+        Save-MobileSmbPlan $Plan
+        Write-MobileRunEvent -Run $Run -Event 'SmbRestored' -Data @{ HostName = $hostInfo.HostName; Platform = 'Windows'; State = $result }
+    }
+    $Plan.Status = 'RestorePendingReboot'
+    Save-MobileSmbPlan $Plan
+    Write-Host '[+] SMB cleanup staged. Reboot all hosts to restore original networking and Linux FIPS enforcement; query -SmbStatus afterward.'
+}
+
+function Show-MobileSmbStatus {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$MobileName)
+    $plan = Read-MobileSmbPlan $MobileName
+    if (-not $plan) { throw "No saved SMB deployment for '$MobileName'." }
+    $run = New-MobileRunLog -MobileName $MobileName -Procedure 'SMB-Status'
+    $states = @(
+        foreach ($hostInfo in $plan.Windows) {
+            try {
+                $root = "C:\ProgramData\Mobiles\Smb\$($plan.Id)"
+                try { $state = Invoke-Command -ComputerName $hostInfo.HostName -ScriptBlock (Get-WindowsMobileSmbWorker) -ArgumentList 'Status', $root -ErrorAction Stop }
+                catch { $state = Invoke-Command -ComputerName $hostInfo.Interface.IPAddress -ScriptBlock (Get-WindowsMobileSmbWorker) -ArgumentList 'Status', $root -ErrorAction Stop }
+                [pscustomobject]@{ HostName = $hostInfo.HostName; IPAddress = $hostInfo.Interface.IPAddress; Platform = 'Windows'; Status = $state.Status; Details = $state }
+            } catch { [pscustomobject]@{ HostName = $hostInfo.HostName; IPAddress = $hostInfo.Interface.IPAddress; Platform = 'Windows'; Status = 'Unreachable'; Details = $_.Exception.Message } }
+        }
+        foreach ($hostInfo in $plan.Linux) {
+            try {
+                $raw = @(Invoke-Linux -Computers @($hostInfo.HostName) -Script (Get-LinuxMobileSmbScript -Mode Status -Id $plan.Id) -KeyPath $script:Config.SSHKeyPath)
+                if ($raw.Count -ne 1 -or $raw[0].ExitCode -ne 0) { $raw = @(Invoke-Linux -Computers @($hostInfo.Interface.IPAddress) -Script (Get-LinuxMobileSmbScript -Mode Status -Id $plan.Id) -KeyPath $script:Config.SSHKeyPath) }
+                if ($raw.Count -ne 1) { throw 'No response.' }
+                $state = ConvertFrom-MobileSmbLinuxResult $raw[0]
+                [pscustomobject]@{ HostName = $hostInfo.HostName; IPAddress = $hostInfo.Interface.IPAddress; Platform = 'Linux'; Status = $state.Status; Details = $state }
+            } catch { [pscustomobject]@{ HostName = $hostInfo.HostName; IPAddress = $hostInfo.Interface.IPAddress; Platform = 'Linux'; Status = 'Unreachable'; Details = $_.Exception.Message } }
+        }
+    )
+    if ($states.Count -and @($states | Where-Object Status -ne Restored).Count -eq 0) { $plan.Status = 'Restored'; Save-MobileSmbPlan $plan }
+    foreach ($state in $states) { Write-MobileRunEvent -Run $run -Event 'SmbStatus' -Data $state }
+    Write-MobileRunEvent -Run $run -Event 'RunCompleted' -Data @{ Success = (@($states | Where-Object { $_.Status -notin @('Active','Restored') }).Count -eq 0) }
+    Write-Host "[+] SMB status audit log: $($run.ReadablePath)"
+    $states
+}
+
+#endregion
+
 #region Deployment commands
 
 function Register-MobileDeployment {
@@ -5574,6 +6247,8 @@ function Register-MobileDeployment {
         [string]$oldEncryption = $Script:Config.curLuks,
         [string]$mobileDump    = $Script:Config.mobileDump,
         [string]$nfsHome       = $Script:Config.NfsHome,
+        [string[]]$SmbHosts,
+        [pscredential]$SmbCredential,
         [switch]$Disjoin,
         [string]$LinuxDisjoinKeytab,
         [string]$DomainController,
@@ -5599,6 +6274,11 @@ function Register-MobileDeployment {
         Write-MobileRunEvent -Run $run -Event 'PreflightStarted' -Data $null
         if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
         Write-MobileRunEvent -Run $run -Event 'PreflightCompleted' -Data @{ Success = $true }
+        $sharingEnabled = 'NetworkSharing' -in @(Get-DeploymentTaskSelection -Platform Windows -Phase PostDeployment)
+        if ($SmbHosts -and -not $sharingEnabled) { throw '-SmbHosts requires NetworkSharing in DeploymentTasks.Windows.PostDeployment.' }
+        if ($sharingEnabled -and @($mobileData.Windows).Count) {
+            $smbPlan = Initialize-MobileSmbDeployment -MobileData $mobileData -MobileName $MobileName -SmbHosts $SmbHosts -SmbCredential $SmbCredential -Run $run
+        }
         $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump
         $taskData = @()
         if (@($mobileData.Windows).Count -gt 0) {
@@ -5763,6 +6443,14 @@ function Unregister-Deployment {
         Write-MobileRunEvent -Run $run -Event 'TaskSelection' -Data $script:Config.DeploymentTasks
         $mobileData = Get-MobileData -MobileName $MobileName
         Write-MobileRunEvent -Run $run -Event 'Targets' -Data @{ Windows = @($mobileData.Windows); Linux = @($mobileData.Linux) }
+        $smbPlan = Read-MobileSmbPlan $MobileName
+        if ($smbPlan -and $smbPlan.Status -ne 'Restored') {
+            Invoke-MobileSmbCheckInHooks -Plan $smbPlan -Run $run -WindowsHooks $windowsHooks -LinuxHooks $linuxHooks
+            Restore-MobileSmbDeployment -Plan $smbPlan -Run $run
+            $windowsHooks = @(); $linuxHooks = @() # Already executed before storage teardown.
+            $mobileData.Windows = @($smbPlan.Windows | ForEach-Object { $_.Interface.IPAddress })
+            $mobileData.Linux = @($smbPlan.Linux | ForEach-Object { $_.Interface.IPAddress })
+        }
         $taskData = @(
             [PSCustomObject]@{ TaskName = 'Mobile-LogArchiver' }
             [PSCustomObject]@{ TaskName = 'Mobile-DisjoinTask' }
