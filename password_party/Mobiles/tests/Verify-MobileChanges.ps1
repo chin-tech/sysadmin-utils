@@ -11,7 +11,7 @@ $issues = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$issues)
 if ($issues.Count) { throw ($issues.Message -join "`n") }
-$names = @('Test-DeploymentTaskPlan', 'Get-DeploymentTaskSelection', 'Set-MobileConfig', 'Write-MobileFile', 'Get-MobileData', 'Set-Groups',
+$names = @('Get-LinuxDeploymentUsers', 'Get-LinuxResultHeader', 'Get-LinuxResultFooter', 'ConvertFrom-WindowsDeploymentResult', 'ConvertFrom-LinuxDeploymentResult', 'Test-DeploymentTaskPlan', 'Get-DeploymentTaskSelection', 'Set-MobileConfig', 'Write-MobileFile', 'Get-MobileData', 'Set-Groups',
     'Resolve-GroupType', 'Get-LinuxDeployScript', 'New-LinuxTask-LeaveDomain', 'ConvertTo-BashArgument')
 $parts = @($ast.FindAll({ param($node)
     ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names) -or
@@ -130,7 +130,8 @@ legacy,,Legacy User
 
         function New-LinuxTask-CreateDirectory { '# create directory' }
         function New-LinuxTask-AddUsers { param($Users, $HomeBase) '# account creation marker' }
-        $linux = Get-LinuxDeployScript -AllUsers $data.AllUsers -Disjoin -b64kt 'YWJj' -SkipLuks -SkipLogrotate
+        $linux = Get-LinuxDeployScript -AllUsers $data.AllUsers -Disjoin -b64kt 'YWJj' -SkipLuks
+        Assert (-not $linux.Contains('mobile-logrotate')) 'Check-out still installs the retired Linux log service'
         Assert ($linux.IndexOf('# account creation marker') -lt $linux.IndexOf('# Verify the account')) 'Linux verification precedes account creation'
         Assert ($linux.IndexOf('# Verify the account') -lt $linux.IndexOf('# Task: Domain Departure')) 'Linux departure precedes verification'
         $linuxPath = Join-Path $fixture 'linux.sh'

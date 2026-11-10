@@ -265,7 +265,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
         }
 
         function Get-MobileData { param($MobileName) [pscustomobject]@{ Windows = @('win-host'); Linux = @('linux-host', 'offline-host') } }
-        function Get-DeploymentTaskSelection { param($Platform, $Phase) @('NetworkSharing') }
+        function Get-DeploymentTaskSelection { param($Platform, $Phase) @('UserRights') }
         function Invoke-Command { [CmdletBinding()] param($ComputerName, $ScriptBlock, $ArgumentList)
             [pscustomobject]@{ PSComputerName = 'win-host'; DefinitionDate = $today; ScanStatus = 'CompletedNeedsReview'
                 Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'Symantec'; Status = 'CompletedNeedsReview'; Details = $null }); Failures = @() }

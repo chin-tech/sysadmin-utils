@@ -58,8 +58,4 @@ A host is marked successful only with current definitions, a managed clean resul
 
 ## Scope
 
-Preflight evaluates AV definitions and scan history only. It does not query SMB/FIPS state, infer sharing intent, or require mount verification for a successful AV assessment. The `-Smb` preflight option has been removed.
-
-SMB authentication, mounts, and any related FIPS compatibility checks belong to a separate verification stage for mobiles that use shares, after all machines have left the domain and disconnected from the domain network. That stage is implemented by the separate [SMB checkout/check-in workflow](SMB.md), not by preflight. Preflight does not edit boot options, crypto policy, credential files, or `fstab`.
-
-Run `pwsh -NoProfile -File ./tests/Verify-Preflight.ps1` for fake-scanner and transport-fixture checks. These do not execute real malware scans or modify FIPS/boot settings.
+Preflight evaluates AV definitions and scan history only. It does not change networking, boot options, crypto policy, credential files, or `fstab`.

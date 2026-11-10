@@ -29,7 +29,6 @@
         'Set-MobileConfig'
         'Show-MobileRunLog'
         'Invoke-MobilePreflight'
-        'Show-MobileSmbStatus'
         'Initialize-Environment'
     )
 
@@ -51,8 +50,6 @@
                 encryptionPin     = 'defaultPin123!@#'
                 adminRoot = "C:\TEMP"
                 nfsHomeRoot   = "C:\TEMP\"
-                SMBUser       = 'mobile-smb-access'
-                SMBLinuxGroup = 'users' # Local Linux group allowed to access mounted shares.
 
                 Preflight = @{
                     DefinitionMaxAgeDays = 30
@@ -72,10 +69,10 @@
                     Windows = @{
                         Provisioning = @('Users', 'PasswordExpiry', 'Groups', 'BitLocker')
                         Scheduled = @('LogArchiver', 'PostDeploy')
-                        PostDeployment = @('UserRights', 'NetworkSharing')
+                        PostDeployment = @('UserRights')
                     }
                     Linux = @{
-                        Provisioning = @('CreateDirectory', 'LogService', 'Luks', 'AddUsers')
+                        Provisioning = @('CreateDirectory', 'Luks', 'AddUsers')
                     }
                 }
 

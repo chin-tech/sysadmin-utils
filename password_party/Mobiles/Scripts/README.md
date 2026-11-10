@@ -5,7 +5,6 @@ Put self-contained scripts directly in these folders:
 - `Check-out`: runs during `Register-MobileDeployment`, after provisioning and before account verification/domain departure.
 - `Check-in`: runs during `Unregister-Deployment`, before archive/account cleanup.
 
-When restoring a saved SMB deployment, check-in hooks run once before all SMB teardown, followed by ordinary cleanup. See [SMB workflow](../SMB.md).
 
 Windows hosts receive only `.ps1` files. Linux hosts receive only `.sh` files. Other files and subdirectories are ignored. Scripts run in filename order; names such as `10-configure.ps1` and `20-verify.ps1` make the order clear. Discovery snapshots the content once per procedure run, so every applicable host receives the same version even if the local files change during deployment. Script hashes identify the executed snapshots in the audit log. Linux CRLF line endings are normalized to LF before hashing/execution.
 
@@ -21,7 +20,7 @@ MOBILE_RUN_ID
 
 The working directory is temporary. Supporting files and adjacent scripts are not copied. Hooks should be self-contained, handle repeated execution, and avoid interactive prompts. Use `throw`/`Write-Error` or `exit 1` in PowerShell, and a nonzero exit status in Bash, to report failure. Hooks are independent child processes, so shell variables and functions do not carry between scripts.
 
-The execution path is `Get-MobileProcedureHooks` (discover and snapshot), then `Get-WindowsProcedureHookRunner` or `Get-LinuxProcedureHookScript` (execute and record). SMB check-in uses these same runners. The Linux `-Standalone` option adds the result envelope when hooks run outside normal provisioning/cleanup. The Windows launcher exists to turn PowerShell errors into a failed process exit code; it is a temporary part of that execution, not a scheduled job.
+The execution path is `Get-MobileProcedureHooks` (discover and snapshot), then `Get-WindowsProcedureHookRunner` or `Get-LinuxProcedureHookScript` (execute and record). The Linux `-Standalone` option adds the result envelope when hooks run outside normal provisioning/cleanup. The Windows launcher exists to turn PowerShell errors into a failed process exit code; it is a temporary part of that execution, not a scheduled job.
 
 ## Audit files
 

@@ -5,8 +5,6 @@
     MobileRoot = '\\nas\home\.mobiles'
     SshKeyName = 'deployer'
     CertName = 'MobileDeployer'
-    SMBUser = 'mobile-smb-access'
-    SMBLinuxGroup = 'users' # Members of this local group can use the Linux mounts.
     GpoID = '{00000000-0000-0000-0000-000000000000}' # Replace with the actual GPO ID.
     # Supply deployment secrets through -ConfigOverride or a protected local cfg.psd1.
 }

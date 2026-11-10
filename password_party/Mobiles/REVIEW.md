@@ -51,17 +51,17 @@ DeploymentTasks = @{
     Windows = @{
         Provisioning = @('Users', 'PasswordExpiry', 'Groups', 'BitLocker')
         Scheduled = @('LogArchiver', 'PostDeploy')
-        PostDeployment = @('UserRights', 'NetworkSharing')
+        PostDeployment = @('UserRights')
     }
     Linux = @{
-        Provisioning = @('CreateDirectory', 'LogService', 'Luks', 'AddUsers')
+        Provisioning = @('CreateDirectory', 'Luks', 'AddUsers')
     }
 }
 ```
 
 Remove a name to omit that step, or set an entire list to `@()`. Keep the platform and phase dictionaries present. Reload the module after editing the manifest (`Mobiles.ps1` already imports with `-Force`). Defaults retain the existing deployment steps. Supported task names map to existing implementations; introducing a new task requires updating the module's catalog and implementation as well as the manifest.
 
-Selections execute in the module's canonical order, preserving account creation before privilege assignment and Linux directory creation before user creation. Unknown platforms/phases/task names and duplicate names are rejected. A `DeploymentTasks` override replaces the entire plan, so supply all its platform/phase dictionaries. Explicit `Get-PostDeployScript` switches can override its configured selection for direct callers; Linux `-SkipLuks` and `-SkipLogrotate` still suppress selected steps.
+Selections execute in the module's canonical order, preserving account creation before privilege assignment and Linux directory creation before user creation. Unknown platforms/phases/task names and duplicate names are rejected. A `DeploymentTasks` override replaces the entire plan, so supply all its platform/phase dictionaries. Explicit `Get-PostDeployScript` switches can override its configured selection for direct callers; Linux `-SkipLuks` still suppresses the selected encryption step. Linux log rotation is managed by fleet logrotate configuration, independently of mobile check-in/check-out.
 
 `Scheduled.PostDeploy` controls registration of the existing `Mobile-DisjoinTask` boot task; `PostDeployment` controls its generated contents. An empty post-deployment list omits that scheduled task. Windows provisioning selection travels in the remote payload. Linux-only deployments no longer construct Windows task XML. Cleanup removes all known managed scheduled tasks regardless of the current selection, allowing a mobile deployed under an earlier plan to be cleaned up.
 
@@ -75,8 +75,6 @@ Both procedures create a unique append-only JSON-lines run journal in `MobileDep
 
 Audit readability: every run now writes a readable `.log` beside its existing `.jsonl` journal. The readable file expands target names, selected tasks, host/action statuses, nested details, hook output, and failure messages without PowerShell object placeholders. Completion prints the readable path; `-Verbose` also shows the JSONL path. The exported `Show-MobileRunLog -Path ...` renders existing JSONL files, so old runs do not need to be repeated. Tests cover both in-memory event objects and deserialized historical JSONL records, nested action details, empty platform lists, and failure messages.
 
-Standalone preflight: `Mobiles.ps1 -Preflight -Name <mobile>` runs definition/core-server inventory and ClamAV/SEP scans separately from checkout. The manifest contains a `Preflight` dictionary for definition-age limits, scan timeout/scope, and optional SEP executable/scan-name overrides. `-SkipScans` collects readiness without starting scans. Every planned host receives a report/audit record, including unreachable or malformed responses. SEP completion is explicitly `CompletedNeedsReview`, since DoScan exit zero does not establish no detections. Linux reports runtime FIPS/crypto-policy incompatibility with intended workgroup SMB; no FIPS, boot, credential-file, or fstab changes are made. See `PREFLIGHT.md` for scope, status meanings, and remaining SMB mapping requirements.
+Standalone preflight: `Mobiles.ps1 -Preflight -Name <mobile>` runs definition/core-server inventory and ClamAV/SEP scans separately from checkout. The manifest contains a `Preflight` dictionary for definition-age limits, scan timeout/scope, and optional SEP executable/scan-name overrides. `-SkipScans` collects readiness without starting scans. Every planned host receives a report/audit record, including unreachable or malformed responses. SEP completion is explicitly `CompletedNeedsReview`, since DoScan exit zero does not establish no detections. Preflight evaluates AV readiness only; see `PREFLIGHT.md` for scope and status meanings.
 
 Preflight scans now dispatch to independent endpoint workers rather than waiting over WinRM/SSH. Windows uses a protected SYSTEM scheduled task plus SEP's native scan-status registry; Linux uses a root-owned transient systemd service, explicit ClamAV log, and dispatch lock. Repeated calls reuse running/latest attempts, `-Rescan` requests a new attempt only when idle, and `-SkipScans` queries status/history without dispatch. Managed exit codes, timestamps, scan scope, and output survive controller disconnects. Reports show latest completed managed results alongside active state; abandoned workers become `Interrupted`. Readable audit summaries distinguish `Pending` and `NeedsReview` from failed scans. SEP results retain the required AV-log review. Updated offline tests execute detached fake scanner workers and exercise duplicate suppression, stored results, forced rescans, dispatch decisions, pending/interrupted states, and scope mismatches; native Windows scheduling/ACL and real RHEL/Centrify behavior still require environment validation.
-
-Preflight scope correction: removed SMB intent inference, the preflight `-Smb` switch, Linux FIPS/crypto-policy probes, SMB report fields, and SMB-dependent readiness gating. Current definitions plus a valid clean scan can now pass independently of sharing. SMB-specific verification belongs after disjoin/domain-network disconnection for mobiles that use shares; it is not part of preflight. Existing SMB provisioning is unchanged.

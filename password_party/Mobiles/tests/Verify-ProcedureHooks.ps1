@@ -7,16 +7,10 @@ $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join '; ') }
 $statements = @($ast.EndBlock.Statements)
-$smbAsts = @(foreach ($file in @('WindowsSmb.ps1','LinuxSmb.ps1','MobileSmb.ps1')) {
-    $smbAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root "Private/$file"), [ref]$tokens, [ref]$errors)
-    if ($errors.Count) { throw ($errors.Message -join '; ') }
-    $statements += $smbAst.EndBlock.Statements
-    $smbAst
-})
-$names = @('ConvertTo-MobileLogLines', 'Format-MobileRunEvent', 'Show-MobileRunLog', 'Get-MobileProcedureHooks', 'Write-MobileRunEvent', 'New-MobileRunLog', 'Get-WindowsProcedureHookRunner',
+$names = @('Get-LinuxDeploymentUsers', 'Get-LinuxResultHeader', 'Get-LinuxResultFooter', 'ConvertFrom-WindowsDeploymentResult', 'ConvertFrom-LinuxDeploymentResult', 'ConvertTo-MobileLogLines', 'Format-MobileRunEvent', 'Show-MobileRunLog', 'Get-MobileProcedureHooks', 'Write-MobileRunEvent', 'New-MobileRunLog', 'Get-WindowsProcedureHookRunner',
     'Get-LinuxProcedureHookScript', 'ConvertTo-BashArgument', 'Get-LinuxDeployScript', 'Get-LinuxUnregisterScript',
     'New-LinuxTask-LeaveDomain', 'Get-DeploymentTaskSelection', 'Test-DeploymentTaskPlan',
-    'Register-MobileDeployment', 'Unregister-Deployment', 'Read-MobileSmbPlan', 'Get-MobileSmbPlanPath', 'Get-MobileSmbId')
+    'Register-MobileDeployment', 'Unregister-Deployment')
 $source = $statements | Where-Object {
     ($_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in $names) -or
     ($_ -is [System.Management.Automation.Language.TypeDefinitionAst] -and $_.Name -in @('GroupType', 'LinuxAccountType')) -or
@@ -28,6 +22,23 @@ try {
     & $module {
         param($fixture, $root)
         function Assert($condition, $message) { if (-not $condition) { throw $message } }
+        # Mixed replies exercise the common check-in/check-out result handling.
+        $windows = @(ConvertFrom-WindowsDeploymentResult -Computers @('good','denied','offline','missing') -Results @(
+            [pscustomobject]@{ PSComputerName='good'; Success=$true; Actions=@('fixture-action'); Failures=@() }
+        ) -TransportErrors @(
+            [pscustomobject]@{ TargetObject='denied'; Exception=[Exception]::new('access denied') },
+            [pscustomobject]@{ OriginInfo=[pscustomobject]@{ PSComputerName='offline' }; Exception=[Exception]::new('connection failed') }
+        ))
+        Assert ($windows.Count -eq 4 -and $windows[0].Success -and $windows[0].Actions[0] -eq 'fixture-action') 'Windows replies were lost or duplicated'
+        Assert ($windows[1].Failures[0] -eq 'access denied' -and $windows[2].Failures[0] -eq 'connection failed' -and $windows[3].Failures[0] -like 'No result*') 'Windows transport failures were attributed to the wrong hosts'
+        $linuxResults = @(ConvertFrom-LinuxDeploymentResult -Results @(
+            [pscustomobject]@{ Target='good'; ExitCode=0; StdOut='{"HostName":"good","Platform":"Linux","Success":true,"Actions":[],"Failures":[]}'; StdErr='' },
+            [pscustomobject]@{ Target='malformed'; ExitCode=0; StdOut='invalid json'; StdErr='' },
+            [pscustomobject]@{ Target='denied'; ExitCode=1; StdOut=''; StdErr='permission denied' },
+            [pscustomobject]@{ Target='empty'; ExitCode=255; StdOut=''; StdErr='' }
+        ))
+        Assert ($linuxResults.Count -eq 4 -and $linuxResults[0].Success) 'Linux replies were lost'
+        Assert ($linuxResults[1].Failures[0] -like 'Invalid JSON*' -and $linuxResults[2].Failures[0] -eq 'permission denied' -and $linuxResults[3].Failures[0] -like '*255*') 'Linux failures lost their diagnostics'
         $scripts = Join-Path $fixture 'Scripts'
         New-Item -ItemType Directory -Path "$scripts/Check-in", "$scripts/Check-out" | Out-Null
         Set-Content -LiteralPath "$scripts/Check-out/10-first.ps1" -Value 'Write-Output "first:$env:MOBILE_NAME"'
@@ -90,6 +101,21 @@ try {
             $oldPath = $env:PATH
             try {
                 $env:PATH = "$tools" + [IO.Path]::PathSeparator + $oldPath
+                # Keep both historical Details representations and the common failure ledger.
+                $envelopePath = Join-Path $fixture 'result-envelope.sh'
+                foreach ($textDetails in @($false,$true)) {
+                    $envelope = (Get-LinuxResultHeader -TextDetails:$textDetails) + "`n" + @'
+record_action Fixture 'quoted name' Success '{"Value":"quoted detail"}'
+record_action Fixture 'no detail' Success
+record_failure 'fixture failure'
+'@ + "`n" + (Get-LinuxResultFooter)
+                    [IO.File]::WriteAllText($envelopePath, $envelope)
+                    $envelopeResult = ((& bash $envelopePath) -join "`n") | ConvertFrom-Json
+                    Assert (-not $envelopeResult.Success -and $envelopeResult.Failures[0] -eq 'fixture failure' -and $null -eq $envelopeResult.Actions[1].Details) 'Shared Linux logger lost failures or null details'
+                    if ($textDetails) { Assert ($envelopeResult.Actions[0].Details -is [string]) 'Check-in text details changed type' }
+                    else { Assert ($envelopeResult.Actions[0].Details.Value -eq 'quoted detail') 'Check-out JSON details changed type' }
+                }
+
                 [IO.File]::WriteAllText("$scripts/Check-out/10-linux's hook.sh", "echo linux:`$MOBILE_NAME:`$MOBILE_PROCEDURE`n")
                 [IO.File]::WriteAllText("$scripts/Check-out/20-failed.sh", "echo fixture-stderr >&2`nexit 7`n")
                 [IO.File]::WriteAllText("$scripts/Check-in/10-failed.sh", "exit 9`n")
@@ -104,7 +130,7 @@ try {
                 Assert (-not $linux.Success -and $linux.Actions.Count -eq 2) 'Linux hook result JSON was corrupted or failed hook was ignored'
                 Assert ($linux.Actions[0].Details.StdOut.Trim() -eq 'linux:fixture:Check-out') 'Linux context or quoted filename failed'
                 Assert ($linux.Actions[1].Details.ExitCode -eq 7) 'Linux exit code was not recorded'
-                # SMB check-in uses the same runner directly, without another hand-built envelope.
+                # The standalone hook runner also preserves output and failure details.
                 $standalone = Get-LinuxProcedureHookScript -Hooks $linuxHooks -MobileName fixture -Procedure Check-in -RunId fixture-run -Standalone -ToolPath $env:PATH
                 [IO.File]::WriteAllText($path, $standalone)
                 $standaloneResult = ((& bash $path) -join "`n") | ConvertFrom-Json
@@ -126,7 +152,8 @@ try {
                 function New-LinuxUnregisterTask-Users { param($Users, $Archive) 'touch ' + (ConvertTo-BashArgument $script:cleanupMarker) }
                 $user = [pscustomobject]@{ BaseName = 'fixture'; LinuxAccountType = [LinuxAccountType]::General; GroupType = [GroupType]::Local }
                 $linuxReturnHooks = @(Get-MobileProcedureHooks Check-in -ScriptsRoot $scripts | Where-Object Platform -eq Linux)
-                $text = Get-LinuxUnregisterScript -AllUsers @($user) -Hooks $linuxReturnHooks -MobileName fixture -RunId fixture-run -SkipLogrotate
+                $text = Get-LinuxUnregisterScript -AllUsers @($user) -Hooks $linuxReturnHooks -MobileName fixture -RunId fixture-run
+                Assert (-not $text.Contains('mobile-logrotate') -and -not $text.Contains('daemon-reload')) 'Check-in still manages the retired Linux log service'
                 [IO.File]::WriteAllText($path, $text)
                 $json = & bash $path
                 $linux = ($json -join "`n") | ConvertFrom-Json

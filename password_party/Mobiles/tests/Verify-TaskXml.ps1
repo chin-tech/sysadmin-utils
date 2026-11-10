@@ -37,7 +37,7 @@ try {
             $service | Add-Member ScriptMethod NewTask { param($flags) $this.Definition }
             $service
         }
-        $arguments = '-NoProfile -File "C:\ProgramData\Mobiles\Smb\fixture\boot.ps1" -Mode Activate -Root "C:\ProgramData\Mobiles\Smb\fixture"'
+        $arguments = '-NoProfile -File "C:\ProgramData\Mobiles\fixture\boot.ps1" -Mode Activate -Root "C:\ProgramData\Mobiles\fixture"'
         $xml = New-TaskXML -Execute powershell.exe -Arguments $arguments -TriggerConfigs @(@{ Type=8; Delay='PT30S'; EndBoundary='' }) -ExecutionTimeLimit PT2M
         Assert ($xml -eq '<Task />' -and $script:task.Actions.Last.Arguments.EndsWith($arguments)) 'Task arguments were corrupted'
         Assert ([regex]::Matches($script:task.Actions.Last.Arguments, '-File ').Count -eq 1) 'Explicit arguments were duplicated'

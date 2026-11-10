@@ -37,8 +37,6 @@ $script:Config = [PSCustomObject]@{
     mobileOU           = $manifestCfg.MobileOU
     DeploymentTasks    = $manifestCfg.DeploymentTasks
     Preflight          = $manifestCfg.Preflight
-    SMBUser            = $manifestCfg.SMBUser
-    SMBLinuxGroup      = $manifestCfg.SMBLinuxGroup
     NfsHome            = (Join-Path $nfsRoot $env:USERNAME)
     MobileEntries      = (Join-Path $mobileRoot 'entries')
     mobileDefaultUsers = (Join-Path $mobileRoot '.default')
@@ -275,18 +273,9 @@ if (-not ([System.Management.Automation.PSTypeName]'Sha512Crypt').Type) {
     Add-Type -TypeDefinition $Sha512CryptSource
 }
 
-function ConvertTo-Base64 {
-    param (
-        [string]$text
-    )
+function ConvertTo-Base64([string]$text) { return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($text)) }
 
-    return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($text))
-}
-
-function ConvertTo-BashArgument {
-    param([string]$v)
-    "'" + $v.Replace("'","'\''") + "'"
-}
+function ConvertTo-BashArgument([string]$v) { "'" + $v.Replace("'","'\''") + "'" }
 
 function Invoke-Linux {
     [CmdletBinding()]
@@ -338,32 +327,26 @@ function Invoke-Linux {
     return $res
 }
 
-function New-TaskXML {
-    [CmdletBinding()]
-    param(
-        [Parameter()][string]$Description = "Automated Task",
-        [Parameter()][string]$Author = "SYSTEM",
-        [Parameter()][string]$Version = "1.0",
+function New-TaskXML(
+    [string]$Description = "Automated Task",
+    [string]$Author = "SYSTEM",
+    [string]$Version = "1.0",
 
-        [Parameter()]
-        [string]$Execute,
-        [string]$ToEncode,
+    [string]$Execute,
+    [string]$ToEncode,
 
-        [Parameter()]
-        [string]$Arguments = "",
+    [string]$Arguments = "",
 
-        # Pass a hashtable or array of hashtables describing triggers
-        [Parameter()]
-        [hashtable[]]$TriggerConfigs = @(@{ Type = [TaskTriggerType]::Registration }),
+    # Pass a hashtable or array of hashtables describing triggers
+    [hashtable[]]$TriggerConfigs = @(@{ Type = [TaskTriggerType]::Registration }),
 
-        [Parameter()][string]$UserId = "NT AUTHORITY\SYSTEM",
-        [Parameter()][int]$LogonType = 5, # 5 = TASK_LOGON_SERVICE / SYSTEM
-        [Parameter()][int]$RunLevel = 1,  # 1 = TASK_RUNLEVEL_HIGHEST
+    [string]$UserId = "NT AUTHORITY\SYSTEM",
+    [int]$LogonType = 5, # 5 = TASK_LOGON_SERVICE / SYSTEM
+    [int]$RunLevel = 1,  # 1 = TASK_RUNLEVEL_HIGHEST
 
-        [Parameter()][bool]$Hidden = $true,
-        [Parameter()][string]$ExecutionTimeLimit = "PT72H"
-    )
-
+    [bool]$Hidden = $true,
+    [string]$ExecutionTimeLimit = "PT72H"
+) {
     $defaultPSArgs = if ($Execute.ToLower().Contains('powershell')) { "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive "
     }
     $encoded = if (-not ([string]::IsNullOrWhiteSpace($toEncode))) { "-Encoded $(ConvertTo-Base64 $ToEncode)"
@@ -598,12 +581,8 @@ function Show-TerminalMultiPicker {
             $key = [Console]::ReadKey($true)
 
             switch ($key.Key) {
-                'UpArrow' {
-                    $currentIndex = ($currentIndex - 1 + $total) % $total
-                }
-                'DownArrow' {
-                    $currentIndex = ($currentIndex + 1) % $total
-                }
+                'UpArrow' { $currentIndex = ($currentIndex - 1 + $total) % $total }
+                'DownArrow' { $currentIndex = ($currentIndex + 1) % $total }
                 'Spacebar' {
                     if ($selectedIndices.Contains($currentIndex)) {
                         [void]$selectedIndices.Remove($currentIndex)
@@ -611,12 +590,8 @@ function Show-TerminalMultiPicker {
                         [void]$selectedIndices.Add($currentIndex)
                     }
                 }
-                'A' {
-                    0..($total - 1) | ForEach-Object { [void]$selectedIndices.Add($_) }
-                }
-                'C' {
-                    $selectedIndices.Clear()
-                }
+                'A' { 0..($total - 1) | ForEach-Object { [void]$selectedIndices.Add($_) } }
+                'C' { $selectedIndices.Clear() }
                 'Escape' { return @() }
                 'Enter' {
                     # Wipe interactive menu
@@ -661,13 +636,7 @@ function Resolve-GroupType {
     return $null
 }
 
-function Set-Groups {
-    [CmdletBinding()]
-    param(
-        [Parameter(Position = 0)]
-        [array]$Groups
-    )
-
+function Set-Groups([array]$Groups) {
     if (-not $groups) { return @([GroupType]::Local)
     }
 
@@ -697,13 +666,7 @@ function Set-Groups {
     ) | Select-Object -unique
 }
 
-function Get-UserFullName {
-    [CmdletBinding()]
-    param(
-        [Parameter()][string]$UserName,
-        [Parameter()][string]$FullName
-    )
-
+function Get-UserFullName([string]$UserName, [string]$FullName) {
     if ([string]::IsNullOrWhiteSpace($FullName) -and -not [string]::IsNullOrWhiteSpace($UserName)) {
         $searcher = [System.DirectoryServices.DirectorySearcher]::new()
         $searcher.Filter = "(&(objectCategory=person)(objectClass=user)(sAMAccountName=$([System.Security.SecurityElement]::Escape($UserName))))"
@@ -717,20 +680,16 @@ function Get-UserFullName {
             }
 
             $first = if ($props.Contains('givenName')) {
-                $props['givenName'][0]
-            } else {
-                ''
-            }
+                $props['givenName'][0] 
+            } else { '' }
+
             $last  = if ($props.Contains('sn')) {
-                $props['sn'][0]
-            } else {
-                ''
-            }
+                $props['sn'][0] 
+            } else { '' }
+
             $combined = "$first $last".Trim()
 
-            if (-not [string]::IsNullOrWhiteSpace($combined)) {
-                return $combined
-            }
+            if (-not [string]::IsNullOrWhiteSpace($combined)) { return $combined }
         }
     }
 
@@ -776,32 +735,23 @@ function Find-ADUserMatch {
     $results = @($searcher.FindAll())
     $pMatches = foreach ($res in $results) {
         $props = $res.Properties
-        $first = if ($props.Contains('givenName')) { $props['givenName'][0]
-        } else { ''
-        }
-        $last  = if ($props.Contains('sn')) { $props['sn'][0]
-        } else { ''
-        }
+        $first = if ($props.Contains('givenName')) { $props['givenName'][0] } else { '' }
+        $last  = if ($props.Contains('sn')) { $props['sn'][0] } else { '' }
         $combined = "$first $last".Trim()
 
         $resolvedName = if ($props.Contains('displayName') -and -not [string]::IsNullOrWhiteSpace($props['displayName'][0])) {
             $props['displayName'][0]
         } elseif (-not [string]::IsNullOrWhiteSpace($combined)) {
             $combined
-        } else {
-            ''
-        }
+        } else { '' }
 
         $sam = if ($props.Contains('samaccountname')) { $props['samaccountname'][0]
-        } else { ''
-        }
+        } else { '' }
 
         [PSCustomObject]@{
             UserName    = $sam
             FullName    = $resolvedName
-            Email       = if ($props.Contains('mail')) { $props['mail'][0]
-            } else { ''
-            }
+            Email       = if ($props.Contains('mail')) { $props['mail'][0] } else { '' }
             DisplayText = "$sam - $resolvedName"
         }
     }
@@ -818,9 +768,9 @@ $script:DeploymentTaskCatalog = @{
     Windows = @{
         Provisioning = @('Users', 'PasswordExpiry', 'Groups', 'BitLocker')
         Scheduled = @('LogArchiver', 'PostDeploy')
-        PostDeployment = @('UserRights', 'NetworkSharing')
+        PostDeployment = @('UserRights')
     }
-    Linux = @{ Provisioning = @('CreateDirectory', 'LogService', 'Luks', 'AddUsers') }
+    Linux = @{ Provisioning = @('CreateDirectory', 'Luks', 'AddUsers') }
 }
 
 function Test-DeploymentTaskPlan {
@@ -944,14 +894,12 @@ function Get-UserCreds {
     return $AllUsers
 }
 
-function Resolve-LinuxDisjoinKeytab {
-    [CmdletBinding()]
-    param(
-        [string]$Keytab,
-        [string]$DomainController,
-        [string]$Principal,
-        [int]$Kvno = 0
-    )
+function Resolve-LinuxDisjoinKeytab(
+    [string]$Keytab,
+    [string]$DomainController,
+    [string]$Principal,
+    [int]$Kvno = 0
+) {
     if (-not [string]::IsNullOrWhiteSpace($Keytab)) {
         if ($Keytab -notmatch '^[A-Za-z0-9+/]+={0,2}$') { throw 'Invalid base64 keytab.' }
         return $Keytab
@@ -1759,30 +1707,20 @@ function Get-MobileData {
     }
 
     if ($sections.ContainsKey('users')) {
-        $result.MobileUsers = @(
-            $sections['users'] |
-                ConvertFrom-Csv |
-                ForEach-Object {
-                    [PSCustomObject]@{
+        $result.MobileUsers = @( $sections['users'] |
+                ConvertFrom-Csv | ForEach-Object {
+                    [PSCustomObject]@{ 
                         Username = $_.username
-                        Groups   = if ($_.groups) {
-                            $_.groups -split ';'
-                        } else {
-                            @()
-                        }
+                        Groups   = if ($_.groups) { $_.groups -split ';' } else { @() }
                         Name = if ($_.fullname) { $_.fullname } else { $_.name }
                     }
                 }
         )
     }
 
-    if ($sections.ContainsKey('Windows')) {
-        $result.Windows = @($sections['Windows'])
-    }
+    if ($sections.ContainsKey('Windows')) { $result.Windows = @($sections['Windows']) }
 
-    if ($sections.ContainsKey('Linux')) {
-        $result.Linux = @($sections['Linux'])
-    }
+    if ($sections.ContainsKey('Linux')) { $result.Linux = @($sections['Linux']) }
     $tmp = @($result.DefaultUsers) + @($result.MobileUsers)
 
     $allUsers = [System.Collections.Generic.List[object]]::new()
@@ -1793,11 +1731,7 @@ function Get-MobileData {
         Write-Debug "$($u.Username) -- $($grps)"
         foreach ($grp in $grps) {
             $meta = $Script:GroupMetadata[$grp]
-            $accountName = if ($meta.Suffix) {
-                "$($u.Username).$($meta.Suffix)"
-            } else {
-                $u.Username
-            }
+            $accountName = if ($meta.Suffix) { "$($u.Username).$($meta.Suffix)" } else { $u.Username }
 
             $uData = [PSCustomObject]@{
                 BaseName = $u.UserName
@@ -1844,17 +1778,13 @@ function Write-MobileFile {
     # [windows]
     $lines.Add('[windows]')
     foreach ($c in $newMobile.WindowsComputers) {
-        if (-not [string]::IsNullOrWhiteSpace($c)) {
-            $lines.Add($c)
-        }
+        if (-not [string]::IsNullOrWhiteSpace($c)) { $lines.Add($c) }
     }
 
     # [linux]
     $lines.Add('[linux]')
     foreach ($c in $newMobile.LinuxComputers) {
-        if (-not [string]::IsNullOrWhiteSpace($c)) {
-            $lines.Add($c)
-        }
+        if (-not [string]::IsNullOrWhiteSpace($c)) { $lines.Add($c) }
     }
 
     # [users]
@@ -1863,9 +1793,7 @@ function Write-MobileFile {
         foreach ($row in ($newMobile.Users | Select-Object username, groups, fullname | ConvertTo-Csv -NoTypeInformation)) {
             $lines.Add($row)
         }
-    } else {
-        $lines.Add('username,groups,fullname')
-    }
+    } else { $lines.Add('username,groups,fullname') }
 
     # Write out without BOM issues or extra blank lines
     [System.IO.File]::WriteAllLines($outPath, $lines)
@@ -2067,9 +1995,7 @@ function Get-MobileProcedureHooks {
     }
 }
 
-function ConvertTo-MobileLogLines {
-    [CmdletBinding()]
-    param([AllowNull()]$Value, [string]$Prefix = '')
+function ConvertTo-MobileLogLines($Value, [string]$Prefix = '') {
     if ($null -eq $Value) { return "$($Prefix): (none)" }
     if ($Value -is [string] -or $Value -is [ValueType]) {
         $text = if ($Value -is [datetime]) { $Value.ToString('o') } else { [string]$Value }
@@ -2185,7 +2111,7 @@ function New-MobileRunLog {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')][string]$MobileName,
-        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out', 'Preflight', 'SMB-Status')][string]$Procedure,
+        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out', 'Preflight')][string]$Procedure,
         [string]$LogRoot = $script:Config.MobileDeployments
     )
     New-Item -ItemType Directory -Path $LogRoot -Force -ErrorAction Stop | Out-Null
@@ -2201,8 +2127,6 @@ function New-MobileRunLog {
 }
 
 function Get-WindowsProcedureHookRunner {
-    [CmdletBinding()]
-    param()
     return {
         param([array]$Hooks, [string]$MobileName, [string]$Procedure, [string]$RunId)
         $actions = [System.Collections.Generic.List[object]]::new()
@@ -2276,11 +2200,14 @@ function Get-WindowsProcedureHookRunner {
     }
 }
 
-function Get-LinuxProcedureHookScript {
-    [CmdletBinding()]
-    param([array]$Hooks, [string]$MobileName, [string]$Procedure, [string]$RunId,
-        [switch]$Standalone,
-        [string]$ToolPath = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')
+function Get-LinuxProcedureHookScript(
+    [array]$Hooks,
+    [string]$MobileName,
+    [string]$Procedure,
+    [string]$RunId,
+    [switch]$Standalone,
+    [string]$ToolPath = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+) {
     if (-not $Hooks) { return '' }
     $header = @'
 # Procedure hooks run in isolated child shells; stdout never mixes with result JSON.
@@ -2403,12 +2330,6 @@ function Get-WindowsTask-LogArchiver {
 }
 
 function New-WindowsPostTask-UserRights {
-    [CmdletBinding()]
-    param(
-        [switch]$Sharing,
-        [switch]$HasLinux
-    )
-
     return {
         # Task: User Rights
 
@@ -2501,19 +2422,9 @@ function New-WindowsPostTask-UserRights {
     }.ToString()
 }
 
-function Get-PostDeployScript {
-    [CmdletBinding()]
-    param(
-        [switch]$UserRights,
-        [switch]$Sharing,
-        [switch]$HasLinux,
-
-        [string[]]$DriveLetters
-    )
-
+function Get-PostDeployScript([switch]$UserRights) {
     $selected = @(Get-DeploymentTaskSelection -Platform Windows -Phase PostDeployment)
     if (-not $PSBoundParameters.ContainsKey('UserRights')) { $UserRights = 'UserRights' -in $selected }
-    if (-not $PSBoundParameters.ContainsKey('Sharing')) { $Sharing = 'NetworkSharing' -in $selected }
     $tasks = [System.Collections.Generic.List[string]]::new()
 
     $tasks.Add(({
@@ -2547,9 +2458,7 @@ function Get-PostDeployScript {
                 }
             }).ToString())
 
-    if ($UserRights) { $tasks.Add( (New-WindowsPostTask-UserRights  -Sharing:$Sharing  -HasLinux:$HasLinux)) }
-
-    # NetworkSharing is prepared by the SMB coordinator, independently of this optional task.
+    if ($UserRights) { $tasks.Add((New-WindowsPostTask-UserRights)) }
 
     $tasks.Add(({
                 "[ Post Deployment Ran - $(Get-Date) ]" |
@@ -2566,12 +2475,7 @@ function Get-PostDeployScript {
     return ($tasks -join "`n`n")
 }
 
-function Get-TaskData {
-    param(
-        [string]$tasksPath,
-        [bool]$hasLinux
-    )
-
+function Get-TaskData([string]$tasksPath, [bool]$hasLinux) {
     $selected = @(Get-DeploymentTaskSelection -Platform Windows -Phase Scheduled)
     $postTasks = @(Get-DeploymentTaskSelection -Platform Windows -Phase PostDeployment)
     $taskData = @()
@@ -2590,7 +2494,7 @@ function Get-TaskData {
             'PostDeploy' {
                 # Do not register an otherwise empty post-deployment task.
                 if ('UserRights' -notin $postTasks) { continue }
-                $scriptText = Get-PostDeployScript -HasLinux:$hasLinux
+                $scriptText = Get-PostDeployScript
                 $trigger = @{ Type = [TaskTriggerType]::Boot; Delay = 'PT1M' }
                 $xml = New-TaskXML -Description 'Runs after deployment' -Author '[Mobile Administration]' `
                     -Execute 'powershell.exe' -ToEncode $scriptText -TriggerConfigs @($trigger)
@@ -2992,57 +2896,13 @@ $script:WindowsUnregisterBlock = {
 
 #region Linux provisioning and cleanup
 
-function New-LinuxTask-CreateDirectory {
-    [CmdletBinding()]
-    param([string]$Path = '/mobiles/home')
+function New-LinuxTask-CreateDirectory([string]$Path = '/mobiles/home') {
     return @"
 # Task: Create Directory: ($Path)
 if dzdo mkdir -p '$Path' &> /dev/null; then
     record_action 'Directory' '$Path' 'Success'
 else
     record_failure 'Directory: $Path failed to create'
-fi
-"@
-}
-
-function New-LinuxTask-AddLogService {
-    [CmdletBinding()]
-    param([string]$ExecPath = '/path/to-rotate')
-    return @"
-#Log rotation Unit Files
-
-cat << 'EOF' | dzdo tee /etc/systemd/system/mobile-logrotate.timer >/dev/null
-[Unit]
-Description=Mobile Log Rotate Timer
-
-[Timer]
-OnCalendar=Sun 23:59
-Persistent=True
-
-[Install]
-WantedBy=timers.target
-EOF
-
-cat << 'EOF' | dzdo tee /etc/systemd/system/mobile-logrotate.service >/dev/null
-[Unit]
-Description=Mobile Log Rotate Service
-
-[Service]
-Restart=on-failure
-RemainAfterExit=no
-ExecStart=$ExecPath
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-dzdo systemctl daemon-reload &>/dev/null
-
-if dzdo systemctl enable --now mobile-logrotate.timer &>/dev/null; then
-    record_action 'Task: LogArchive' 'mobile-logrotate.timer' 'Success'
-else
-    record_action 'Task: LogArchive' 'mobile-logrotate.timer' 'Failed'
-    record_failure "Scheduled task 'mobile-logrotate.timer': failed to enable"
 fi
 "@
 }
@@ -3181,6 +3041,85 @@ fi
 "@
 }
 
+function Get-LinuxResultHeader([switch]$TextDetails) {
+    # Check-in historically records text details; check-out supports JSON details.
+    $format = if ($TextDetails) { 'text' } else { 'json' }
+    return (@'
+#!/usr/bin/env bash
+set -o pipefail
+action_details_format=__DETAILS_FORMAT__
+
+declare -a actions_json=()
+declare -a failures=()
+
+record_action() {
+    local category="$1"
+    local name="$2"
+    local status="$3"
+    local details="${4:-}" details_option='--arg'
+    if [[ "$action_details_format" == json ]]; then
+        details="${4:-null}"
+        details_option='--argjson'
+    fi
+
+    actions_json+=( "$(jq -n \
+        --arg cat "$category" \
+        --arg name "$name" \
+        --arg stat "$status" \
+        "$details_option" det "$details" \
+        '{
+            Category: $cat,
+            Name: $name,
+            Status: $stat,
+            Details: (if $det == "" then null else $det end)
+        }'
+        )" )
+}
+
+record_failure() {
+    failures+=("$1")
+}
+array_to_json() {
+    if (( $# == 0 )); then
+        printf '[]'
+    else
+        printf '%s\n' "$@" | jq -R . | jq -s .
+    fi
+}
+'@).Replace('__DETAILS_FORMAT__', $format)
+}
+
+function Get-LinuxResultFooter {
+    return @'
+# --- Result Serialization ---
+
+final_actions="[$(IFS=,; echo "${actions_json[*]}")]"
+final_failures="$(array_to_json "${failures[@]}")"
+
+jq -n \
+    --arg hostname "$(hostname -s)" \
+    --argjson success "$([[ ${#failures[@]} -eq 0 ]] && echo true || echo false)" \
+    --argjson actions "$final_actions" \
+    --argjson failures "$final_failures" \
+    '{
+        HostName: $hostname,
+        Platform: "Linux",
+        Success: $success,
+        Actions: $actions,
+        Failures: $failures
+    }'
+'@
+}
+
+function Get-LinuxDeploymentUsers([array]$AllUsers) {
+    foreach ($group in ($AllUsers | Group-Object BaseName)) {
+        $group.Group |
+            Where-Object { $null -ne $_.LinuxAccountType } |
+            Sort-Object { $script:GroupMetadata[$_.GroupType].Priority } -Descending |
+            Select-Object -First 1
+    }
+}
+
 function Get-LinuxDeployScript {
     [CmdletBinding()]
     param (
@@ -3196,100 +3135,30 @@ function Get-LinuxDeployScript {
         # [Parameter(ParameterSetName='disjoin', Mandatory=$true)]
         [string]$b64kt,
 
-        [Parameter()]
-        [switch]$SkipLogrotate,
         [array]$Hooks = @(),
         [string]$MobileName,
-        [string]$RunId,
-        [string]$SmbId
+        [string]$RunId
     )
 
-    # 1. Resolve users according to metadata priority
-    $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName)) {
-        $group.Group |
-            Where-Object { $null -ne $_.LinuxAccountType } |
-            Sort-Object { $script:GroupMetadata[$_.GroupType].Priority } -Descending |
-            Select-Object -First 1
-    }
+    # Resolve users according to metadata priority
+    $linuxUsers = @(Get-LinuxDeploymentUsers -AllUsers $AllUsers)
 
-    # 2. Bash execution runtime + state logger
-    $header = @'
-#!/usr/bin/env bash
-set -o pipefail
+    $header = Get-LinuxResultHeader
 
-declare -a actions_json=()
-declare -a failures=()
+    $footer = Get-LinuxResultFooter
 
-record_action() {
-    local category="$1"
-    local name="$2"
-    local status="$3"
-    local details="${4:-null}"
-
-    actions_json+=( "$(jq -n \
-        --arg cat "$category" \
-        --arg name "$name" \
-        --arg stat "$status" \
-        --argjson det "$details" \
-        '{
-            Category: $cat,
-             Name: $name,
-             Status: $stat,
-             Details: (if $det == "" then null else $det end)
-
-        }'
-        )" )
-}
-
-record_failure() {
-    failures+=("$1")
-}
-array_to_json() {
-    if (( $# == 0 )); then
-        printf '[]'
-    else
-        printf '%s\n' "$@" | jq -R . | jq -s .
-    fi
-}
-'@
-
-    $footer = @'
-# --- Result Serialization ---
-final_actions="[$(IFS=,; echo "${actions_json[*]}")]"
-if [[ ${#failures[@]} -eq 0 ]]; then
-    final_failures="[]"
-else
-    final_failures="$(printf '%s\n' "${failures[@]}" | jq -R . | jq -s .)"
-fi
-
-jq -n \
-    --arg hostname "$(hostname -s)" \
-    --argjson success "$([[ ${#failures[@]} -eq 0 ]] && echo true || echo false)" \
-    --argjson actions "$final_actions" \
-    --argjson failures "$final_failures" \
-    '{
-        HostName: $hostname,
-        Platform: "Linux",
-        Success: $success,
-        Actions: $actions,
-        Failures: $failures
-    }'
-'@
-
-    # 3. Assemble optional tasks in dependency order from the manifest selection.
+    # Assemble optional tasks in dependency order from the manifest selection.
     $selected = @(Get-DeploymentTaskSelection -Platform Linux -Phase Provisioning)
     $tasks = [System.Collections.Generic.List[string]]::new()
     $tasks.Add($header)
     foreach ($task in $selected) {
         switch ($task) {
             'CreateDirectory' { $tasks.Add((New-LinuxTask-CreateDirectory -Path '/mobiles/home')) }
-            'LogService' { if (-not $SkipLogrotate) { $tasks.Add((New-LinuxTask-AddLogService)) } }
             'Luks' { if (-not $SkipLuks) { $tasks.Add((New-LinuxTask-Luks -CurrentPass $script:Config.curLuks -NewPin $script:Config.encryptionPin)) } }
             'AddUsers' { if ($linuxUsers) { $tasks.Add((New-LinuxTask-AddUsers -Users $linuxUsers -HomeBase '/mobiles/home')) } }
         }
     }
 
-    if ($SmbId) { $tasks.Add((New-LinuxTask-SmbGroup -Id $SmbId)) }
 
     if ($Hooks) {
         $tasks.Add((Get-LinuxProcedureHookScript -Hooks $Hooks -MobileName $MobileName -Procedure 'Check-out' -RunId $RunId))
@@ -3318,60 +3187,10 @@ fi
         $tasks.Add((New-LinuxTask-LeaveDomain -b64Ktab $b64kt))
     }
 
-    # 4. Standardized JSON Output emitter
+    # Standardized JSON output
     $tasks.Add($footer)
 
     return ($tasks -join "`n`n")
-}
-
-function New-LinuxUnregisterTask-LogService {
-    [CmdletBinding()]
-    param()
-
-    return @'
-# Task: Remove Log Rotation Service
-
-mobile_units=(
-    'mobile-logrotate.timer'
-    'mobile-logrotate.service'
-)
-
-unitFailure=false
-
-for unit in "${mobile_units[@]}"; do
-
-    unitPath="/etc/systemd/system/$unit"
-
-    #
-    # Already absent satisfies desired state.
-    #
-    if [[ ! -e "$unitPath" ]]; then
-        continue
-    fi
-
-    dzdo systemctl disable --now "$unit" &>/dev/null
-
-    if dzdo rm -f "$unitPath" &>/dev/null; then
-        :
-    else
-        unitFailure=true
-        record_failure "Scheduled task '$unit': failed to remove unit file"
-    fi
-done
-
-if dzdo systemctl daemon-reload &>/dev/null; then
-    :
-else
-    unitFailure=true
-    record_failure 'Systemd: daemon-reload failed'
-fi
-
-if [[ "$unitFailure" == false ]]; then
-    record_action 'ScheduledTask' 'mobile-logrotate' 'Success'
-else
-    record_action 'ScheduledTask' 'mobile-logrotate' 'Failed'
-fi
-'@
 }
 
 function New-LinuxUnregisterTask-Users {
@@ -3476,7 +3295,6 @@ function Get-LinuxUnregisterScript {
 
         [bool]$Archive = $true,
 
-        [switch]$SkipLogrotate,
         [array]$Hooks = @(),
         [string]$MobileName,
         [string]$RunId
@@ -3485,53 +3303,9 @@ function Get-LinuxUnregisterScript {
     #
     # Resolve canonical Linux account for each user.
     #
-    $linuxUsers = foreach ($group in ($AllUsers | Group-Object BaseName)) {
-        $group.Group |
-            Where-Object { $null -ne $_.LinuxAccountType } |
-            Sort-Object {
-                $script:GroupMetadata[$_.GroupType].Priority
-            } -Descending |
-            Select-Object -First 1
-    }
+    $linuxUsers = @(Get-LinuxDeploymentUsers -AllUsers $AllUsers)
 
-    $header = @'
-#!/usr/bin/env bash
-set -o pipefail
-
-declare -a actions_json=()
-declare -a failures=()
-
-record_action() {
-    local category="$1"
-    local name="$2"
-    local status="$3"
-    local details="${4:-}"
-
-    actions_json+=( "$(jq -cn \
-        --arg cat "$category" \
-        --arg name "$name" \
-        --arg stat "$status" \
-        --arg det "$details" \
-        '{
-            Category: $cat,
-            Name: $name,
-            Status: $stat,
-            Details: (if $det == "" then null else $det end)
-        }')" )
-}
-
-record_failure() {
-    failures+=("$1")
-}
-
-array_to_json() {
-    if (( $# == 0 )); then
-        printf '[]'
-    else
-        printf '%s\n' "$@" | jq -R . | jq -s .
-    fi
-}
-'@
+    $header = Get-LinuxResultHeader -TextDetails
 
     $tasks = [System.Collections.Generic.List[string]]::new()
     $tasks.Add($header)
@@ -3550,37 +3324,13 @@ array_to_json() {
         )
     }
 
-    if (-not $SkipLogrotate) {
-        $tasks.Add(
-            (New-LinuxUnregisterTask-LogService)
-        )
-    }
-
     if ($Hooks) {
         $tasks.Add('else')
         $tasks.Add("record_action 'Cleanup' 'Built-in cleanup' 'Skipped'")
         $tasks.Add('fi')
     }
 
-    $footer = @'
-# --- Result Serialization ---
-
-final_actions="[$(IFS=,; echo "${actions_json[*]}")]"
-final_failures="$(array_to_json "${failures[@]}")"
-
-jq -n \
-    --arg hostname "$(hostname -s)" \
-    --argjson success "$([[ ${#failures[@]} -eq 0 ]] && echo true || echo false)" \
-    --argjson actions "$final_actions" \
-    --argjson failures "$final_failures" \
-    '{
-        HostName: $hostname,
-        Platform: "Linux",
-        Success: $success,
-        Actions: $actions,
-        Failures: $failures
-    }'
-'@
+    $footer = Get-LinuxResultFooter
 
     $tasks.Add($footer)
 
@@ -3592,8 +3342,6 @@ jq -n \
 #region Windows information collectors
 
 function Get-WindowsCollector-Registry {
-    [CmdletBinding()]
-    param()
     return ({
             function Read-MobileRegistryKey {
                 param([Parameter(Mandatory)][string]$Path)
@@ -3614,9 +3362,6 @@ function Get-WindowsCollector-Registry {
 }
 
 function Get-WindowsCollector-DiskSpace {
-    [CmdletBinding()]
-    param()
-
     return ({
             function Get-DiskSpace {
                 param([int]$MinimumFreeGB = 20, [int]$MinimumFreePercent = 10)
@@ -3645,8 +3390,6 @@ function Get-WindowsCollector-DiskSpace {
 }
 
 function Get-WindowsCollector-Symantec {
-    [CmdletBinding()]
-    param()
     return ({
             function Get-SymantecInformation {
                 # Broadcom article 181033: native path for 14.3 RU5+, WOW6432Node for older x64 agents.
@@ -3675,9 +3418,6 @@ function Get-WindowsCollector-Symantec {
 }
 
 function Get-WindowsCollector-Ivanti {
-    [CmdletBinding()]
-    param()
-
     return ({
             function Get-IvantiInformation {
                 $paths = @(
@@ -3738,9 +3478,6 @@ function Get-WindowsCollector-Ivanti {
 }
 
 function Get-WindowsCollector-SecurityUpdates {
-    [CmdletBinding()]
-    param()
-
     return ({
             function Get-SecurityUpdateInformation {
                 $session = New-Object -ComObject Microsoft.Update.Session
@@ -3769,9 +3506,6 @@ function Get-WindowsCollector-SecurityUpdates {
 }
 
 function Get-WindowsInformationBlock {
-    [CmdletBinding()]
-    param()
-
     $parts = [System.Collections.Generic.List[string]]::new()
 
     # 1. Inject Child Functions
@@ -3887,9 +3621,6 @@ function Get-WindowsInformationBlock {
 #region Linux information collectors
 
 function Get-LinuxCollector-DiskSpace {
-    [CmdletBinding()]
-    param()
-
     return @'
 # Task: Disk Space
 
@@ -3921,9 +3652,6 @@ disk_json="$(
 }
 
 function Get-LinuxInformationScript {
-    [CmdletBinding()]
-    param()
-
     $parts = [System.Collections.Generic.List[string]]::new()
     $parts.Add('#!/usr/bin/env bash')
     $parts.Add((Get-LinuxCollector-DiskSpace))
@@ -4012,14 +3740,7 @@ jq -n \
 
 #region Information collection orchestration and legacy collectors
 
-function Invoke-InformationCollector {
-    [CmdletBinding()]
-    param(
-        [Parameter()][array]$winComputers,
-        [Parameter()][array]$linComputers,
-        [Parameter()][string]$sshKeyPath
-    )
-
+function Invoke-InformationCollector([array]$winComputers, [array]$linComputers, [string]$sshKeyPath) {
     $winResult = @()
     $linResult = @()
 
@@ -4116,9 +3837,7 @@ function Invoke-InformationCollector {
 
 #region Standalone preflight scans and readiness reporting
 
-function Get-MobileDefinitionAssessment {
-    [CmdletBinding()]
-    param([AllowNull()][string]$Date, [ValidateRange(0, 3650)][int]$MaximumAgeDays = 30)
+function Get-MobileDefinitionAssessment([string]$Date, [ValidateRange(0, 3650)][int]$MaximumAgeDays = 30) {
     $parsed = [datetime]::MinValue
     $valid = [datetime]::TryParseExact($Date, [string[]]@('yyyy-MM-dd', 'yyyy/MM/dd', 'yyyyMMdd'),
         [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)
@@ -4131,8 +3850,6 @@ function Get-MobileDefinitionAssessment {
 }
 
 function Get-WindowsPreflightScanWorker {
-    [CmdletBinding()]
-    param()
     return {
         param([Parameter(Mandatory)][string]$RunDirectory)
         $ErrorActionPreference = 'Stop'
@@ -4338,8 +4055,6 @@ function Get-WindowsPreflightScanState {
 }
 
 function Get-WindowsPreflightBlock {
-    [CmdletBinding()]
-    param()
     $parts = [System.Collections.Generic.List[string]]::new()
     $parts.Add('param($Options)')
     $parts.Add((Get-WindowsCollector-Registry))
@@ -4382,8 +4097,6 @@ function Get-WindowsPreflightBlock {
 }
 
 function Get-LinuxPreflightScanWorker {
-    [CmdletBinding()]
-    param()
     return @'
 #!/usr/bin/env bash
 set -o pipefail
@@ -4932,7 +4645,6 @@ function Format-DeploymentResults {
             Host = $host
 
             # Privileges = Get-AggregateStatus  -Result $result  -Category 'Privilege'
-            # NetworkSharing = Get-AggregateStatus -Result $result -Category 'NetworkSharing'
 
             LogArchiveTask = Get-AggregateStatus -Result $result -Category 'Task: LogArchive'
             # ScheduledTasks = Get-AggregateStatus  -Result $result  -Category 'ScheduledTask'
@@ -5117,14 +4829,50 @@ function Get-MobileOverview {
 
 #endregion
 
-#region SMB deployment coordination
-# Keep platform operations separate from the deployment commands and controller record.
-. (Join-Path $PSScriptRoot 'Private/WindowsSmb.ps1')
-. (Join-Path $PSScriptRoot 'Private/LinuxSmb.ps1')
-. (Join-Path $PSScriptRoot 'Private/MobileSmb.ps1')
-#endregion
-
 #region Deployment commands
+
+# Both procedures use the same host result shape, including hosts that did not reply.
+function ConvertFrom-WindowsDeploymentResult([array]$Results, [array]$Computers, [array]$TransportErrors) {
+    $returned = @{}
+    foreach ($result in $Results) {
+        if ($result.PSComputerName) { $returned[$result.PSComputerName] = $true }
+        [PSCustomObject]@{
+            HostName = $result.PSComputerName
+            Platform = 'Windows'
+            Success = [bool]$result.Success
+            Actions = @($result.Actions)
+            Failures = @($result.Failures)
+        }
+    }
+    foreach ($computer in $Computers) {
+        if ($returned.ContainsKey($computer)) { continue }
+        $hostErrors = @($TransportErrors | Where-Object {
+                $_.TargetObject -eq $computer -or $_.OriginInfo.PSComputerName -eq $computer
+            })
+        $messages = if ($hostErrors) { @($hostErrors | ForEach-Object { $_.Exception.Message }) }
+        else { @('No result returned from remote host.') }
+        [PSCustomObject]@{
+            HostName = $computer; Platform = 'Windows'; Success = $false
+            Actions = @(); Failures = @($messages)
+        }
+    }
+}
+
+function ConvertFrom-LinuxDeploymentResult([array]$Results) {
+    foreach ($result in $Results) {
+        if ($result.ExitCode -eq 0 -and $result.StdOut) {
+            try {
+                $result.StdOut | ConvertFrom-Json -ErrorAction Stop
+                continue
+            } catch { $message = "Invalid JSON response: $($_.Exception.Message)" }
+        } elseif ($result.StdErr) { $message = $result.StdErr }
+        else { $message = "SSH exited with code $($result.ExitCode) without a JSON result." }
+        [PSCustomObject]@{
+            HostName = $result.Target; Platform = 'Linux'; Success = $false
+            Actions = @(); Failures = @($message)
+        }
+    }
+}
 
 function Register-MobileDeployment {
     [CmdletBinding()]
@@ -5141,8 +4889,6 @@ function Register-MobileDeployment {
         [string]$oldEncryption = $Script:Config.curLuks,
         [string]$mobileDump    = $Script:Config.mobileDump,
         [string]$nfsHome       = $Script:Config.NfsHome,
-        [string[]]$SmbHosts,
-        [pscredential]$SmbCredential,
         [switch]$Disjoin,
         [string]$LinuxDisjoinKeytab,
         [string]$DomainController,
@@ -5168,11 +4914,6 @@ function Register-MobileDeployment {
         Write-MobileRunEvent -Run $run -Event 'PreflightStarted' -Data $null
         if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
         Write-MobileRunEvent -Run $run -Event 'PreflightCompleted' -Data @{ Success = $true }
-        $sharingEnabled = 'NetworkSharing' -in @(Get-DeploymentTaskSelection -Platform Windows -Phase PostDeployment)
-        if ($SmbHosts -and -not $sharingEnabled) { throw '-SmbHosts requires NetworkSharing in DeploymentTasks.Windows.PostDeployment.' }
-        if ($sharingEnabled -and @($mobileData.Windows).Count) {
-            $smbPlan = Initialize-MobileSmbDeployment -MobileData $mobileData -MobileName $MobileName -SmbHosts $SmbHosts -SmbCredential $SmbCredential -Run $run
-        }
         $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump
         $taskData = @()
         if (@($mobileData.Windows).Count -gt 0) {
@@ -5206,50 +4947,7 @@ function Register-MobileDeployment {
         }
 
 
-        $winResults = @(
-            foreach ($r in $rawWindows) {
-                [PSCustomObject]@{
-                    HostName = $r.PSComputerName
-                    Platform = 'Windows'
-                    Success  = [bool]$r.Success
-                    Actions  = @($r.Actions)
-                    Failures = @($r.Failures)
-                }
-            }
-        )
-
-
-        foreach ($computer in $mobileData.Windows) {
-            $alreadyReturned = $winResults |
-                Where-Object HostName -eq $computer
-
-            if ($alreadyReturned) { continue }
-
-            $hostErrors = @(
-                $winErrors |
-                    Where-Object {
-                        $_.TargetObject -eq $computer -or
-                        $_.OriginInfo.PSComputerName -eq $computer
-                    }
-            )
-
-            $messages = if ($hostErrors) {
-                @($hostErrors | ForEach-Object { $_.Exception.Message })
-            } else {
-                @('No result returned from remote host.')
-            }
-
-            $winResults += [PSCustomObject]@{
-                HostName = $computer
-                Platform = 'Windows'
-                Success  = $false
-                Actions  = @()
-                Failures = $messages
-            }
-        }
-
-        # Need the linux computers and the linux computers there for easy processing
-        # $mobileData.AllUsers | Out-File -Encoding UTF8 (Join-Path $cfg['netAppHome'] "${env:Username}/")
+        $winResults = @(ConvertFrom-WindowsDeploymentResult -Results $rawWindows -Computers $mobileData.Windows -TransportErrors $winErrors)
 
         $linRes = @()
         $linResults = @()
@@ -5257,7 +4955,6 @@ function Register-MobileDeployment {
 
         if ($mobileData.Linux.Count -gt 0) {
             $linSplat = @{ allUsers = $mobileData.AllUsers; Hooks = $linuxHooks; MobileName = $MobileName; RunId = $run.Id }
-            if ($smbPlan) { $linSplat.SmbId = $smbPlan.Id }
             if ($disjoin) {
                 $linSplat['disjoin'] = $true
                 $linSplat['b64kt'] = $LinuxDisjoinKeytab
@@ -5265,35 +4962,7 @@ function Register-MobileDeployment {
             $linuxDeploy = Get-LinuxDeployScript @linSplat
             $linRes = Invoke-Linux -Computers $mobileData.Linux -Script $linuxDeploy -KeyPath $sshKeyPath
 
-            $linResults = foreach ($r in $linRes) {
-                if ($r.ExitCode -eq 0 -and $r.StdOut) {
-                    try {
-                        $r.StdOut | ConvertFrom-Json
-                    } catch {
-                        [PSCustomObject]@{
-                            HostName = $r.Target
-                            Platform = 'Linux'
-                            Success  = $false
-                            Actions  = @()
-                            Failures = @(
-                                "Invalid JSON response: $($_.Exception.Message)"
-                                "STDOUT: $($r.StdOut)"
-                                "STDERR: $($r.StdErr)"
-                            )
-                        }
-                    }
-                } else {
-                    [PSCustomObject]@{
-                        HostName = $r.Target
-                        Platform = 'Linux'
-                        Success  = $false
-                        Actions  = @()
-                        Failures = @($r.StdErr)
-                    }
-                }
-            }
-
-
+            $linResults = @(ConvertFrom-LinuxDeploymentResult -Results $linRes)
         }
         $results = @($winResults) + @($linResults)
         foreach ($result in $linResults) { Write-MobileRunEvent -Run $run -Event 'HostResult' -Data $result }
@@ -5338,14 +5007,6 @@ function Unregister-Deployment {
         Write-MobileRunEvent -Run $run -Event 'TaskSelection' -Data $script:Config.DeploymentTasks
         $mobileData = Get-MobileData -MobileName $MobileName
         Write-MobileRunEvent -Run $run -Event 'Targets' -Data @{ Windows = @($mobileData.Windows); Linux = @($mobileData.Linux) }
-        $smbPlan = Read-MobileSmbPlan $MobileName
-        if ($smbPlan -and $smbPlan.Status -ne 'Restored') {
-            Invoke-MobileSmbCheckInHooks -Plan $smbPlan -Run $run -WindowsHooks $windowsHooks -LinuxHooks $linuxHooks
-            Restore-MobileSmbDeployment -Plan $smbPlan -Run $run
-            $windowsHooks = @(); $linuxHooks = @() # Already executed before storage teardown.
-            $mobileData.Windows = @($smbPlan.Windows | ForEach-Object { $_.HostName })
-            $mobileData.Linux = @($smbPlan.Linux | ForEach-Object { $_.Interface.IPAddress })
-        }
         $taskData = @(
             [PSCustomObject]@{ TaskName = 'Mobile-LogArchiver' }
             [PSCustomObject]@{ TaskName = 'Mobile-DisjoinTask' }
@@ -5356,8 +5017,6 @@ function Unregister-Deployment {
         $linResults = @()
 
         if (@($mobileData.Windows).Count -gt 0) {
-            $winErrors = [System.Collections.Generic.List[object]]::new()
-
             $payload = [PSCustomObject]@{
                 MobileName = $MobileName
                 TaskData = $taskData
@@ -5377,51 +5036,7 @@ function Unregister-Deployment {
                 -ErrorAction SilentlyContinue `
                 -ErrorVariable winErrors
 
-            $winResults = @(
-                foreach ($r in $rawWindows) {
-                    [PSCustomObject]@{
-                        HostName = $r.PSComputerName
-                        Platform = 'Windows'
-                        Success  = [bool]$r.Success
-                        Actions  = @($r.Actions)
-                        Failures = @($r.Failures)
-                    }
-                }
-            )
-
-            foreach ($computer in $mobileData.Windows) {
-                $alreadyReturned = $winResults |
-                    Where-Object HostName -eq $computer
-
-                if ($alreadyReturned) {
-                    continue
-                }
-
-                $hostErrors = @(
-                    $winErrors |
-                        Where-Object {
-                            $_.TargetObject -eq $computer -or
-                            $_.OriginInfo.PSComputerName -eq $computer
-                        }
-                )
-
-                $messages = if ($hostErrors) {
-                    @(
-                        $hostErrors |
-                            ForEach-Object { $_.Exception.Message }
-                    )
-                } else {
-                    @('No result returned from remote host.')
-                }
-
-                $winResults += [PSCustomObject]@{
-                    HostName = $computer
-                    Platform = 'Windows'
-                    Success  = $false
-                    Actions  = @()
-                    Failures = $messages
-                }
-            }
+            $winResults = @(ConvertFrom-WindowsDeploymentResult -Results $rawWindows -Computers $mobileData.Windows -TransportErrors $winErrors)
         }
 
         foreach ($result in $winResults) { Write-MobileRunEvent -Run $run -Event 'HostResult' -Data $result }
@@ -5436,39 +5051,7 @@ function Unregister-Deployment {
                 -Script $linuxUnregister `
                 -KeyPath $sshKeyPath
 
-            $linResults = @(
-                foreach ($r in $rawLinux) {
-                    if ($r.ExitCode -eq 0 -and $r.StdOut) {
-                        try {
-                            $r.StdOut | ConvertFrom-Json
-                        } catch {
-                            [PSCustomObject]@{
-                                HostName = $r.Target
-                                Platform = 'Linux'
-                                Success  = $false
-                                Actions  = @()
-                                Failures = @(
-                                    "Invalid JSON response: $($_.Exception.Message)"
-                                )
-                            }
-                        }
-                    } else {
-                        [PSCustomObject]@{
-                            HostName = $r.Target
-                            Platform = 'Linux'
-                            Success  = $false
-                            Actions  = @()
-                            Failures = @(
-                                if ($r.StdErr) {
-                                    $r.StdErr
-                                } else {
-                                    "SSH exited with code $($r.ExitCode)"
-                                }
-                            )
-                        }
-                    }
-                }
-            )
+            $linResults = @(ConvertFrom-LinuxDeploymentResult -Results $rawLinux)
         }
 
         $results = @($winResults) + @($linResults)
