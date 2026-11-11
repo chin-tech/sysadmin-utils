@@ -6,6 +6,8 @@ Start or inspect AV scans before checkout, without creating accounts, publishing
 .\Mobiles.ps1 -Preflight -Name example
 ```
 
+Windows dispatch uses the shared `New-TaskXML` builder with an encoded PowerShell action, registered as SYSTEM and explicitly started without an automatic trigger. Scan options, output, and results remain in the protected state directory; a separate generated `worker.ps1` is no longer needed.
+
 Repeat the same command to inspect running scans or the latest completed result. It returns after dispatch/status collection and does not wait for scan completion. Completed attempts are reused until you explicitly request a new scan:
 
 ```powershell

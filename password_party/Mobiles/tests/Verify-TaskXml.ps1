@@ -41,11 +41,16 @@ try {
         $xml = New-TaskXML -Execute powershell.exe -Arguments $arguments -TriggerConfigs @(@{ Type=8; Delay='PT30S'; EndBoundary='' }) -ExecutionTimeLimit PT2M
         Assert ($xml -eq '<Task />' -and $script:task.Actions.Last.Arguments.EndsWith($arguments)) 'Task arguments were corrupted'
         Assert ([regex]::Matches($script:task.Actions.Last.Arguments, '-File ').Count -eq 1) 'Explicit arguments were duplicated'
-        Assert ($null -eq $script:task.Triggers.Last.EndBoundary -and $null -eq $script:task.Settings.DeleteExpiredTaskAfter) 'Persistent boot task received expiry settings'
+        Assert ([string]::IsNullOrEmpty($script:task.Triggers.Last.EndBoundary) -and $null -eq $script:task.Settings.DeleteExpiredTaskAfter) 'Persistent boot task received expiry settings'
         Assert ($script:task.Triggers.Last.Type -eq 8 -and $script:task.Principal.UserId -eq 'NT AUTHORITY\SYSTEM' -and $script:task.Settings.ExecutionTimeLimit -eq 'PT2M') 'Boot task settings changed'
         $null = New-TaskXML -Execute powershell.exe -ToEncode 'Write-Output "fixture"' -TriggerConfigs @(@{ Type=8 })
-        Assert ($script:task.Triggers.Last.EndBoundary -and $script:task.Settings.DeleteExpiredTaskAfter -eq 'PT0S') 'Existing one-time boot tasks lost their default expiry'
-        Assert ($script:task.Actions.Last.Arguments.Contains('-Encoded ')) 'Existing encoded task actions changed'
-        'PASS: shared task builder arguments, persistent boot trigger, SYSTEM settings and existing expiring/encoded tasks.'
+        Assert ([string]::IsNullOrEmpty($script:task.Triggers.Last.EndBoundary)) 'Boot task expired without an explicit boundary'
+        Assert ($script:task.Actions.Last.Arguments.Contains('-EncodedCommand ')) 'Existing encoded task actions changed'
+        Assert ($script:task.Actions.Last.Arguments.Contains('-WindowStyle Hidden')) 'Encoded action has an invalid hidden-window argument'
+        $encoded = ($script:task.Actions.Last.Arguments -split '-EncodedCommand ')[1].Trim()
+        Assert ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded)) -eq 'Write-Output "fixture"') 'Encoded action was corrupted'
+        $null = New-TaskXML -ToEncode 'Write-Output "manual"' -TriggerConfigs @() -ExecutionTimeLimit PT6M
+        Assert ($null -eq $script:task.Triggers.Last -and $script:task.Settings.ExecutionTimeLimit -eq 'PT6M') 'Manually started scan task gained a trigger or lost its limit'
+        'PASS: shared task builder arguments, boot triggers, SYSTEM settings, encoded actions and triggerless scan tasks.'
     }
 } finally { Remove-Module $module -ErrorAction SilentlyContinue }

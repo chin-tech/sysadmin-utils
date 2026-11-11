@@ -6,7 +6,7 @@ New-Item -ItemType Directory -Path $fixture | Out-Null
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join '; ') }
-$names = @('Start-WindowsPreflightScanJob', 'Get-WindowsPreflightScanWorker', 'Get-WindowsPreflightScanState', 'Get-LinuxPreflightScanWorker', 'Get-MobileDefinitionAssessment', 'Get-WindowsPreflightBlock', 'Get-LinuxPreflightScript', 'Invoke-MobilePreflight',
+$names = @('New-TaskXML', 'ConvertTo-Base64', 'Start-WindowsPreflightScanJob', 'Get-WindowsPreflightScanWorker', 'Get-WindowsPreflightScanState', 'Get-LinuxPreflightScanWorker', 'Get-MobileDefinitionAssessment', 'Get-WindowsPreflightBlock', 'Get-LinuxPreflightScript', 'Invoke-MobilePreflight',
     'Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
     'ConvertTo-BashArgument', 'New-MobileRunLog', 'Write-MobileRunEvent', 'Format-MobileRunEvent', 'ConvertTo-MobileLogLines')
 $source = $ast.EndBlock.Statements | Where-Object {
@@ -201,6 +201,37 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 }
                 $workerOptions | ConvertTo-Json | Set-Content "$runDirectory/options.json"
                 $env:MOBILE_TEST_SEP_CODE = '0'
+                # Exercise dispatch itself, replacing only the Windows-only ACL setup and scheduler.
+                # The shared XML builder's real encoding/settings are covered in Verify-TaskXml.
+                $dispatchSource = ${function:Start-WindowsPreflightScanJob}.ToString()
+                $aclStart = $dispatchSource.IndexOf('    $acl =')
+                $aclEnd = $dispatchSource.IndexOf('    $runDirectory =', $aclStart)
+                $dispatchSource = $dispatchSource.Remove($aclStart, $aclEnd - $aclStart)
+                $dispatch = [scriptblock]::Create($dispatchSource)
+                $realXmlBuilder = ${function:New-TaskXML}
+                function New-TaskXML {
+                    param($Description,$ToEncode,$TriggerConfigs,$ExecutionTimeLimit)
+                    Assert ($TriggerConfigs.Count -eq 0 -and $ExecutionTimeLimit -eq 'PT6M') 'Preflight XML gained an automatic trigger or lost its timeout'
+                    $script:scanInvocation = $ToEncode
+                    '<Task>fixture encoded action</Task>'
+                }
+                function Register-ScheduledTask {
+                    [CmdletBinding()] param($TaskName,$Xml,$User,[switch]$Force)
+                    Assert ($TaskName -eq 'Mobiles-PreflightAV' -and $Xml -eq '<Task>fixture encoded action</Task>' -and $User -eq 'SYSTEM') 'Preflight did not register the shared XML as SYSTEM'
+                    $script:registeredScan = $TaskName
+                }
+                function Start-ScheduledTask { [CmdletBinding()] param($TaskName)
+                    Assert ($TaskName -eq $script:registeredScan) 'Preflight did not explicitly start the registered task'
+                }
+                function New-ScheduledTaskAction { throw 'Preflight bypassed New-TaskXML' }
+                function New-ScheduledTaskSettingsSet { throw 'Preflight bypassed New-TaskXML' }
+                $dispatchOptions = [pscustomobject]@{ WindowsScanPaths=@('C:'); SymantecScanName=''; ScanTimeoutMinutes=1 }
+                $job = & $dispatch -Options $dispatchOptions -Worker (Get-WindowsPreflightScanWorker) -Root "$fixture/windows state's" -Executable "$tools/DoScan.exe"
+                Assert ($job.State.Status -eq 'Starting' -and -not (Test-Path (Join-Path $job.RunDirectory 'worker.ps1'))) 'Preflight wrote an executable worker or lost its starting state'
+                & ([scriptblock]::Create($script:scanInvocation))
+                $dispatchResult = Get-Content (Join-Path $job.RunDirectory 'result.json') -Raw | ConvertFrom-Json
+                Assert ($dispatchResult.Status -eq 'CompletedNeedsReview') 'Encoded worker invocation lost its quoted state path or scan result'
+                ${function:New-TaskXML} = $realXmlBuilder
                 & (Get-WindowsPreflightScanWorker) -RunDirectory $runDirectory
                 $completed = Get-Content "$runDirectory/result.json" -Raw | ConvertFrom-Json
                 Assert ($completed.Status -eq 'CompletedNeedsReview' -and $completed.CompletedUtc) 'SEP worker exit zero was called clean or not persisted'

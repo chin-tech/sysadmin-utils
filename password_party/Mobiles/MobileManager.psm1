@@ -327,119 +327,91 @@ function Invoke-Linux {
     return $res
 }
 
-function New-TaskXML(
-    [string]$Description = "Automated Task",
-    [string]$Author = "SYSTEM",
-    [string]$Version = "1.0",
+function New-TaskXML {
+    [CmdletBinding()]
+    param(
+        [string]$Description = "Automated Task",
+        [string]$Author = "SYSTEM",
+        [string]$Execute = 'powershell.exe',
+        [string]$ToEncode,
+        [string]$Arguments = "",
+        [hashtable[]]$TriggerConfigs = @(@{ Type = 7 }), # Registration
+        [string]$UserId = "NT AUTHORITY\SYSTEM",
+        [int]$LogonType = 5, # TASK_LOGON_SERVICE
+        [int]$RunLevel = 1,  # TASK_RUNLEVEL_HIGHEST
+        [bool]$Hidden = $true,
+        [string]$ExecutionTimeLimit = "PT72H"
+    )
 
-    [string]$Execute,
-    [string]$ToEncode,
-
-    [string]$Arguments = "",
-
-    # Pass a hashtable or array of hashtables describing triggers
-    [hashtable[]]$TriggerConfigs = @(@{ Type = [TaskTriggerType]::Registration }),
-
-    [string]$UserId = "NT AUTHORITY\SYSTEM",
-    [int]$LogonType = 5, # 5 = TASK_LOGON_SERVICE / SYSTEM
-    [int]$RunLevel = 1,  # 1 = TASK_RUNLEVEL_HIGHEST
-
-    [bool]$Hidden = $true,
-    [string]$ExecutionTimeLimit = "PT72H"
-) {
-    $defaultPSArgs = if ($Execute.ToLower().Contains('powershell')) { "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive "
+    # 1. Resolve Command & Arguments
+    if (-not [string]::IsNullOrWhiteSpace($ToEncode)) {
+        $Arguments = @('-WindowStyle', 'Hidden', '-NonInteractive', '-NoProfile', '-EncodedCommand', (ConvertTo-Base64 $ToEncode), $Arguments) -join ' '
     }
-    $encoded = if (-not ([string]::IsNullOrWhiteSpace($toEncode))) { "-Encoded $(ConvertTo-Base64 $ToEncode)"
-    }
-    $arguments = $defaultPSArgs + $encoded + $arguments
 
+    # 2. Initialize COM Task
     $ts = New-Object -ComObject "Schedule.Service"
     $ts.Connect()
-
-    # 0 = TASK_CREATE (Task Definition)
     $taskDef = $ts.NewTask(0)
 
-    # 1. Registration Info
+    # 3. Registration Info & Principal
     $taskDef.RegistrationInfo.Description = $Description
-    $taskDef.RegistrationInfo.Author = $Author
-    $taskDef.RegistrationInfo.Version = $Version
+    $taskDef.RegistrationInfo.Author      = $Author
 
-    # 2. Task Settings
-    $taskDef.Settings.Enabled = $true
-    $taskDef.Settings.Hidden = $Hidden
-    $taskDef.Settings.StartWhenAvailable = $true
-    $taskDef.Settings.AllowDemandStart = $true
-    $taskDef.Settings.WakeToRun = $true
-    $taskDef.Settings.DisallowStartIfOnBatteries = $false
-    $taskDef.Settings.StopIfGoingOnBatteries = $false
-    $taskDef.Settings.ExecutionTimeLimit = $ExecutionTimeLimit
-    $hasEndBoundary = $TriggerConfigs | Where-Object { $_.ContainsKey("EndBoundary") -and $_.EndBoundary }
-    if ($hasEndBoundary) {
-        $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
-    }
-
-    # 3. Principal Configuration
-    $taskDef.Principal.UserId = $UserId
+    $taskDef.Principal.UserId    = $UserId
     $taskDef.Principal.LogonType = $LogonType
-    $taskDef.Principal.RunLevel = $RunLevel
-    function Get-ValOrFallBack {
-        param($map, $key, $default)
-        if ($map.ContainsKey($key)) {
-            $map[$key]
+    $taskDef.Principal.RunLevel  = $RunLevel
 
-        } else {
-            $default
-        }
+    # 4. Settings Configuration
+    $settings = @{
+        Enabled                    = $true
+        Hidden                     = $Hidden
+        StartWhenAvailable         = $true
+        AllowDemandStart           = $true
+        WakeToRun                  = $true
+        DisallowStartIfOnBatteries = $false
+        StopIfGoingOnBatteries     = $false
+        ExecutionTimeLimit         = $ExecutionTimeLimit
     }
+    foreach ($k in $settings.Keys) { $taskDef.Settings.$k = $settings[$k] }
 
-    # 4. Triggers Configuration
+    # 5. Triggers Configuration
+    $nowIso = (Get-Date).ToString("s")
+
     foreach ($cfg in $TriggerConfigs) {
-        $tType = [TaskTriggerType]$cfg.Type
+        $tType = if ($null -ne $cfg.Type) { [int]$cfg.Type } else { 7 } # Registration
         $trigger = $taskDef.Triggers.Create([int]$tType)
-        $trigger.Enabled = Get-ValOrFallBack $cfg "Enabled" $true
+        $trigger.Enabled = if ($cfg.ContainsKey('Enabled')) { $cfg.Enabled } else { $true }
 
-        switch ($tType) {
-            ([TaskTriggerType]::Logon) {
-                # Specific user or $null / empty string for all users
-                $trigger.UserID  = Get-ValOrFallBack $cfg "UserId" $null
-                $trigger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
+        # Dynamically bind any matching COM properties supplied in the hashtable (e.g., Delay, UserId, DaysInterval)
+        foreach ($key in $cfg.Keys) {
+            if ($key -notin 'Type', 'Enabled' -and $trigger.PSObject.Properties[$key]) {
+                $trigger.$key = $cfg[$key]
             }
-            ([TaskTriggerType]::Boot) {
-                $trigger.Delay = Get-ValOrFallBack $cfg "Delay" "PT30S"
-                $endBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddMinutes(30).ToString('s')
-                if ($endBoundary) {
-                    $trigger.EndBoundary = $endBoundary
-                    $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
+        }
+
+        # Handle type-specific defaults only when omitted
+        switch ($tType) {
+            2 { # Daily
+                if (-not $cfg.DaysInterval)  { $trigger.DaysInterval = 1 }
+                if (-not $cfg.StartBoundary) { $trigger.StartBoundary = $nowIso }
+            }
+            3 { # Weekly
+                if (-not $cfg.WeeksInterval) { $trigger.WeeksInterval = 1 }
+                if (-not $cfg.DaysOfWeek)    { $trigger.DaysOfWeek = 2 } # Monday default (bitmask)
+                if (-not $cfg.StartBoundary) { $trigger.StartBoundary = $nowIso }
+            }
+            1 { # Time
+                if (-not $cfg.StartBoundary) {
+                    $trigger.StartBoundary = (Get-Date).AddMinutes(5).ToString("s")
                 }
             }
-            ([TaskTriggerType]::Daily) {
-
-                $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
-                $trigger.DaysInterval = Get-ValOrFallBack $cfg "DaysInterval" 1
-            }
-            ([TaskTriggerType]::Weekly) {
-                $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
-                $trigger.WeeksInterval = Get-ValOrFallBack $cfg 'WeeksInterval' 1
-                # DaysOfWeek bitmask: 1=Sun, 2=Mon, 4=Tue, 8=Wed, 16=Thu, 32=Fri, 64=Sat
-                $trigger.DaysOfWeek = Get-ValOrFallBack $cfg 'DaysOfWeek' 1
-            }
-            ([TaskTriggerType]::Time) {
-                ## StartBoundary set earlier
-                $trigger.StartBoundary = Get-ValOrFallBack $cfg 'StartBoundary' (Get-Date).AddMinutes(1).ToString('s')
-            }
-            ([TaskTriggerType]::Registration) {
-                $trigger.Delay = Get-ValOrFallBack $cfg 'Delay' 'PT0S'
-                $trigger.EndBoundary = Get-ValOrFallBack $cfg 'EndBoundary' (Get-Date).AddSeconds(15).ToString('s')
-                $taskDef.Settings.DeleteExpiredTaskAfter = 'PT0S'
-            }
         }
     }
 
-
-    # 5. Action Configuration (0 = ExecAction)
+    # 6. Action Configuration (0 = ExecAction)
     $action = $taskDef.Actions.Create(0)
     $action.Path = $Execute
-    $action.Arguments = $Arguments
+    $action.Arguments = $Arguments.Trim()
 
     return $taskDef.XmlText
 }
@@ -504,12 +476,8 @@ function Show-TerminalSinglePicker {
             $key = [Console]::ReadKey($true)
 
             switch ($key.Key) {
-                'UpArrow' {
-                    $currentIndex = ($currentIndex - 1 + $total) % $total
-                }
-                'DownArrow' {
-                    $currentIndex = ($currentIndex + 1) % $total
-                }
+                'UpArrow' { $currentIndex = ($currentIndex - 1 + $total) % $total }
+                'DownArrow' { $currentIndex = ($currentIndex + 1) % $total }
                 'Escape' { return }
                 'Enter' {
                     # Wipe interactive menu
@@ -3760,6 +3728,7 @@ function Invoke-InformationCollector([array]$winComputers, [array]$linComputers,
                 [PSCustomObject]@{
                     HostName = $r.HostName
                     Platform = $r.Platform
+                    PlatformFamily = 'Windows'
                     Success  = $true
                     Summary  = $r.Summary
                     Details  = $r.Details
@@ -3775,6 +3744,7 @@ function Invoke-InformationCollector([array]$winComputers, [array]$linComputers,
             $winResult += [PSCustomObject]@{
                 HostName = $computer
                 Platform = 'Windows'
+                PlatformFamily = 'Windows'
                 Success  = $false
                 Summary  = $null
                 Details  = $null
@@ -3798,6 +3768,7 @@ function Invoke-InformationCollector([array]$winComputers, [array]$linComputers,
                     [PSCustomObject]@{
                         HostName = $r.Target
                         Platform = 'Linux'
+                        PlatformFamily = 'Linux'
                         Success  = $false
                         Summary  = $null
                         Details  = $null
@@ -3811,6 +3782,7 @@ function Invoke-InformationCollector([array]$winComputers, [array]$linComputers,
                     [PSCustomObject]@{
                         HostName = $p.HostName
                         Platform = $p.Platform
+                        PlatformFamily = 'Linux'
                         Success  = $true
                         Summary  = $p.Summary
                         Details  = $p.Details
@@ -3820,6 +3792,7 @@ function Invoke-InformationCollector([array]$winComputers, [array]$linComputers,
                     [PSCustomObject]@{
                         HostName = $r.Target
                         Platform = 'Linux'
+                        PlatformFamily = 'Linux'
                         Success  = $false
                         Summary  = $null
                         Details  = $null
@@ -3938,8 +3911,6 @@ function Start-WindowsPreflightScanJob {
     Set-Acl -LiteralPath $root -AclObject $acl -ErrorAction Stop
     $runDirectory = Join-Path $root ([guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $runDirectory -ErrorAction Stop | Out-Null
-    $workerPath = Join-Path $runDirectory 'worker.ps1'
-    [IO.File]::WriteAllText($workerPath, $Worker.ToString(), [Text.UTF8Encoding]::new($true))
     $workerOptions = [PSCustomObject]@{
         SymantecScanExecutable = $executable; SymantecScanName = $Options.SymantecScanName
         WindowsScanPaths = $Options.WindowsScanPaths; ScanTimeoutMinutes = $Options.ScanTimeoutMinutes
@@ -3949,10 +3920,11 @@ function Start-WindowsPreflightScanJob {
     $saved | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDirectory 'result.json') -Encoding UTF8
     @{ RunDirectory = $runDirectory } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'latest.json') -Encoding UTF8
     try {
-        $shell = (Get-Process -Id $PID).Path
-        $action = New-ScheduledTaskAction -Execute $shell -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$workerPath`" -RunDirectory `"$runDirectory`""
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes ($Options.ScanTimeoutMinutes + 5))
-        Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings -User SYSTEM -RunLevel Highest -Force -ErrorAction Stop | Out-Null
+        $invocation = "& {`n$($Worker.ToString())`n} -RunDirectory '$($runDirectory.Replace("'", "''"))'"
+        $timeLimit = [Xml.XmlConvert]::ToString([TimeSpan]::FromMinutes($Options.ScanTimeoutMinutes + 5))
+        $taskXml = New-TaskXML -Description 'Mobile AV preflight scan' -ToEncode $invocation `
+            -TriggerConfigs @() -ExecutionTimeLimit $timeLimit
+        Register-ScheduledTask -TaskName $taskName -Xml $taskXml -User SYSTEM -Force -ErrorAction Stop | Out-Null
         Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
         $status = 'Starting'
     } catch {
@@ -4057,6 +4029,8 @@ function Get-WindowsPreflightScanState {
 function Get-WindowsPreflightBlock {
     $parts = [System.Collections.Generic.List[string]]::new()
     $parts.Add('param($Options)')
+    $parts.Add('function ConvertTo-Base64 {' + ${function:ConvertTo-Base64}.ToString() + '}')
+    $parts.Add('function New-TaskXML {' + ${function:New-TaskXML}.ToString() + '}')
     $parts.Add((Get-WindowsCollector-Registry))
     $parts.Add((Get-WindowsCollector-Symantec))
     $parts.Add((Get-WindowsCollector-Ivanti))
@@ -4417,91 +4391,72 @@ function Invoke-MobilePreflight {
 
 function Format-HostCollector {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory, ValueFromPipeline)]
-        [object[]]$InputObject
-    )
-    begin {
-        $results = [System.Collections.Generic.List[object]]::new()
-    }
-    process {
-        foreach ($item in $InputObject) {
-            $results.Add($item)
-        }
-    }
+    param([Parameter(Mandatory, ValueFromPipeline)][object[]]$InputObject)
+    begin { $results = [System.Collections.Generic.List[object]]::new() }
+    process { foreach ($item in $InputObject) { $results.Add($item) } }
     end {
-        if ($results.Count -eq 0) {
-            Write-Host "  No telemetry results returned." -ForegroundColor Yellow
+        if (-not $results.Count) {
+            Write-Host '  No telemetry results returned.' -ForegroundColor Yellow
             return
         }
 
-        # Column definitions: header text + the property/logic used to derive each row's value
-        $columns = @(
-            @{ Header = 'HOST';    Getter = { param($r) $r.HostName.ToUpper() } }
-            @{ Header = 'OS';      Getter = { param($r) $r.Platform } }
-            @{ Header = 'KERNEL';  Getter = { param($r) if ($r.Success -and $r.Summary.Kernel) { $r.Summary.Kernel } else { '-' } } }
-            @{ Header = 'AV DEFS'; Getter = { param($r) if ($r.Success -and $r.Summary.AVDefs) { $r.Summary.AVDefs } else { '-' } } }
-            @{ Header = 'IVANTI';  Getter = { param($r) if ($r.Success -and $r.Summary.IvantiVersion) { $r.Summary.IvantiVersion } else { '-' } } }
-            @{ Header = 'IVANTI CORE'; Getter = { param($r) if ($r.Success -and $r.Summary.IvantiCoreServer) { $r.Summary.IvantiCoreServer } else { '-' } } }
-            @{ Header = 'LICENSE'; Getter = { param($r) if ($r.Success -and $r.Summary.License) { $r.Summary.License } else { '-' } } }
-            @{ Header = 'LAPS';    Getter = { param($r) if ($r.Success -and $r.Summary.AdminRotateVersion) { $r.Summary.AdminRotateVersion } else { '-' } } }
-            @{ Header = 'PKGS';    Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.PackageCount) { $r.Summary.PackageCount } else { '-' } } }
-            # @{ Header = 'CPU';     Getter = { param($r) if ($r.Success -and $null -ne $r.Summary.Cores) { $r.Summary.Cores } else { '-' } } }
+        # Keep shared fields and their order consistent across both tables.
+        $commonColumns = @(
+            @{ Header = 'HOST'; Getter = { param($r) ([string]$r.HostName).ToUpperInvariant() } }
+            @{ Header = 'OS'; Getter = { param($r) $r.Platform } }
+            @{ Header = 'KERNEL'; Property = 'Kernel' }
+            @{ Header = 'AV DEFS'; Property = 'AVDefs' }
+            @{ Header = 'LAST UPDATE'; Property = 'LastUpdate' }
+            @{ Header = 'FREE GB'; Property = 'DiskFreeGB' }
+            @{ Header = 'LAPS'; Property = 'AdminRotateVersion' }
+            @{ Header = 'PKGS'; Property = 'PackageCount' }
         )
-
-        $sorted = $results | Sort-Object Platform, HostName
-
-        # Pre-compute every cell value once, then derive each column's width from
-        # the longest of: its header, or any value that will appear under it.
-        $rows = foreach ($r in $sorted) {
-            [PSCustomObject]@{
-                Result = $r
-                Cells  = $columns | ForEach-Object { & $_.Getter $r }
-            }
-        }
-
-        $widths = for ($i = 0; $i -lt $columns.Count; $i++) {
-            $maxCellLen = ($rows | ForEach-Object { "$($_.Cells[$i])".Length } | Measure-Object -Maximum).Maximum
-            [Math]::Max($columns[$i].Header.Length, $maxCellLen)
-        }
-
-        # Build the format string dynamically: "  {0,-W0} {1,-W1} ... {N,-Wn}"
-        $fmt = "  " + (
-            (0..($columns.Count - 1) | ForEach-Object { "{$($_),-$($widths[$_])}" }) -join ' '
+        $windowsColumns = @(
+            @{ Header = 'IVANTI'; Property = 'IvantiVersion' }
+            @{ Header = 'IVANTI CORE'; Property = 'IvantiCoreServer' }
+            @{ Header = 'LICENSE'; Property = 'License' }
         )
-
-        Write-Host ($fmt -f $columns.Header) -ForegroundColor DarkGray
-
-        foreach ($row in $rows) {
-            $r = $row.Result
-            if ($r.Success) {
-                Write-Host ($fmt -f $row.Cells)
-            } else {
-                $failCells = $row.Cells.Clone()
-                $failCells[-1] = ''   # blank the last column so FAILED can be appended after
-                Write-Host ($fmt -f $failCells) -NoNewline
-                Write-Host 'FAILED' -ForegroundColor Red
-            }
+        # PlatformFamily is collector provenance; fall back to the OS label for older results.
+        $groups = $results | Group-Object {
+            if ($_.PlatformFamily) { $_.PlatformFamily }
+            elseif ($_.Platform -match '^WIN') { 'Windows' }
+            else { 'Linux' }
         }
+        foreach ($family in @('Windows','Linux')) {
+            $hosts = @($groups | Where-Object Name -eq $family | ForEach-Object { $_.Group } | Sort-Object HostName)
+            if (-not $hosts.Count) { continue }
+            $columns = $commonColumns
+            if ($family -eq 'Windows') { $columns += $windowsColumns }
+            Write-Host "`n  $family hosts" -ForegroundColor Cyan
 
-        #
-        # Failures beneath table
-        #
-        $failed = @($results | Where-Object { -not $_.Success })
-        if ($failed.Count) {
-            Write-Host ""
-            Write-Host "  Failures:" -ForegroundColor DarkRed
-            $hostWidth = [Math]::Max(
-                10,
-                [int](
-                    $hosts |
-                        ForEach-Object { $_.Length } |
-                        Measure-Object -Maximum
-                ).Maximum
-            )
-            foreach ($r in $failed) {
-                foreach ($failure in @($r.Failures)) {
-                    Write-Host ("    {0,-$hostWidth} {1}" -f $r.HostName, $failure) -ForegroundColor Red
+            $rows = @(foreach ($hostResult in $hosts) {
+                $cells = @(foreach ($column in $columns) {
+                    if ($column.Getter) { & $column.Getter $hostResult }
+                    elseif ($hostResult.Success -and $null -ne $hostResult.Summary.($column.Property) -and
+                            [string]$hostResult.Summary.($column.Property) -ne '') {
+                        $hostResult.Summary.($column.Property)
+                    } else { '-' }
+                })
+                [PSCustomObject]@{ Result = $hostResult; Cells = $cells }
+            })
+            $widths = for ($i = 0; $i -lt $columns.Count; $i++) {
+                $maximum = ($rows | ForEach-Object { ([string]$_.Cells[$i]).Length } | Measure-Object -Maximum).Maximum
+                [Math]::Max($columns[$i].Header.Length, $maximum)
+            }
+            $format = '  ' + ((0..($columns.Count - 1) | ForEach-Object { "{$_,-$($widths[$_])}" }) -join ' ')
+            Write-Host ($format -f $columns.Header) -ForegroundColor DarkGray
+            foreach ($row in $rows) {
+                $line = $format -f $row.Cells
+                if ($row.Result.Success) { Write-Host $line }
+                else { Write-Host "$line  FAILED" -ForegroundColor Red }
+            }
+            $failed = @($hosts | Where-Object { -not $_.Success })
+            if ($failed.Count) {
+                Write-Host '  Failures:' -ForegroundColor DarkRed
+                foreach ($hostResult in $failed) {
+                    foreach ($failure in @($hostResult.Failures)) {
+                        Write-Host "    $($hostResult.HostName): $failure" -ForegroundColor Red
+                    }
                 }
             }
         }
@@ -4525,9 +4480,7 @@ function Format-DeploymentResults {
         return
     }
 
-    function Get-ShortHostName {
-        param([string]$Name)
-
+    function Get-ShortHostName ([string]$Name) {
         if ([string]::IsNullOrWhiteSpace($Name)) {
             return '-'
         }
@@ -4535,15 +4488,7 @@ function Format-DeploymentResults {
         return ($Name -split '\.')[0]
     }
 
-    function Get-AggregateStatus {
-        param(
-            [Parameter(Mandatory)]
-            $Result,
-
-            [Parameter(Mandatory)]
-            [string]$Category
-        )
-
+    function Get-AggregateStatus ($Result, [string]$Category) {
         $actions = @( $Result.Actions | Where-Object Category -eq $Category)
 
         if (-not $actions) { return '-' }
