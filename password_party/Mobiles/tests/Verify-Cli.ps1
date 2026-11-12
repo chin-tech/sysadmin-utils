@@ -15,7 +15,7 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
         $source += "`nfunction $name {" + @'
     [CmdletBinding()]
     param([string]$MobileName, [switch]$Full, [switch]$Archive, [switch]$Disjoin,
-        [string]$LinuxDisjoinKeytab, [string]$DomainController, [string]$DomainPrincipal, [int]$DomainKeyVersion,
+        [string]$LinuxDisjoinKeytab, [string]$DomainPrincipal, [int]$DomainKeyVersion,
         [switch]$Rescan,
         [switch]$Add, [switch]$Remove, [switch]$Force, [switch]$Console)
     [pscustomobject]@{ Command=$MyInvocation.MyCommand.Name; Options=@{} + $PSBoundParameters; Config=$script:configuration }
@@ -42,7 +42,7 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
     # Exercise discovery before the first invocation: no module/config/site work is needed.
     Assert-Completion '-' @('-Info','-RegisterDeployment','-UnRegisterDeployment','-Scan','-Initialize','-New','-GPO','-Name','-Full')
     Assert-Completion '-Scan fixture -' @('-Rescan','-Force')
-    Assert-Completion '-RegisterDeployment fixture -' @('-Disjoin','-LinuxDisjoinKeytab','-DomainController','-DomainPrincipal','-DomainKeyVersion')
+    Assert-Completion '-RegisterDeployment fixture -' @('-Disjoin','-LinuxDisjoinKeytab','-DomainPrincipal','-DomainKeyVersion')
     Assert-Completion '-UnRegisterDeployment fixture -' @('-Archive')
     Assert-Completion '-Info fixture -' @('-Full')
     Assert-Completion '-GPO fixture -' @('-Add','-Remove','-Force')
@@ -66,8 +66,8 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
     Assert ($result.Command -eq 'Invoke-MobileScan' -and $result.Options.Force -and $result.Options.Rescan) 'Scan controls were not forwarded'
     $result = & $cli -Scan fixture
     Assert (-not $result.Options.ContainsKey('Force') -and -not $result.Options.ContainsKey('Rescan')) 'Omitted scan controls were forwarded'
-    $result = & $cli -RegisterDeployment fixture -Disjoin -LinuxDisjoinKeytab fixture-keytab -DomainController dc -DomainPrincipal admin -DomainKeyVersion 3
-    Assert ($result.Command -eq 'Register-MobileDeployment' -and $result.Options.Disjoin -and $result.Options.LinuxDisjoinKeytab -eq 'fixture-keytab' -and $result.Options.DomainController -eq 'dc' -and $result.Options.DomainPrincipal -eq 'admin' -and $result.Options.DomainKeyVersion -eq 3) 'Check-out options were not forwarded'
+    $result = & $cli -RegisterDeployment fixture -Disjoin -LinuxDisjoinKeytab fixture-keytab -DomainPrincipal admin -DomainKeyVersion 3
+    Assert ($result.Command -eq 'Register-MobileDeployment' -and $result.Options.Disjoin -and $result.Options.LinuxDisjoinKeytab -eq 'fixture-keytab' -and $result.Options.DomainPrincipal -eq 'admin' -and $result.Options.DomainKeyVersion -eq 3) 'Check-out options were not forwarded'
     $result = & $cli -UnRegisterDeployment fixture -Archive
     Assert ($result.Command -eq 'Unregister-Deployment' -and $result.Options.Archive) 'Check-in dispatch changed'
     $result = & $cli -GPO -Add fixture
@@ -79,6 +79,7 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
     Assert ($result.Command -eq 'Initialize-Environment' -and $result.Options.Console) 'Initialization dispatch changed'
 
     Assert-Rejected @{ Scan=$true; Name='fixture'; Disjoin=$true }
+    Assert-Rejected @{ RegisterDeployment=$true; Name='fixture'; DomainController='dc' }
     Assert-Rejected @{ RegisterDeployment=$true; Name='fixture'; Rescan=$true }
     Assert-Rejected @{ GPO=$true; Add=$true; Remove=$true; Name='fixture' }
     Assert-Rejected @{ GPO=$true; Name='fixture' }

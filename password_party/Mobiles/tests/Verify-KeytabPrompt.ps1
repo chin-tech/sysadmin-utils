@@ -12,6 +12,11 @@ $module = New-Module -ScriptBlock ([scriptblock]::Create($node.Extent.Text))
 try {
     & $module {
         function Assert($condition, $message) { if (-not $condition) { throw $message } }
+        function Get-MobileDomainController {
+            $script:discoveries++
+            if ($script:failDiscovery) { throw 'Fixture DC discovery failed' }
+            'dc.example.test'
+        }
         function Read-Host {
             param($Prompt, [switch]$AsSecureString)
             $script:prompts++
@@ -30,23 +35,30 @@ try {
             'YWJj'
         }
         $script:prompts = 0
+        $script:discoveries = 0
         $script:generations = 0
         $script:securePrompt = $false
         $result = Resolve-LinuxDisjoinKeytab -Keytab 'YWJj'
-        Assert ($result -eq 'YWJj' -and $script:prompts -eq 0 -and $script:generations -eq 0) 'Supplied keytab triggered a prompt'
-        $result = Resolve-LinuxDisjoinKeytab -DomainController 'dc.example.test'
-        Assert ($result -eq 'YWJj' -and $script:prompts -eq 3 -and $script:securePrompt) 'Interactive principal/version/password flow failed'
+        Assert ($result -eq 'YWJj' -and $script:prompts -eq 0 -and $script:generations -eq 0 -and $script:discoveries -eq 0) 'Supplied keytab triggered discovery or a prompt'
+        $result = Resolve-LinuxDisjoinKeytab
+        Assert ($result -eq 'YWJj' -and $script:prompts -eq 3 -and $script:securePrompt -and $script:discoveries -eq 1) 'Interactive principal/version/password flow failed'
         $script:prompts = 0
-        $result = Resolve-LinuxDisjoinKeytab -DomainController 'dc.example.test' -Principal 'deployer@EXAMPLE.TEST' -Kvno 7
+        $result = Resolve-LinuxDisjoinKeytab -Principal 'deployer@EXAMPLE.TEST' -Kvno 7
         Assert ($result -eq 'YWJj' -and $script:prompts -eq 1) 'Explicit inputs did not reduce prompting to the secure password'
         $script:failGeneration = $true
         $rejected = $false
-        try { Resolve-LinuxDisjoinKeytab -DomainController 'dc.example.test' -Principal 'deployer@EXAMPLE.TEST' -Kvno 7 } catch { $rejected = $true }
+        try { Resolve-LinuxDisjoinKeytab -Principal 'deployer@EXAMPLE.TEST' -Kvno 7 } catch { $rejected = $true }
         Assert $rejected 'Generation failure was swallowed'
         $before = $script:generations
         $rejected = $false
         try { Resolve-LinuxDisjoinKeytab -Principal 'invalid principal' -Kvno 7 } catch { $rejected = $true }
         Assert ($rejected -and $script:generations -eq $before) 'Invalid principal reached generator'
-        'PASS: secure prompting, explicit inputs, supplied-keytab bypass, and failure propagation.'
+        $script:failDiscovery = $true
+        $before = $script:generations
+        $script:prompts = 0
+        $rejected = $false
+        try { Resolve-LinuxDisjoinKeytab -Principal 'deployer@EXAMPLE.TEST' -Kvno 7 } catch { $rejected = $_.Exception.Message -eq 'Fixture DC discovery failed' }
+        Assert ($rejected -and $script:generations -eq $before -and $script:prompts -eq 0) 'Discovery failure prompted for a password or reached generation'
+        'PASS: automatic DC discovery, secure prompting, explicit inputs, supplied-keytab bypass, and discovery/generation failure propagation.'
     }
 } finally { Remove-Module $module -ErrorAction SilentlyContinue }

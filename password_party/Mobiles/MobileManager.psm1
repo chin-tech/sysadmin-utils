@@ -862,9 +862,12 @@ function Get-UserCreds {
     return $AllUsers
 }
 
+function Get-MobileDomainController {
+    [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().FindDomainController().Name
+}
+
 function Resolve-LinuxDisjoinKeytab(
     [string]$Keytab,
-    [string]$DomainController,
     [string]$Principal,
     [int]$Kvno = 0
 ) {
@@ -883,9 +886,7 @@ function Resolve-LinuxDisjoinKeytab(
         if (-not [int]::TryParse($versionInput, [ref]$Kvno)) { throw 'Key version number must be a positive integer.' }
     }
     if ($Kvno -lt 1) { throw 'Key version number must be a positive integer.' }
-    if ([string]::IsNullOrWhiteSpace($DomainController)) {
-        $DomainController = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().FindDomainController().Name
-    }
+    $DomainController = Get-MobileDomainController
 
     $secretPass = Read-Host -AsSecureString -Prompt "Domain password for $Principal"
     try {
@@ -4679,7 +4680,6 @@ function Register-MobileDeployment {
         [string]$nfsHome       = $Script:Config.NfsHome,
         [switch]$Disjoin,
         [string]$LinuxDisjoinKeytab,
-        [string]$DomainController,
         [string]$DomainPrincipal,
         [int]$DomainKeyVersion = 0
     )
@@ -4697,7 +4697,7 @@ function Register-MobileDeployment {
         Write-MobileRunEvent -Run $run -Event 'Targets' -Data @{ Windows = @($mobileData.Windows); Linux = @($mobileData.Linux) }
         if ($Disjoin -and $mobileData.Linux.Count -gt 0) {
             $LinuxDisjoinKeytab = Resolve-LinuxDisjoinKeytab -Keytab $LinuxDisjoinKeytab `
-                -DomainController $DomainController -Principal $DomainPrincipal -Kvno $DomainKeyVersion
+                -Principal $DomainPrincipal -Kvno $DomainKeyVersion
         }
         Write-MobileRunEvent -Run $run -Event 'PreflightStarted' -Data $null
         if (-not (Initialize-Environment)) { throw "Failed to properly initialize environment!" }
