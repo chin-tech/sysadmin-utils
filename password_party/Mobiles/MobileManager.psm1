@@ -3445,34 +3445,6 @@ function Get-WindowsCollector-Ivanti {
         }).ToString()
 }
 
-function Get-WindowsCollector-SecurityUpdates {
-    return ({
-            function Get-SecurityUpdateInformation {
-                $session = New-Object -ComObject Microsoft.Update.Session
-                $searcher = $session.CreateUpdateSearcher()
-                $count = $searcher.GetTotalHistoryCount()
-
-                $history = if ($count -gt 0) {
-                    @($searcher.QueryHistory(0, [math]::Min($count, 100)) |
-                            Where-Object { $_.ResultCode -eq 2 -and $_.Title -match 'Security|Cumulative|KB\d+' } |
-                            Select-Object Title, Date, ResultCode)
-                } else {
-                    @()
-                }
-
-                $hotfixes = @(Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending |
-                        Select-Object HotFixID, Description, InstalledOn)
-
-                [PSCustomObject]@{
-                    LastRelevantUpdate = $history | Sort-Object Date -Descending | Select-Object -First 1
-                    UpdateHistory = $history
-                    InstalledHotfixes = $hotfixes
-                    IvantiPatchCompliance = 'Unknown'
-                }
-            }
-        }).ToString()
-}
-
 function Get-WindowsInformationBlock {
     $parts = [System.Collections.Generic.List[string]]::new()
 
@@ -3481,7 +3453,6 @@ function Get-WindowsInformationBlock {
     $parts.Add((Get-WindowsCollector-Symantec))
     $parts.Add((Get-WindowsCollector-DiskSpace))
     $parts.Add((Get-WindowsCollector-Ivanti))
-    $parts.Add((Get-WindowsCollector-SecurityUpdates))
 
     # 2. Add System Baseline & Aggregator Script
     $parts.Add(({
@@ -3505,18 +3476,6 @@ function Get-WindowsInformationBlock {
 
                 $osString = Get-WinVersion ([int]$osInfo.CurrentBuildNumber)
                 $cores = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property NumberOfCores -Sum).Sum
-
-                # Software Inventory
-                $packages = @(
-                    Get-ItemProperty @(
-                        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-                        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-                        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-                    ) -ErrorAction SilentlyContinue |
-                        Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
-                        Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
-                        Sort-Object DisplayName -Unique
-                )
 
                 # LAPS Scheduled Task Check
                 $adminRotateScriptVersion = $null
@@ -3545,7 +3504,6 @@ function Get-WindowsInformationBlock {
                 $symantecInfo = Get-SymantecInformation
                 $diskInfo    = Get-DiskSpace
                 $ivantiInfo  = Get-IvantiInformation
-                $updateInfo  = Get-SecurityUpdateInformation
 
                 $systemDrive = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
                 $systemDisk  = $diskInfo.Volumes | Where-Object Drive -eq $systemDrive | Select-Object -First 1
@@ -3557,7 +3515,6 @@ function Get-WindowsInformationBlock {
                     Summary = [PSCustomObject]@{
                         Kernel              = $kernelString
                         Cores               = $cores
-                        PackageCount        = $packages.Count
                         AdminRotateVersion  = $adminRotateScriptVersion
                         AVDefs              = $symantecInfo.DefinitionDate
                         AVDefsRevision      = $symantecInfo.DefinitionRevision
@@ -3566,14 +3523,11 @@ function Get-WindowsInformationBlock {
                         IvantiCoreServer    = $ivantiInfo.ConfiguredCoreServer
                         IvantiServicesReady = $ivantiInfo.AutomaticServicesReady
                         License             = $activationStatus
-                        LastUpdate          = $updateInfo.LastUpdate
                         DiskFreeGB          = $systemDisk.FreeGB
                         DiskLow             = $diskInfo.LowSpace
                     }
 
                     Details = [PSCustomObject]@{
-                        Packages = $packages
-                        Updates  = $updateInfo.UpdateHistory
                         Disks    = $diskInfo.Volumes
                         Ivanti   = $ivantiInfo
                         Symantec = $symantecInfo
@@ -3632,45 +3586,16 @@ kernel_value="$(uname -r)"
 
 clamav_value="$(clamscan -V 2>/dev/null | awk -F'/' '{print $NF}' | xargs -I{} date -d "{}" +'%Y/%m/%d' 2>/dev/null)"
 
-last_update_value="$(
-    (yum history list 2>/dev/null || dnf history list 2>/dev/null) |
-        awk -F'|' '
-            tolower($0) ~ /(update|upgrade)/ {
-                gsub(/^[ \t]+|[ \t]+$/, "", $0)
-                print
-                exit
-            }
-        '
-)"
-
 laps_path="$(find /etc/systemd -iname '*laps*' -type f 2>/dev/null | head -n 1)"
 laps_version=$([[ -n "$laps_path" ]] && echo "Present" || echo "")
-
-# Filter RPM packages installed after system baseline cutoff
-base_epoch=$(rpm -q --qf '%{INSTALLTIME}' basesystem 2>/dev/null || rpm -q --qf '%{INSTALLTIME}' setup 2>/dev/null)
-cutoff=$(( ${base_epoch:-0} + 1800 ))
-
-packages_json="$(
-    rpm -qa --qf '%{INSTALLTIME}|%{NAME}|%{VERSION}-%{RELEASE}|%{ARCH}\n' 2>/dev/null |
-    awk -F'|' -v cutoff="$cutoff" '$1 > cutoff { print $2 "|" $3 "|" $4 }' |
-    jq -R -s '
-        split("\n") | map(select(length > 0)) | map(
-            split("|") | {Name: .[0], Version: .[1], Arch: .[2]}
-        )
-    '
-)"
-package_count="$(jq 'length' <<< "$packages_json")"
 
 jq -n \
     --arg hostname "$hostname_value" \
     --arg os "$os" \
     --arg kernel "$kernel_value" \
     --argjson cores "$cores_value" \
-    --argjson packageCount "$package_count" \
     --arg laps "$laps_version" \
     --arg avDefs "$clamav_value" \
-    --arg lastUpdate "$last_update_value" \
-    --argjson packages "$packages_json" \
     --argjson disks "$disk_json" \
 '
 {
@@ -3680,20 +3605,16 @@ jq -n \
     Summary: {
         Kernel: $kernel,
         Cores: $cores,
-        PackageCount: $packageCount,
         AdminRotateVersion: $laps,
         AVDefs: $avDefs,
         IvantiVersion: null,
         IvantiServicesReady: null,
         License: null,
-        LastUpdate: $lastUpdate,
         DiskFreeGB: ($disks | map(select(.MountPoint == "/")) | first | .FreeGB),
         DiskLow: ($disks | any(.LowSpace == true))
     },
 
     Details: {
-        Packages: $packages,
-        Updates: [],
         Disks: $disks,
         Ivanti: null
     }
@@ -3824,72 +3745,69 @@ function Get-MobileDefinitionAssessment([string]$Date, [ValidateRange(0, 3650)][
 
 function Get-WindowsPreflightScanWorker {
     return {
-        param([Parameter(Mandatory)][string]$RunDirectory)
+        param([string]$RunDirectory)
         $ErrorActionPreference = 'Stop'
-        function Save-ScanState($State) {
-            $temporary = Join-Path $RunDirectory 'result.tmp'
-            $State | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $temporary -Encoding UTF8
-            Move-Item -LiteralPath $temporary -Destination (Join-Path $RunDirectory 'result.json') -Force
-        }
-        $options = Get-Content -LiteralPath (Join-Path $RunDirectory 'options.json') -Raw | ConvertFrom-Json
-        $state = [ordered]@{
-            Status = 'Running'; StartedUtc = [datetime]::UtcNow.ToString('o'); CompletedUtc = $null
-            ExitCode = $null; ScanPaths = $options.WindowsScanPaths; ScanName = $options.SymantecScanName
-            StdOutPath = Join-Path $RunDirectory 'stdout.txt'; StdErrPath = Join-Path $RunDirectory 'stderr.txt'
-            ScanLogs = @(); Error = $null
-        }
-        Save-ScanState $state
+        $options = Get-Content (Join-Path $RunDirectory 'options.json') -Raw | ConvertFrom-Json
+        [datetime]::UtcNow.ToString('o') | Set-Content (Join-Path $RunDirectory 'started-utc') -Encoding UTF8
+        'Running' | Set-Content (Join-Path $RunDirectory 'status') -Encoding UTF8
         $process = $null
+        $code = 2
         try {
-            $arguments = [System.Collections.Generic.List[string]]::new()
-            $arguments.Add('/Sync')
+            $arguments = @('/Sync')
             if ($options.SymantecScanName) {
-                if ($options.SymantecScanName -match '["\r\n]') { throw 'Invalid configured Symantec scan name.' }
-                $arguments.Add('/ScanName "' + $options.SymantecScanName + '"')
+                if ($options.SymantecScanName -match '["\r\n]') { throw 'Invalid Symantec scan name.' }
+                $arguments += '/ScanName "' + $options.SymantecScanName + '"'
             } else {
                 foreach ($path in $options.WindowsScanPaths) {
-                    if ([string]::IsNullOrWhiteSpace($path) -or $path -match '["\r\n]') { throw 'Invalid Windows scan path.' }
-                    $arguments.Add('/ScanDir "' + $path.TrimEnd('\') + '"')
+                    if ([string]::IsNullOrWhiteSpace($path) -or $path -match '["\r\n]') { throw 'Invalid scan path.' }
+                    $arguments += '/ScanDir "' + $path.TrimEnd('\') + '"'
                 }
             }
-            $info = [Diagnostics.ProcessStartInfo]::new()
-            $info.FileName = $options.SymantecScanExecutable
-            $info.Arguments = $arguments -join ' '
-            $info.UseShellExecute = $false
-            $info.RedirectStandardOutput = $true
-            $info.RedirectStandardError = $true
-            $process = [Diagnostics.Process]::Start($info)
-            $outTask = $process.StandardOutput.ReadToEndAsync()
-            $errTask = $process.StandardError.ReadToEndAsync()
-            if (-not $process.WaitForExit([int]($options.ScanTimeoutMinutes * 60000))) {
+            $process = Start-Process -FilePath $options.SymantecScanExecutable -ArgumentList $arguments -PassThru `
+                -RedirectStandardOutput (Join-Path $RunDirectory 'stdout.txt') `
+                -RedirectStandardError (Join-Path $RunDirectory 'stderr.txt') -ErrorAction Stop
+            if ($process.WaitForExit([int]($options.ScanTimeoutMinutes * 60000))) {
+                $process.WaitForExit()
+                $code = $process.ExitCode
+            } else {
                 $process.Kill()
-                $state.Status = 'TimedOut'
-                throw 'SEP launcher timed out; its service may still be scanning. Check native scan status.'
+                $process.WaitForExit()
+                $code = 124
             }
-            $state.ExitCode = $process.ExitCode
-            [IO.File]::WriteAllText($state.StdOutPath, $outTask.GetAwaiter().GetResult())
-            [IO.File]::WriteAllText($state.StdErrPath, $errTask.GetAwaiter().GetResult())
-            if ($state.ExitCode -ne 0) { throw "DoScan.exe exited with code $($state.ExitCode)." }
-            # SEP exit zero does not establish absence of detections.
-            $state.Status = 'CompletedNeedsReview'
-        } catch {
-            if ($state.Status -ne 'TimedOut') { $state.Status = 'Failed' }
-            $state.Error = $_.Exception.Message
-        } finally {
+        } catch { $_.Exception.Message | Set-Content (Join-Path $RunDirectory 'error') -Encoding UTF8 }
+        finally {
             if ($process) { $process.Dispose() }
-            $state.CompletedUtc = [datetime]::UtcNow.ToString('o')
-            if ($env:ProgramData) {
-                $state.ScanLogs = @(Get-ChildItem -Path (Join-Path $env:ProgramData 'Symantec\Symantec Endpoint Protection\*\Data\Logs\AV\*') `
-                        -File -ErrorAction SilentlyContinue | Where-Object LastWriteTimeUtc -ge ([datetime]$state.StartedUtc) |
-                        Select-Object FullName, LastWriteTimeUtc, Length)
-            }
-            Save-ScanState $state
-            $completed = Join-Path (Split-Path $RunDirectory -Parent) 'completed.json'
-            $temporary = $completed + '.tmp'
-            $state | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $temporary -Encoding UTF8
-            Move-Item -LiteralPath $temporary -Destination $completed -Force
+            $code | Set-Content (Join-Path $RunDirectory 'exit-code') -Encoding UTF8
+            [datetime]::UtcNow.ToString('o') | Set-Content (Join-Path $RunDirectory 'completed-utc') -Encoding UTF8
+            'finished' | Set-Content (Join-Path $RunDirectory 'status') -Encoding UTF8
+            $pointer = Join-Path (Split-Path $RunDirectory -Parent) 'completed'
+            $RunDirectory | Set-Content "$pointer.tmp" -Encoding UTF8
+            Move-Item "$pointer.tmp" $pointer -Force
         }
     }
+}
+
+function Read-WindowsPreflightScan([string]$Directory) {
+    if (-not $Directory) { return }
+    if (-not (Test-Path (Join-Path $Directory 'status'))) {
+        # Retain reports from the previous JSON-based workers.
+        if (Test-Path (Join-Path $Directory 'result.json')) { Get-Content (Join-Path $Directory 'result.json') -Raw | ConvertFrom-Json }
+        return
+    }
+    $scan = [ordered]@{ RunDirectory = $Directory }
+    foreach ($field in @{ Status='status'; StartedUtc='started-utc'; CompletedUtc='completed-utc'; ExitCode='exit-code'; Error='error' }.GetEnumerator()) {
+        $file = Join-Path $Directory $field.Value
+        $scan[$field.Key] = if (Test-Path $file) { ([string](Get-Content $file -Raw)).Trim() } else { $null }
+    }
+    $scan.ExitCode = if ($scan.ExitCode -match '^-?\d+$') { [int]$scan.ExitCode } else { $null }
+    $scan.StdOutPath = Join-Path $Directory 'stdout.txt'
+    $scan.StdErrPath = Join-Path $Directory 'stderr.txt'
+    if (Test-Path (Join-Path $Directory 'options.json')) {
+        $options = Get-Content (Join-Path $Directory 'options.json') -Raw | ConvertFrom-Json
+        $scan.ScanPaths = $options.WindowsScanPaths
+        $scan.ScanName = $options.SymantecScanName
+    }
+    [PSCustomObject]$scan
 }
 
 function Start-WindowsPreflightScanJob {
@@ -3916,9 +3834,11 @@ function Start-WindowsPreflightScanJob {
         WindowsScanPaths = $Options.WindowsScanPaths; ScanTimeoutMinutes = $Options.ScanTimeoutMinutes
     }
     $workerOptions | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runDirectory 'options.json') -Encoding UTF8
-    $saved = [PSCustomObject]@{ Status = 'Starting'; StartedUtc = [datetime]::UtcNow.ToString('o'); CompletedUtc = $null }
-    $saved | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDirectory 'result.json') -Encoding UTF8
-    @{ RunDirectory = $runDirectory } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'latest.json') -Encoding UTF8
+    $saved = [PSCustomObject]@{ Status='Starting'; StartedUtc=[datetime]::UtcNow.ToString('o'); CompletedUtc=$null }
+    $saved.StartedUtc | Set-Content (Join-Path $runDirectory 'started-utc') -Encoding UTF8
+    'Starting' | Set-Content (Join-Path $runDirectory 'status') -Encoding UTF8
+    $runDirectory | Set-Content (Join-Path $root 'latest.tmp') -Encoding UTF8
+    Move-Item (Join-Path $root 'latest.tmp') (Join-Path $root 'latest') -Force
     try {
         $invocation = "& {`n$($Worker.ToString())`n} -RunDirectory '$($runDirectory.Replace("'", "''"))'"
         $timeLimit = [Xml.XmlConvert]::ToString([TimeSpan]::FromMinutes($Options.ScanTimeoutMinutes + 5))
@@ -3930,349 +3850,284 @@ function Start-WindowsPreflightScanJob {
     } catch {
         $saved.Status = 'Failed'
         $saved | Add-Member -NotePropertyName Error -NotePropertyValue $_.Exception.Message
-        $saved | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDirectory 'result.json') -Encoding UTF8
+        'Failed' | Set-Content (Join-Path $runDirectory 'status') -Encoding UTF8
+        $_.Exception.Message | Set-Content (Join-Path $runDirectory 'error') -Encoding UTF8
         throw
     }
     [PSCustomObject]@{ RunDirectory = $runDirectory; State = $saved }
 }
 
+
 function Get-WindowsPreflightScanState {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)]$Options, [Parameter(Mandatory)][scriptblock]$Worker, [string]$DefinitionDate)
-    $root = if ($Options.WindowsScanStateDirectory) { $Options.WindowsScanStateDirectory } else {
-        Join-Path $env:ProgramData 'Mobiles\Preflight'
-    }
-    $taskName = 'Mobiles-PreflightAV'
+    param($Options, [scriptblock]$Worker)
+    $root = if ($Options.WindowsScanStateDirectory) { $Options.WindowsScanStateDirectory } else { Join-Path $env:ProgramData 'Mobiles\Preflight' }
     $mutex = [Threading.Mutex]::new($false, 'Global\Mobiles-PreflightAV')
     $locked = $false
     try {
         try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
-        if (-not $locked) { return [PSCustomObject]@{ Status = 'Starting'; Note = 'Another preflight request is dispatching a scan.' } }
-        $saved = $null; $lastCompleted = $null; $runDirectory = $null
-        if (Test-Path -LiteralPath (Join-Path $root 'latest.json')) {
-            $pointer = Get-Content -LiteralPath (Join-Path $root 'latest.json') -Raw -ErrorAction Stop | ConvertFrom-Json
-            $runDirectory = $pointer.RunDirectory
-            $saved = Get-Content -LiteralPath (Join-Path $runDirectory 'result.json') -Raw -ErrorAction Stop | ConvertFrom-Json
-        }
-        if (Test-Path -LiteralPath (Join-Path $root 'completed.json')) {
-            $lastCompleted = Get-Content -LiteralPath (Join-Path $root 'completed.json') -Raw | ConvertFrom-Json
-        }
-        $nativeStatus = $null
-        foreach ($path in @(
-                'HKLM:\SOFTWARE\Symantec\Symantec Endpoint Protection\AV'
-                'HKLM:\SOFTWARE\WOW6432Node\Symantec\Symantec Endpoint Protection\AV'
-            )) {
+        if (-not $locked) { return [PSCustomObject]@{ Status='Starting'; StateDirectory=$root } }
+        $directory = $null; $previous = $null
+        if (Test-Path (Join-Path $root 'latest')) { $directory = (Get-Content (Join-Path $root 'latest') -Raw).Trim() }
+        elseif (Test-Path (Join-Path $root 'latest.json')) { $directory = (Get-Content (Join-Path $root 'latest.json') -Raw | ConvertFrom-Json).RunDirectory }
+        $current = Read-WindowsPreflightScan $directory
+        if (Test-Path (Join-Path $root 'completed')) { $previous = Read-WindowsPreflightScan ((Get-Content (Join-Path $root 'completed') -Raw).Trim()) }
+        elseif (Test-Path (Join-Path $root 'completed.json')) { $previous = Get-Content (Join-Path $root 'completed.json') -Raw | ConvertFrom-Json }
+        $native = $null
+        $activeValues = @(1,2,3,5,6,7,8,11,12,13,14,15,16,17,18,19,20,21,22)
+        foreach ($path in @('HKLM:\SOFTWARE\Symantec\Symantec Endpoint Protection\AV','HKLM:\SOFTWARE\WOW6432Node\Symantec\Symantec Endpoint Protection\AV')) {
             $key = Read-MobileRegistryKey $path
             if ($key.Status -eq 'Found' -and $null -ne $key.Values.GlobalScanStatus) {
-                $value = [int]$key.Values.GlobalScanStatus
-                # Any active native observation takes precedence over an older idle view.
-                if ($value -in @(1, 2, 3, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)) { $nativeStatus = $value; break }
-                if ($null -eq $nativeStatus) { $nativeStatus = $value }
+                $native = [int]$key.Values.GlobalScanStatus
+                if ($native -in $activeValues) { break }
             }
         }
-        $task = $null
-        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
-            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        $task = Get-ScheduledTask -TaskName 'Mobiles-PreflightAV' -ErrorAction SilentlyContinue
+        $status = if ($current) { $current.Status } elseif ($native -eq 4) { 'CompletedNeedsReview' } elseif ($native -eq 10) { 'Interrupted' } else { 'NotStarted' }
+        if ($task.State -in @('Running','Queued') -or $native -in $activeValues) { $status='Running' }
+        elseif ($status -in @('Starting','Running')) {
+            $started = if ($current.StartedUtc -is [datetime]) { $current.StartedUtc.ToUniversalTime() }
+                       elseif ($current.StartedUtc) { [DateTimeOffset]::Parse($current.StartedUtc).UtcDateTime } else { [datetime]::MinValue }
+            $status = if ($status -eq 'Starting' -and ([datetime]::UtcNow - $started).TotalSeconds -lt 60) { 'Starting' } else { 'Interrupted' }
         }
-        $active = ($task -and $task.State -in @('Running', 'Queued')) -or
-        $nativeStatus -in @(1, 2, 3, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
-        $status = 'NotStarted'
-        if ($active) { $status = 'Running' }
-        elseif ($saved) {
-            $status = $saved.Status
-            if ($status -in @('Starting', 'Running')) {
-                $status = if ($status -eq 'Starting' -and ([datetime]::UtcNow - [datetime]$saved.StartedUtc).TotalSeconds -lt 60) { 'Starting' } else { 'Interrupted' }
-            }
-        } elseif ($nativeStatus -eq 4) { $status = 'CompletedNeedsReview' }
-        elseif ($nativeStatus -eq 10) { $status = 'Interrupted' }
-        $launch = -not $Options.SkipScans -and -not $active -and
-        $status -notin @('Starting', 'Running') -and ($Options.Rescan -or $status -eq 'NotStarted')
-        $maximumAge = if ($null -ne $Options.DefinitionMaxAgeDays) { [int]$Options.DefinitionMaxAgeDays } else { 30 }
-        $definition = Get-MobileDefinitionAssessment -Date $DefinitionDate -MaximumAgeDays $maximumAge
-        $blocked = $launch -and -not $Options.ForceScan -and $definition.Status -ne 'Current'
-        if ($blocked) { $status = 'BlockedDefinitions' }
-        if ($launch -and -not $blocked) {
+        if ($Options.StartScan -and $status -notin @('Starting','Running') -and ($Options.Rescan -or $status -eq 'NotStarted')) {
             $candidates = @($Options.SymantecScanExecutable)
-            foreach ($directory in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            foreach ($directory in @($env:ProgramFiles,${env:ProgramFiles(x86)})) {
                 if ($directory) { $candidates += Join-Path $directory 'Symantec\Symantec Endpoint Protection\DoScan.exe' }
             }
-            $executable = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+            $executable = $candidates | Where-Object { $_ -and (Test-Path $_ -PathType Leaf) } | Select-Object -First 1
             if (-not $executable) { throw 'Symantec DoScan.exe was not found.' }
-            $job = Start-WindowsPreflightScanJob -Options $Options -Worker $Worker -Root $root -Executable $executable
-            $saved = $job.State
-            $runDirectory = $job.RunDirectory
-            $status = 'Starting'
+            $job = Start-WindowsPreflightScanJob $Options $Worker $root $executable
+            $current=$job.State; $status='Starting'
         }
-        $logs = @()
-        if ($env:ProgramData) {
-            $logs = @(Get-ChildItem -Path (Join-Path $env:ProgramData 'Symantec\Symantec Endpoint Protection\*\Data\Logs\AV\*') `
-                    -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 3 |
-                    ForEach-Object {
-                        [PSCustomObject]@{ Path = $_.FullName; ModifiedUtc = $_.LastWriteTimeUtc.ToString('o')
-                            Tail = (((Get-Content -LiteralPath $_.FullName -Tail 40 -ErrorAction SilentlyContinue) -join "`n") | ForEach-Object { $_.Substring(0, [Math]::Min(65536, $_.Length)) }) 
-                        }
-                    })
-        }
-        [PSCustomObject]@{
-            Status = $status; NativeScanStatus = $nativeStatus; StateDirectory = $root
-            Current = $saved; LastCompleted = $lastCompleted; LatestAVLogs = $logs
-            DefinitionAssessment = $definition; ScanBlocked = [bool]$blocked
-            Note = if ($blocked) { 'Definitions are stale, unknown, or future-dated; use -ForceScan to override.' } else { $null }
-            Review = 'SEP completion is not a clean verdict. Review the latest native AV-log evidence.'
-        }
-    } finally {
-        if ($locked) { $mutex.ReleaseMutex() }
-        $mutex.Dispose()
-    }
+        $logs = if ($env:ProgramData) {
+            @(Get-ChildItem (Join-Path $env:ProgramData 'Symantec\Symantec Endpoint Protection\*\Data\Logs\AV\*') -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 3 | ForEach-Object {
+                    $tail=(Get-Content $_.FullName -Tail 40 -ErrorAction SilentlyContinue) -join "`n"
+                    [PSCustomObject]@{ Path=$_.FullName; ModifiedUtc=$_.LastWriteTimeUtc.ToString('o'); Tail=$tail.Substring(0,[Math]::Min(65536,$tail.Length)) }
+                })
+        } else { @() }
+        [PSCustomObject]@{ Status=$status; StateDirectory=$root; Current=$current; LastCompleted=$previous; NativeScanStatus=$native; LatestAVLogs=@($logs) }
+    } finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
 }
 
 function Get-WindowsPreflightBlock {
-    $parts = [System.Collections.Generic.List[string]]::new()
-    $parts.Add('param($Options)')
-    $parts.Add('function ConvertTo-Base64 {' + ${function:ConvertTo-Base64}.ToString() + '}')
-    $parts.Add('function New-TaskXML {' + ${function:New-TaskXML}.ToString() + '}')
-    $parts.Add((Get-WindowsCollector-Registry))
-    $parts.Add((Get-WindowsCollector-Symantec))
-    $parts.Add((Get-WindowsCollector-Ivanti))
-    $parts.Add('function Start-WindowsPreflightScanJob {' + ${function:Start-WindowsPreflightScanJob}.ToString() + '}')
-    $parts.Add('function Get-MobileDefinitionAssessment {' + ${function:Get-MobileDefinitionAssessment}.ToString() + '}')
-    $parts.Add('function Get-WindowsPreflightScanState {' + ${function:Get-WindowsPreflightScanState}.ToString() + '}')
-    $parts.Add('$scanWorker = {' + (Get-WindowsPreflightScanWorker).ToString() + '}')
-    $parts.Add(({
-                $actions = [System.Collections.Generic.List[object]]::new()
-                $failures = [System.Collections.Generic.List[string]]::new()
-                $symantec = Get-SymantecInformation
-                $ivanti = Get-IvantiInformation
-                $rawDate = [string]$symantec.DefinitionDate
-                $normalizedDate = $null
-                # Accept only an unambiguous date; keep the original value in Details.
-                if ($rawDate -match '^(\d{4})[-/](\d{2})[-/](\d{2})(?:$|[ T])') {
-                    $normalizedDate = '{0}-{1}-{2}' -f $Matches[1], $Matches[2], $Matches[3]
-                } elseif ($rawDate -match '^\d{8}$') { $normalizedDate = $rawDate }
-                $actions.Add([PSCustomObject]@{ Category = 'Inventory'; Name = 'Symantec'; Status = $symantec.Status; Details = $symantec })
-                $actions.Add([PSCustomObject]@{ Category = 'Inventory'; Name = 'Ivanti'; Status = $ivanti.Status; Details = $ivanti })
-                try {
-                    $scan = Get-WindowsPreflightScanState -Options $Options -Worker $scanWorker -DefinitionDate $normalizedDate
-                } catch {
-                    $scan = [PSCustomObject]@{ Status = 'Failed'; Error = $_.Exception.Message }
-                }
-                if ($scan.Status -in @('Failed', 'TimedOut', 'Interrupted')) {
-                    $failures.Add("Symantec scan: $($scan.Status). $($scan.Error)")
-                }
-                $actions.Add([PSCustomObject]@{ Category = 'AVScan'; Name = 'Symantec'; Status = $scan.Status; Details = $scan })
-                [PSCustomObject]@{
-                    HostName = $env:COMPUTERNAME; Platform = 'Windows'; DefinitionDate = $normalizedDate
-                    ScanStatus = $scan.Status
-                    LastScanStatus = $scan.LastCompleted.Status; LastScanCompletedUtc = $scan.LastCompleted.CompletedUtc
-                    Actions = $actions.ToArray(); Failures = $failures.ToArray()
-                }
-            }).ToString())
-    [scriptblock]::Create($parts -join "`n`n")
+    $parts = @('param($Options)',(Get-WindowsCollector-Registry),(Get-WindowsCollector-Symantec),(Get-WindowsCollector-Ivanti))
+    foreach ($name in @('ConvertTo-Base64','New-TaskXML','Read-WindowsPreflightScan','Start-WindowsPreflightScanJob','Get-WindowsPreflightScanState')) {
+        $parts += 'function ' + $name + ' {' + (Get-Command $name).Definition + '}'
+    }
+    $parts += '$scanWorker = {' + (Get-WindowsPreflightScanWorker).ToString() + '}'
+    $parts += ({
+        $symantec = Get-SymantecInformation
+        $date = [string]$symantec.DefinitionDate
+        if ($date -match '^(\d{4})[-/](\d{2})[-/](\d{2})(?:$|[ T])') { $date = '{0}-{1}-{2}' -f $Matches[1],$Matches[2],$Matches[3] }
+        elseif ($date -notmatch '^\d{8}$') { $date = '' }
+        try { $scan = Get-WindowsPreflightScanState -Options $Options -Worker $scanWorker }
+        catch { $scan = [PSCustomObject]@{ Status='Failed'; Current=[PSCustomObject]@{ Error=$_.Exception.Message } } }
+        [PSCustomObject]@{ HostName=$env:COMPUTERNAME; Platform='Windows'; DefinitionDate=$date; Scan=$scan; Inventory=$symantec; Ivanti=(Get-IvantiInformation) }
+    }).ToString()
+    [scriptblock]::Create($parts -join "`n")
 }
 
 function Get-LinuxPreflightScanWorker {
     return @'
 #!/usr/bin/env bash
 set -o pipefail
-export LC_ALL=C
 run_dir="$1"
 source "$run_dir/options.sh"
-export PATH
-state_root="$(dirname "$run_dir")"
-started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-# mountinfo describes this worker's mount namespace, including NFS bind mounts.
-# Decode kernel-escaped mount points before escaping them as literal regex paths.
-excluded_nfs=()
+export PATH LC_ALL=C
+printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/started-utc"
+printf 'Running\n' > "$run_dir/status"
 exclude_args=(--exclude-dir='^/(proc|sys|dev|run)(/|$)')
-discovery_error=''
-if [[ ! -r /proc/self/mountinfo ]]; then
-    discovery_error='Cannot read /proc/self/mountinfo; NFS exclusions could not be determined'
-else
-    while IFS= read -r mount_record; do
-        mount_fields="${mount_record%% - *}"
-        filesystem="${mount_record#* - }"
-        filesystem="${filesystem%% *}"
+# Discover NFS in the scanner's namespace, including bind mounts. No JSON state machinery.
+if [[ -r /proc/self/mountinfo ]]; then
+    while IFS= read -r record; do
+        fields="${record%% - *}"; filesystem="${record#* - }"; filesystem="${filesystem%% *}"
         [[ "$filesystem" == nfs || "$filesystem" == nfs4 ]] || continue
-        read -r mount_id parent_id device mount_root mount_point mount_options remainder <<< "$mount_fields"
-        printf -v mount_point '%b' "$mount_point"
-        excluded_nfs+=("$mount_point")
-        pattern="$(printf '%s' "$mount_point" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
-        if [[ "$mount_point" == / ]]; then
-            exclude_args+=(--exclude-dir='^/')
-        else
-            exclude_args+=("--exclude-dir=^${pattern}(/|$)")
-        fi
+        read -r mount_id parent_id device mount_root target remainder <<< "$fields"
+        printf -v target '%b' "$target"
+        printf '%s\0' "$target" >> "$run_dir/excluded-nfs"
+        pattern="$(printf '%s' "$target" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+        if [[ "$target" == / ]]; then exclude_args+=(--exclude-dir='^/')
+        else exclude_args+=("--exclude-dir=^${pattern}(/|$)"); fi
     done < /proc/self/mountinfo
-fi
-excluded_json="$(printf '%s\n' "${excluded_nfs[@]}" | jq -R . | jq -s 'map(select(length > 0)) | unique | sort')"
-jq -n --arg started "$started" --argjson excluded "$excluded_json" \
-    '{Status:"Running",StartedUtc:$started,ExcludedNfsMounts:$excluded}' > "$run_dir/result.tmp"
-mv -f "$run_dir/result.tmp" "$run_dir/result.json"
-# This worker is supervised by systemd, independent of the requesting SSH session.
-if [[ -n "$discovery_error" ]]; then
-    : > "$run_dir/stdout.txt"
-    printf '%s\n' "$discovery_error" > "$run_dir/stderr.txt"
-    code=2
+    if timeout --kill-after=30 "$scan_timeout" clamscan --recursive --infected --stdout --log="$run_dir/clamav.log" \
+        "${exclude_args[@]}" -- "${scan_paths[@]}" > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt"; then
+        code=0
+    else code=$?; fi
 else
-    timeout "$scan_timeout" clamscan --recursive --infected --stdout --log="$run_dir/clamav.log" \
-        "${exclude_args[@]}" -- "${scan_paths[@]}" \
-        > "$run_dir/stdout.txt" 2> "$run_dir/stderr.txt"
-    code=$?
+    printf 'Cannot read mountinfo; NFS exclusions could not be determined\n' > "$run_dir/stderr.txt"
+    code=2
 fi
-case "$code" in
-    0) status='Clean' ;;
-    1) status='ThreatsDetected' ;;
-    124|137) status='TimedOut' ;;
-    *) status='Failed' ;;
-esac
-head -c 65536 "$run_dir/stdout.txt" > "$run_dir/out-short"
-head -c 65536 "$run_dir/stderr.txt" > "$run_dir/err-short"
-jq -n --arg status "$status" --arg started "$started" --arg ended "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --argjson code "$code" --arg version "$version" --arg log "$run_dir/clamav.log" --argjson paths "$(printf '%s\n' "${scan_paths[@]}" | jq -R . | jq -s .)" \
-    --argjson excluded "$excluded_json" --rawfile stdout "$run_dir/out-short" --rawfile stderr "$run_dir/err-short" \
-    '{Status:$status,StartedUtc:$started,CompletedUtc:$ended,ExitCode:$code,DefinitionVersion:$version,LogPath:$log,ScanPaths:$paths,ExcludedNfsMounts:$excluded,StdOut:$stdout,StdErr:$stderr}' \
-    > "$run_dir/result.tmp"
-mv -f "$run_dir/result.tmp" "$run_dir/result.json"
-cp "$run_dir/result.json" "$state_root/completed.tmp"
-mv -f "$state_root/completed.tmp" "$state_root/completed.json"
+printf '%s\n' "$code" > "$run_dir/exit-code"
+printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/completed-utc"
+printf 'finished\n' > "$run_dir/status"
+printf '%s\n' "$run_dir" > "$(dirname "$run_dir")/completed.tmp"
+mv -f "$(dirname "$run_dir")/completed.tmp" "$(dirname "$run_dir")/completed"
 '@
 }
 
-function Get-LinuxPreflightScript {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)]$Options)
-    $paths = @($Options.LinuxScanPaths | ForEach-Object { ConvertTo-BashArgument $_ }) -join ' '
-    $stateRoot = if ($Options.LinuxScanStateDirectory) { $Options.LinuxScanStateDirectory } else { '/var/log/mobiles/preflight' }
-    if (-not $stateRoot.StartsWith('/')) { throw 'LinuxScanStateDirectory must be an absolute path.' }
-    $toolDirectories = if ($Options.LinuxToolDirectories) { @($Options.LinuxToolDirectories) } else { @('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin') }
-    foreach ($directory in $toolDirectories) {
-        if ([string]::IsNullOrWhiteSpace($directory) -or -not $directory.StartsWith('/') -or $directory -match '[:\r\n]') {
-            throw 'LinuxToolDirectories must contain absolute directory paths without colons or newlines.'
-        }
+function Get-LinuxPreflightScript($Options) {
+    $root = if ($Options.LinuxScanStateDirectory) { $Options.LinuxScanStateDirectory } else { '/var/log/mobiles/preflight' }
+    if (-not $root.StartsWith('/')) { throw 'LinuxScanStateDirectory must be an absolute path.' }
+    $directories = if ($Options.LinuxToolDirectories) { @($Options.LinuxToolDirectories) } else { @('/usr/local/sbin','/usr/local/bin','/usr/sbin','/usr/bin','/sbin','/bin') }
+    foreach ($directory in $directories) {
+        if (-not $directory.StartsWith('/') -or $directory -match '[:\r\n]') { throw 'Invalid Linux tool directory.' }
     }
-    $maximumAge = if ($null -ne $Options.DefinitionMaxAgeDays) { [int]$Options.DefinitionMaxAgeDays } else { 30 }
     $prefix = @"
-force_scan=$(([bool]$Options.ForceScan).ToString().ToLowerInvariant())
-maximum_age=$maximumAge
-export PATH=$(ConvertTo-BashArgument ($toolDirectories -join ':'))
-scan_paths=($paths)
+export PATH=$(ConvertTo-BashArgument ($directories -join ':'))
+state_root=$(ConvertTo-BashArgument $root)
+scan_paths=($(@($Options.LinuxScanPaths | ForEach-Object { ConvertTo-BashArgument $_ }) -join ' '))
 scan_timeout=$([int]$Options.ScanTimeoutMinutes * 60)
-skip_scans=$(([bool]$Options.SkipScans).ToString().ToLowerInvariant())
+start_scan=$(([bool]$Options.StartScan).ToString().ToLowerInvariant())
 rescan=$(([bool]$Options.Rescan).ToString().ToLowerInvariant())
-state_root=$(ConvertTo-BashArgument $stateRoot)
 "@
     $body = @'
 set -o pipefail
 export LC_ALL=C
 umask 077
-for required in jq flock; do
-    if ! command -v "$required" >/dev/null 2>&1; then echo "Preflight requires $required; searched PATH=$PATH" >&2; exit 2; fi
-done
-mkdir -p "$state_root" || exit 2
-chmod 700 "$state_root" || exit 2
+for tool in jq flock; do command -v "$tool" >/dev/null || { echo "Preflight requires $tool; searched PATH=$PATH" >&2; exit 2; }; done
+mkdir -p "$state_root" && chmod 700 "$state_root" || exit 2
 exec 9> "$state_root/dispatch.lock"
-locked=false
-if flock -n 9; then locked=true; fi
+# Scan execution only writes text files. Convert them to JSON once, when reporting.
+read_scan() {
+    local dir="$1"
+    if [[ ! -f "$dir/status" ]]; then [[ ! -f "$dir/result.json" ]] || cat "$dir/result.json"; return; fi
+    jq -n --arg directory "$dir" --arg status "$(cat "$dir/status")" \
+        --arg started "$(cat "$dir/started-utc")" --arg ended "$(cat "$dir/completed-utc")" \
+        --arg code "$(cat "$dir/exit-code")" --arg version "$(cat "$dir/definition-version")" \
+        --rawfile paths "$dir/scan-paths" --rawfile excluded "$dir/excluded-nfs" \
+        --arg stdout "$(head -c 65536 "$dir/stdout.txt")" --arg stderr "$(head -c 65536 "$dir/stderr.txt")" '
+        {RunDirectory:$directory,Status:$status,StartedUtc:$started,CompletedUtc:$ended,
+         ExitCode:(if $code=="" then null else ($code|tonumber) end),DefinitionVersion:$version,
+         ScanPaths:($paths|split("\u0000")|map(select(length>0))),ExcludedNfsMounts:($excluded|split("\u0000")|map(select(length>0))|unique),
+         LogPath:($directory+"/clamav.log"),StdOut:$stdout,StdErr:$stderr}'
+}
 version="$(clamscan --version 2>/dev/null)"
-version_exit=$?
-definition_date=''
-if [[ "$version_exit" -eq 0 ]]; then
-    definition_date="$(date -u -d "${version##*/}" '+%Y-%m-%d' 2>/dev/null)"
-fi
-definitions_current=false
-if [[ -n "$definition_date" ]]; then
-    definition_epoch="$(date -u -d "$definition_date" +%s 2>/dev/null)"
-    today_epoch="$(date -u -d "$(date -u +%F)" +%s)"
-    if [[ -n "$definition_epoch" ]]; then
-        age_days=$(( (today_epoch - definition_epoch) / 86400 ))
-        if (( age_days >= 0 && age_days <= maximum_age )); then definitions_current=true; fi
-    fi
-fi
-scan_status='NotStarted'
-current='null'
-last_completed='null'
-unit=''
-if [[ -s "$state_root/latest.json" ]]; then
-    run_dir="$(jq -er '.RunDirectory' "$state_root/latest.json")" || exit 2
-    unit="$(jq -er '.Unit' "$state_root/latest.json")" || exit 2
-    current="$(jq -c . "$run_dir/result.json")" || exit 2
-    scan_status="$(printf '%s' "$current" | jq -r '.Status')"
-fi
-if [[ -s "$state_root/completed.json" ]]; then
-    last_completed="$(jq -c . "$state_root/completed.json")" || exit 2
-fi
+definition_date="$(date -u -d "${version##*/}" +%F 2>/dev/null)"
+run_dir=''; unit=''; current=null; previous=null
+if [[ -f "$state_root/latest" ]]; then run_dir="$(cat "$state_root/latest")"; unit="mobiles-preflight-av-$(basename "$run_dir").service"
+elif [[ -f "$state_root/latest.json" ]]; then run_dir="$(jq -r .RunDirectory "$state_root/latest.json")"; unit="$(jq -r .Unit "$state_root/latest.json")"; fi
+if [[ -n "$run_dir" ]]; then current="$(read_scan "$run_dir")"; fi
+if [[ -f "$state_root/completed" ]]; then previous="$(read_scan "$(cat "$state_root/completed")")"
+elif [[ -f "$state_root/completed.json" ]]; then previous="$(cat "$state_root/completed.json")"; fi
+status="$(printf '%s' "$current" | jq -r '.Status // "NotStarted"')"
 active=false
-if [[ -n "$unit" ]]; then
-    unit_state="$(systemctl show -p ActiveState "$unit" 2>/dev/null | cut -d= -f2)"
-    case "$unit_state" in active|activating|reloading) active=true ;; esac
-fi
-# Also respect scans launched outside this program; do not start a duplicate.
-for scanner_pid in $(pgrep -x clamscan 2>/dev/null); do
-    scanner_state="$(ps -o stat= -p "$scanner_pid" 2>/dev/null)"
-    if [[ -n "$scanner_state" && "$scanner_state" != Z* ]]; then active=true; break; fi
+if [[ -n "$unit" ]] && systemctl show -p ActiveState "$unit" 2>/dev/null | grep -Eq '^ActiveState=(active|activating|reloading)$'; then active=true; fi
+for pid in $(pgrep -x clamscan 2>/dev/null); do
+    process_state="$(ps -o stat= -p "$pid" 2>/dev/null)"
+    if [[ -n "$process_state" && "$process_state" != Z* ]]; then active=true; fi
 done
-if [[ "$active" == true ]]; then
-    scan_status='Running'
-elif [[ "$scan_status" == 'Starting' ]]; then
+if [[ "$active" == true ]]; then status=Running
+elif [[ "$status" == Starting || "$status" == Running ]]; then
     started="$(printf '%s' "$current" | jq -r '.StartedUtc // ""')"
     started_epoch="$(date -u -d "$started" +%s 2>/dev/null || echo 0)"
-    if (( $(date -u +%s) - started_epoch > 60 )); then scan_status='Interrupted'; fi
-elif [[ "$scan_status" == 'Running' ]]; then
-    scan_status='Interrupted'
+    if [[ "$status" == Running ]] || (( $(date -u +%s) - started_epoch > 60 )); then status=Interrupted; fi
 fi
-if [[ "$locked" == false ]]; then
-    scan_status='Starting'
-elif [[ "$skip_scans" == false && "$active" == false && "$scan_status" != Starting && ( "$rescan" == true || "$scan_status" == 'NotStarted' ) ]]; then
-    if [[ "$force_scan" != true && "$definitions_current" != true ]]; then
-        scan_status='BlockedDefinitions'
-    elif [[ "$version_exit" -ne 0 ]]; then
-        scan_status='Failed'
-        current='{"Status":"Failed","Error":"clamscan is unavailable"}'
-    elif ! command -v systemd-run >/dev/null 2>&1; then
-        scan_status='Failed'
-        current='{"Status":"Failed","Error":"systemd-run is required for detached scans"}'
-    else
-        run_dir="$(mktemp -d "$state_root/run-XXXXXXXXXX")" || exit 2
-        unit="mobiles-preflight-av-$(basename "$run_dir").service"
-        declare -p scan_paths scan_timeout version PATH > "$run_dir/options.sh"
-        cat > "$run_dir/worker.sh" <<'MOBILE_CLAM_WORKER'
+if ! flock -n 9; then status=Starting
+elif [[ "$start_scan" == true && "$status" != Running && "$status" != Starting && ( "$rescan" == true || "$status" == NotStarted ) ]]; then
+    run_dir="$(mktemp -d "$state_root/run-XXXXXXXXXX")" || exit 2
+    unit="mobiles-preflight-av-$(basename "$run_dir").service"
+    declare -p scan_paths scan_timeout PATH > "$run_dir/options.sh"
+    for file in completed-utc exit-code excluded-nfs stdout.txt stderr.txt; do : > "$run_dir/$file"; done
+    printf '%s\n' "$version" > "$run_dir/definition-version"
+    printf '%s\0' "${scan_paths[@]}" > "$run_dir/scan-paths"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$run_dir/started-utc"
+    printf 'Starting\n' > "$run_dir/status"
+    cat > "$run_dir/worker.sh" <<'MOBILE_CLAM_WORKER'
 '@
-    $afterWorker = @'
+    $after = @'
 MOBILE_CLAM_WORKER
-        jq -n --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{Status:"Starting",StartedUtc:$started}' > "$run_dir/result.json"
-        jq -n --arg directory "$run_dir" --arg unit "$unit" '{RunDirectory:$directory,Unit:$unit}' > "$state_root/latest.tmp"
-        mv -f "$state_root/latest.tmp" "$state_root/latest.json"
-        if systemd-run --unit="$unit" /bin/bash "$run_dir/worker.sh" "$run_dir" > "$run_dir/dispatch-out.txt" 2> "$run_dir/dispatch-error.txt"; then
-            scan_status='Starting'
-        else
-            scan_status='Failed'
-            jq -n --rawfile error "$run_dir/dispatch-error.txt" '{Status:"Failed",Error:$error}' > "$run_dir/result.json"
-        fi
-        current="$(jq -c . "$run_dir/result.json")"
-    fi
-fi
-# Release the dispatch lock before collecting inventory. The worker never owns it.
-if [[ "$locked" == true ]]; then flock -u 9; fi
-scope_matches=false
-definitions_match=false
-if [[ "$current" != null ]]; then
-    requested_paths="$(printf '%s\n' "${scan_paths[@]}" | jq -R . | jq -s .)"
-    scope_matches="$(printf '%s' "$current" | jq --argjson paths "$requested_paths" '.ScanPaths == $paths')"
-    definitions_match="$(printf '%s' "$current" | jq --arg version "$version" '.DefinitionVersion == $version')"
+    printf '%s\n' "$run_dir" > "$state_root/latest.tmp"
+    mv -f "$state_root/latest.tmp" "$state_root/latest"
+    if systemd-run --unit="$unit" /bin/bash "$run_dir/worker.sh" "$run_dir" > "$run_dir/dispatch-out.txt" 2> "$run_dir/stderr.txt"; then status=Starting
+    else status=Failed; printf 'Failed\n' > "$run_dir/status"; fi
+    current="$(read_scan "$run_dir")"
 fi
 jq -n --arg host "$(hostname -s)" --arg date "$definition_date" --arg version "$version" \
-    --arg scan "$scan_status" --argjson current "$current" --argjson previous "$last_completed" --arg directory "$state_root" \
-    --argjson scope "$scope_matches" --argjson definitions "$definitions_match" \
-    '{HostName:$host,Platform:"Linux",DefinitionDate:$date,ScanStatus:$scan,
-      LastScanStatus:($previous.Status // null),LastScanCompletedUtc:($previous.CompletedUtc // null),ScanEvidenceCurrent:($scope and $definitions),
-      Actions:[
-        {Category:"Inventory",Name:"ClamAV",Status:(if $date=="" then "Unknown" else "Collected" end),Details:{Version:$version,DefinitionDate:$date}},
-        {Category:"AVScan",Name:"ClamAV",Status:$scan,Details:{StateDirectory:$directory,Current:$current,LastCompleted:$previous,ScopeMatches:$scope,DefinitionsMatch:$definitions,ScanBlocked:($scan=="BlockedDefinitions"),Note:(if $scan=="BlockedDefinitions" then "Definitions are stale, unknown, or future-dated; use -ForceScan to override" else null end)}}
-      ],Failures:(if ($scan=="Failed" or $scan=="TimedOut" or $scan=="ThreatsDetected" or $scan=="Interrupted") then ["ClamAV scan: "+$scan] else [] end)}'
+    --arg status "$status" --arg directory "$state_root" --argjson current "$current" --argjson previous "$previous" '
+    {HostName:$host,Platform:"Linux",DefinitionDate:$date,DefinitionVersion:$version,
+     Scan:{Status:$status,StateDirectory:$directory,Current:$current,LastCompleted:$previous}}'
 '@
-    $delimiter = 'MOBILE_PREFLIGHT_ROOT_' + [guid]::NewGuid().ToString('N')
-    # The root-owned worker and logs survive SSH disconnects; the client waits only for dispatch/status.
-    "dzdo bash <<'$delimiter'`n" + $prefix + "`n" + $body + "`n" + (Get-LinuxPreflightScanWorker) + "`n" + $afterWorker + "`n$delimiter`n"
+    $worker = if ($Options.StartScan) { Get-LinuxPreflightScanWorker } else { '' }
+    $delimiter='MOBILE_PREFLIGHT_'+[guid]::NewGuid().ToString('N')
+    ("dzdo bash <<'$delimiter'`n"+$prefix+"`n"+$body+"`n"+$worker+"`n"+$after+"`n$delimiter`n").Replace("`r`n","`n")
+}
+
+# Query first; only the controller decides whether definitions permit a new scan.
+function Invoke-MobilePreflightQuery([string]$Platform, [array]$Computers, $Options, [switch]$StartScan) {
+    $request=$Options.PSObject.Copy()
+    $request | Add-Member StartScan ([bool]$StartScan) -Force
+    $errors=@(); $raw=@(); $transportError=$null
+    try {
+        if ($Platform -eq 'Windows') {
+            $raw=@(Invoke-Command -ComputerName $Computers -ScriptBlock (Get-WindowsPreflightBlock) -ArgumentList $request -ErrorAction SilentlyContinue -ErrorVariable errors)
+        } else { $raw=@(Invoke-Linux -Computers $Computers -Script (Get-LinuxPreflightScript $request) -KeyPath $script:Config.SSHKeyPath) }
+    } catch { $transportError=$_.Exception.Message }
+    foreach ($computer in $Computers) {
+        try {
+            if ($Platform -eq 'Windows') {
+                $result=$raw | Where-Object PSComputerName -eq $computer | Select-Object -First 1
+                if (-not $result) {
+                    $messages=@($errors | Where-Object { $_.TargetObject -eq $computer -or $_.OriginInfo.PSComputerName -eq $computer } | ForEach-Object { $_.Exception.Message }) -join '; '
+                    throw "No preflight result returned. $transportError $messages"
+                }
+            } else {
+                $response=$raw | Where-Object Target -eq $computer | Select-Object -First 1
+                if (-not $response) { throw "No preflight result returned. $transportError" }
+                if ($response.ExitCode -ne 0) { throw "SSH exited $($response.ExitCode): $($response.StdErr)" }
+                $result=$response.StdOut | ConvertFrom-Json -ErrorAction Stop
+            }
+            [PSCustomObject]@{ Target=$computer; Result=$result; Error=$null }
+        } catch { [PSCustomObject]@{ Target=$computer; Result=$null; Error=$_.Exception.Message } }
+    }
+}
+
+function Get-MobileScanOutcome([string]$Platform, $Scan) {
+    if ($Scan.Status -ne 'finished') { return $Scan.Status } # Also accepts legacy JSON results.
+    if ($null -eq $Scan.ExitCode) { return 'Failed' }
+    if ($Scan.ExitCode -in @(124,137)) { return 'TimedOut' }
+    if ($Platform -eq 'Windows') { if ($Scan.ExitCode -eq 0) { return 'CompletedNeedsReview' }; return 'Failed' }
+    switch ([int]$Scan.ExitCode) { 0 { 'Clean' }; 1 { 'ThreatsDetected' }; default { 'Failed' } }
+}
+
+function Get-MobilePreflightEvidence([string]$Platform, $Observation, $Options) {
+    if ($Observation.Error) { throw $Observation.Error }
+    $result=$Observation.Result
+    # Accept the previous response shape during upgrades as well as stored legacy history.
+    if ($result.ScanStatus -and $result.Actions) { return $result }
+    if (-not $result.Scan.Status) { throw 'Malformed preflight response.' }
+    $definition=Get-MobileDefinitionAssessment -Date $result.DefinitionDate -MaximumAgeDays $Options.DefinitionMaxAgeDays
+    $scan=$result.Scan
+    $start = -not $Options.SkipScans -and $scan.Status -notin @('Starting','Running') -and ($Options.Rescan -or $scan.Status -eq 'NotStarted')
+    $blocked=$start -and -not $Options.ForceScan -and $definition.Status -ne 'Current'
+    if ($start -and -not $blocked) {
+        $reply=@(Invoke-MobilePreflightQuery -Platform $Platform -Computers @($Observation.Target) -Options $Options -StartScan)[0]
+        if ($reply.Error) { throw $reply.Error }
+        $result=$reply.Result; $scan=$result.Scan
+    }
+    foreach ($attempt in @($scan.Current,$scan.LastCompleted)) {
+        if ($attempt) { $attempt.Status=Get-MobileScanOutcome $Platform $attempt }
+    }
+    $status = if ($blocked) { 'BlockedDefinitions' } elseif ($scan.Status -eq 'finished') { Get-MobileScanOutcome $Platform $scan.Current } else { $scan.Status }
+    $scope=$false; $definitions=$false
+    if ($Platform -eq 'Linux' -and $scan.Current) {
+        $scope=(ConvertTo-Json -InputObject @($scan.Current.ScanPaths) -Compress) -ceq (ConvertTo-Json -InputObject @($Options.LinuxScanPaths) -Compress)
+        $definitions=$scan.Current.DefinitionVersion -ceq $result.DefinitionVersion
+    }
+    $scan | Add-Member -NotePropertyMembers @{ Status=$status; ScanBlocked=$blocked
+        Note=$(if ($blocked) { 'Definitions are stale, unknown, or future-dated; use -ForceScan to override.' }) } -Force
+    if ($Platform -eq 'Linux') { $scan | Add-Member -NotePropertyMembers @{ ScopeMatches=$scope; DefinitionsMatch=$definitions } -Force }
+    else { $scan | Add-Member -NotePropertyMembers @{ DefinitionAssessment=$definition; Review='SEP completion is not a clean verdict; review native AV logs.' } -Force }
+    $name=if ($Platform -eq 'Linux') { 'ClamAV' } else { 'Symantec' }
+    $inventory=if ($Platform -eq 'Linux') { [PSCustomObject]@{ Version=$result.DefinitionVersion; DefinitionDate=$result.DefinitionDate } } else { $result.Inventory }
+    $inventoryStatus = if ($inventory.Status) { $inventory.Status } elseif ($result.DefinitionDate) { 'Collected' } else { 'Unknown' }
+    $actions=@([PSCustomObject]@{ Category='Inventory'; Name=$name; Status=$inventoryStatus; Details=$inventory })
+    if ($result.Ivanti) { $actions += [PSCustomObject]@{ Category='Inventory'; Name='Ivanti'; Status=$result.Ivanti.Status; Details=$result.Ivanti } }
+    $actions += [PSCustomObject]@{ Category='AVScan'; Name=$name; Status=$status; Details=$scan }
+    [PSCustomObject]@{ HostName=$Observation.Target; Platform=$Platform; DefinitionDate=$result.DefinitionDate; ScanStatus=$status
+        LastScanStatus=$scan.LastCompleted.Status; LastScanCompletedUtc=$scan.LastCompleted.CompletedUtc
+        ScanEvidenceCurrent=($scope -and $definitions); Actions=$actions
+        Failures=@(if ($status -in @('Failed','TimedOut','Interrupted','ThreatsDetected')) { "$name scan: $status. $($scan.Current.Error) $($scan.Current.StdErr)" }) }
 }
 
 function Invoke-MobilePreflight {
@@ -4312,37 +4167,11 @@ function Invoke-MobilePreflight {
         foreach ($platform in @('Windows', 'Linux')) {
             $hosts = @($data.$platform)
             if (-not $hosts.Count) { continue }
-            $raw = @()
-            $dispatchError = $null
             Write-Host "[+] Preflight $platform targets: $($hosts -join ', '); scans $(if ($SkipScans) { 'status only' } else { 'status/start if needed' })."
-            try {
-                if ($platform -eq 'Windows') {
-                    $remoteErrors = @()
-                    $raw = @(Invoke-Command -ComputerName $hosts -ScriptBlock (Get-WindowsPreflightBlock) -ArgumentList $options `
-                            -ErrorAction SilentlyContinue -ErrorVariable remoteErrors)
-                } else {
-                    $raw = @(Invoke-Linux -Computers $hosts -Script (Get-LinuxPreflightScript -Options $options) -KeyPath $script:Config.SSHKeyPath)
-                }
-            } catch {
-                $dispatchError = $_.Exception.Message
-                $raw = @()
-            }
-            foreach ($target in $hosts) {
-                $result = $null
+            foreach ($observation in @(Invoke-MobilePreflightQuery -Platform $platform -Computers $hosts -Options $options)) {
+                $target=$observation.Target
                 try {
-                    if ($platform -eq 'Windows') {
-                        $result = $raw | Where-Object PSComputerName -eq $target | Select-Object -First 1
-                        if (-not $result) {
-                            $errorText = @($remoteErrors | Where-Object { $_.TargetObject -eq $target -or $_.OriginInfo.PSComputerName -eq $target } | ForEach-Object { $_.Exception.Message }) -join '; '
-                            throw "No preflight result returned. $dispatchError $errorText"
-                        }
-                    } else {
-                        $response = $raw | Where-Object Target -eq $target | Select-Object -First 1
-                        if (-not $response) { throw "No preflight result returned. $dispatchError" }
-                        if ($response.ExitCode -ne 0) { throw "SSH exited $($response.ExitCode): $($response.StdErr)" }
-                        $result = $response.StdOut | ConvertFrom-Json -ErrorAction Stop
-                    }
-                    if (-not $result.ScanStatus -or -not $result.Actions) { throw 'Malformed preflight response.' }
+                    $result=Get-MobilePreflightEvidence -Platform $platform -Observation $observation -Options $options
                     $definition = Get-MobileDefinitionAssessment -Date $result.DefinitionDate -MaximumAgeDays $DefinitionMaxAgeDays
                     $actions = @($result.Actions) + @([PSCustomObject]@{
                             Category = 'Readiness'; Name = 'AV definition age'; Status = $definition.Status
@@ -4371,7 +4200,7 @@ function Invoke-MobilePreflight {
         $runSuccess = $results.Count -gt 0 -and @($results | Where-Object { -not $_.Success }).Count -eq 0
         $runStatus = if ($runSuccess) { 'Ready' } elseif (@($results | Where-Object Readiness -eq 'Failed').Count) { 'Failed' }
         elseif (@($results | Where-Object Readiness -eq 'Pending').Count) { 'Pending' } else { 'NeedsReview' }
-        $results | Format-Table HostName, Platform, Definitions, Scan, LastScan, LastScanUtc -AutoSize -Wrap | Out-String -Width 240 | Write-Host
+        Write-MobileTable @($results) @('HostName', 'Platform', 'Definitions', 'Scan', 'LastScan', 'LastScanUtc')
         Write-Host 'Scans run independently on endpoints. Repeat -Preflight for status/latest results; use -Rescan for a fresh scan. SEP completion still requires AV-log review.'
         if ($PassThru) { $results.ToArray() }
     } catch {
@@ -4388,6 +4217,91 @@ function Invoke-MobilePreflight {
 #endregion
 
 #region Reporting
+
+# Console-only formatting. Audit files retain their plain, terminal-independent layout.
+function Get-MobileTerminalWidth {
+    try {
+        $width = $Host.UI.RawUI.WindowSize.Width
+        if ($width -gt 0) { return $width }
+    } catch { }
+    return 120
+}
+
+function Write-MobileCenteredText([string]$Text, [ConsoleColor]$Color = 'Gray') {
+    $width = Get-MobileTerminalWidth
+    foreach ($line in ($Text -split '\r?\n')) {
+        # Wrap rather than discard text when a terminal is narrow.
+        for ($offset = 0; $offset -lt [Math]::Max(1, $line.Length); $offset += $width) {
+            $part = $line.Substring($offset, [Math]::Min($width, $line.Length - $offset))
+            Write-Host ((' ' * [int][Math]::Floor(($width - $part.Length) / 2)) + $part) -ForegroundColor $Color
+        }
+    }
+}
+
+function Write-MobileTable([array]$Rows, [string[]]$Properties, [string[]]$Headers = $Properties) {
+    if (-not $Rows.Count) { return }
+    $width = Get-MobileTerminalWidth
+    $widths = @(for ($i = 0; $i -lt $Properties.Count; $i++) {
+        $lengths = @($Headers[$i].Length; foreach ($row in $Rows) {
+            foreach ($line in ([string]$row.($Properties[$i]) -split '\r?\n')) { $line.Length }
+        })
+        [int]($lengths | Measure-Object -Maximum).Maximum
+    })
+    # Leave room for separators, then shrink the widest columns first.
+    $available = $width - 3 * ($Properties.Count - 1)
+    if ($available -lt 3 * $Properties.Count) {
+        # Very small windows are easier to read as records than single-character columns.
+        foreach ($row in $Rows) {
+            $color = if ($row.DisplayColor) { $row.DisplayColor } else { 'Gray' }
+            for ($i = 0; $i -lt $Properties.Count; $i++) {
+                Write-MobileCenteredText "$($Headers[$i]): $($row.($Properties[$i]))" $color
+            }
+            Write-Host ''
+        }
+        return
+    }
+    while (($widths | Measure-Object -Sum).Sum -gt $available) {
+        $largest = 0
+        for ($i = 1; $i -lt $widths.Count; $i++) {
+            if ($widths[$i] -gt $widths[$largest]) { $largest = $i }
+        }
+        $widths[$largest]--
+    }
+    $tableWidth = [int]($widths | Measure-Object -Sum).Sum + 3 * ($Properties.Count - 1)
+    $indent = ' ' * [int][Math]::Floor(($width - $tableWidth) / 2)
+    $records = @([pscustomobject]@{ Cells = $Headers; Color = 'DarkGray' }
+        foreach ($row in $Rows) {
+            [pscustomobject]@{
+                Cells = @(foreach ($property in $Properties) { [string]$row.$property })
+                Color = if ($row.DisplayColor) { $row.DisplayColor } else { 'Gray' }
+            }
+        })
+    foreach ($record in $records) {
+        $lines = @(foreach ($cell in $record.Cells) { ,@(([string]$cell) -split '\r?\n') })
+        $height = 1
+        for ($i = 0; $i -lt $widths.Count; $i++) {
+            $wrapped = @(foreach ($line in $lines[$i]) {
+                if (-not $line.Length) { '' }
+                for ($offset = 0; $offset -lt $line.Length; $offset += $widths[$i]) {
+                    $line.Substring($offset, [Math]::Min($widths[$i], $line.Length - $offset))
+                }
+            })
+            $lines[$i] = $wrapped
+            $height = [Math]::Max($height, $wrapped.Count)
+        }
+        for ($n = 0; $n -lt $height; $n++) {
+            $cells = for ($i = 0; $i -lt $widths.Count; $i++) {
+                $value = if ($n -lt $lines[$i].Count) { $lines[$i][$n] } else { '' }
+                $left = [int][Math]::Floor(($widths[$i] - $value.Length) / 2)
+                (' ' * $left) + $value + (' ' * ($widths[$i] - $left - $value.Length))
+            }
+            Write-Host ($indent + ($cells -join ' | ')) -ForegroundColor $record.Color
+        }
+        if ($record -eq $records[0]) {
+            Write-Host ($indent + (($widths | ForEach-Object { '-' * $_ }) -join '-+-')) -ForegroundColor DarkGray
+        } elseif ($height -gt 1) { Write-Host '' }
+    }
+}
 
 function Format-HostCollector {
     [CmdletBinding()]
@@ -4406,10 +4320,8 @@ function Format-HostCollector {
             @{ Header = 'OS'; Getter = { param($r) $r.Platform } }
             @{ Header = 'KERNEL'; Property = 'Kernel' }
             @{ Header = 'AV DEFS'; Property = 'AVDefs' }
-            @{ Header = 'LAST UPDATE'; Property = 'LastUpdate' }
             @{ Header = 'FREE GB'; Property = 'DiskFreeGB' }
             @{ Header = 'LAPS'; Property = 'AdminRotateVersion' }
-            @{ Header = 'PKGS'; Property = 'PackageCount' }
         )
         $windowsColumns = @(
             @{ Header = 'IVANTI'; Property = 'IvantiVersion' }
@@ -4427,35 +4339,29 @@ function Format-HostCollector {
             if (-not $hosts.Count) { continue }
             $columns = $commonColumns
             if ($family -eq 'Windows') { $columns += $windowsColumns }
-            Write-Host "`n  $family hosts" -ForegroundColor Cyan
+            Write-Host ""
+            Write-MobileCenteredText "$family hosts" Cyan
 
             $rows = @(foreach ($hostResult in $hosts) {
-                $cells = @(foreach ($column in $columns) {
-                    if ($column.Getter) { & $column.Getter $hostResult }
+                $values = [ordered]@{}
+                foreach ($column in $columns) {
+                    $values[$column.Header] = if ($column.Getter) { & $column.Getter $hostResult }
                     elseif ($hostResult.Success -and $null -ne $hostResult.Summary.($column.Property) -and
                             [string]$hostResult.Summary.($column.Property) -ne '') {
                         $hostResult.Summary.($column.Property)
                     } else { '-' }
-                })
-                [PSCustomObject]@{ Result = $hostResult; Cells = $cells }
+                }
+                if (-not $hostResult.Success) { $values['HOST'] += ' [FAILED]' }
+                $values['DisplayColor'] = if ($hostResult.Success) { 'Gray' } else { 'Red' }
+                [pscustomobject]$values
             })
-            $widths = for ($i = 0; $i -lt $columns.Count; $i++) {
-                $maximum = ($rows | ForEach-Object { ([string]$_.Cells[$i]).Length } | Measure-Object -Maximum).Maximum
-                [Math]::Max($columns[$i].Header.Length, $maximum)
-            }
-            $format = '  ' + ((0..($columns.Count - 1) | ForEach-Object { "{$_,-$($widths[$_])}" }) -join ' ')
-            Write-Host ($format -f $columns.Header) -ForegroundColor DarkGray
-            foreach ($row in $rows) {
-                $line = $format -f $row.Cells
-                if ($row.Result.Success) { Write-Host $line }
-                else { Write-Host "$line  FAILED" -ForegroundColor Red }
-            }
+            Write-MobileTable $rows $columns.Header
             $failed = @($hosts | Where-Object { -not $_.Success })
             if ($failed.Count) {
-                Write-Host '  Failures:' -ForegroundColor DarkRed
+                Write-MobileCenteredText 'Failures:' DarkRed
                 foreach ($hostResult in $failed) {
                     foreach ($failure in @($hostResult.Failures)) {
-                        Write-Host "    $($hostResult.HostName): $failure" -ForegroundColor Red
+                        Write-MobileCenteredText "$($hostResult.HostName): $failure" Red
                     }
                 }
             }
@@ -4503,7 +4409,7 @@ function Format-DeploymentResults {
     #
     $userRows = foreach ($result in $Results) {
 
-        $host = Get-ShortHostName $result.HostName
+        $hostName = Get-ShortHostName $result.HostName
 
         foreach ($baseName in ($AllUsers.BaseName | Sort-Object -Unique)) {
 
@@ -4540,54 +4446,31 @@ function Format-DeploymentResults {
             if ($unRegister) { $password = ""}
 
             [PSCustomObject]@{
-                Host     = $host
+                Host     = $hostName
                 User     = $baseName
                 Groups   = $roles -join ', '
                 Status   = $status
                 Password = $password
+                DisplayColor = if ($status -eq 'FAILED') { 'Red' } elseif ($status -eq 'OK') { 'Green' } else { 'Gray' }
             }
         }
     }
 
-    Write-Host ""
-    Write-Host "[USERS]" -ForegroundColor Cyan
-    # Optional header row to visually anchor the columns
-    Write-Host ("{0,-30} {1,-30} {2,-30}" -f "USER", "GROUPS", "PASSWORD") -ForegroundColor Gray
-
-    $curUser = ""
-    foreach ($uRow in $userRows | Sort-Object User) {
-        if ($curUser -ne $uRow.User) {
-            $curUser = $uRow.User
-
-            # Safely truncate values exceeding 30 characters to prevent line wrapping/shifting
-            $userCol   = if ($curUser.Length -gt 30) { $curUser.Substring(0, 27) + '...' } else { $curUser }
-            $groupsCol = "[$($uRow.Groups)]"
-            $groupsCol = if ($groupsCol.Length -gt 30) { $groupsCol.Substring(0, 27) + '...]' } else { $groupsCol }
-            $passCol   = if ($uRow.Password.Length -gt 30) { $uRow.Password.Substring(0, 27) + '...' } else { $uRow.Password }
-
-            $line = "{0,-30} {1,-30} {2,-30}" -f $userCol, $groupsCol, $passCol
-            Write-Host $line -ForegroundColor DarkYellow
-        }
-
-        # Indent host status under the active user row
-        if ($status -eq 'OK') {
-            Write-Host ("  [+] {0}" -f $uRow.Host) -ForegroundColor Green
-        } else {
-            Write-Host ("  [-] {0}" -f $uRow.Host) -ForegroundColor Red
-        }
-    }
-
-    # $userRows | Sort-Object Host, User | Format-Table Host, User, Groups, Status, Password -AutoSize
+    Write-Host ''
+    Write-MobileCenteredText '[USERS]' Cyan
+    $userColumns = @('User', 'Groups', 'Host', 'Status')
+    if (-not $Unregister) { $userColumns += 'Password' }
+    Write-MobileTable @($userRows | Sort-Object User, Host) $userColumns
 
     #
     # DEPLOYMENT TASKS
     #
     $taskRows = foreach ($result in $Results) {
 
-        $host = Get-ShortHostName $result.HostName
+        $hostName = Get-ShortHostName $result.HostName
 
         [PSCustomObject]@{
-            Host = $host
+            Host = $hostName
 
             # Privileges = Get-AggregateStatus  -Result $result  -Category 'Privilege'
 
@@ -4611,9 +4494,9 @@ function Format-DeploymentResults {
     }
 
     Write-Host ""
-    Write-Host "[DEPLOYMENT TASKS]" -ForegroundColor Cyan
+    Write-MobileCenteredText '[DEPLOYMENT TASKS]' Cyan
 
-    $taskRows | Sort-Object Host | Format-Table -AutoSize
+    Write-MobileTable @($taskRows | Sort-Object Host) @('Host', 'LogArchiveTask', 'Encryption', 'DomainDisjoin', 'PostDisjoin')
     #
     # FAILURES
     #
@@ -4629,9 +4512,9 @@ function Format-DeploymentResults {
 
     if ($failureRows) {
         Write-Host ""
-        Write-Host "[FAILURES]" -ForegroundColor Red
+        Write-MobileCenteredText '[FAILURES]' Red
 
-        $failureRows | Format-Table Host, Failure -AutoSize
+        Write-MobileTable @($failureRows) @('Host', 'Failure')
     }
 }
 
@@ -4668,22 +4551,15 @@ function Get-MobileOverview {
         -mobileEntriesPath $mobileEntriesPath `
         -fallbackPass $fallBackPass
 
-    $width = 76
-
-    function Write-CenteredHeader {
-        param([string]$Text, [ConsoleColor]$Color = 'Cyan')
-        $border  = '=' * $width
-        $padding = [Math]::Max(0, [Math]::Floor(($width - $Text.Length) / 2))
-        Write-Host $border -ForegroundColor $Color
-        Write-Host (' ' * $padding + $Text) -ForegroundColor $Color
-        Write-Host $border -ForegroundColor $Color
+    function Write-CenteredHeader([string]$Text) {
+        $border = '=' * [Math]::Min(76, (Get-MobileTerminalWidth))
+        Write-MobileCenteredText $border Cyan
+        Write-MobileCenteredText $Text Cyan
+        Write-MobileCenteredText $border Cyan
     }
-
-    function Write-Section {
-        param([string]$Text, [ConsoleColor]$Color = 'DarkYellow')
-        Write-Host ""
-        Write-Host ("[{0}]" -f $Text) -ForegroundColor $Color
-        Write-Host ('-' * $width) -ForegroundColor DarkGray
+    function Write-Section([string]$Text, [ConsoleColor]$Color = 'DarkYellow') {
+        Write-Host ''
+        Write-MobileCenteredText "[$Text]" $Color
     }
 
     if ($data.AllMobiles.Count -eq 0) {
@@ -4694,7 +4570,7 @@ function Get-MobileOverview {
     if ([string]::IsNullOrWhiteSpace($MobileName)) {
         Write-CenteredHeader -Text 'AVAILABLE MOBILES'
         foreach ($name in $data.AllMobiles) {
-            Write-Host ("  {0,-30}" -f $name) -ForegroundColor Green
+            Write-MobileCenteredText $name Green
         }
         Write-Host ""
         return
@@ -4704,28 +4580,22 @@ function Get-MobileOverview {
 
     # --- SECTION: Configured Users ---
     Write-Section -Text 'USERS' -Color DarkYellow
-    Write-Host ("  {0,-18} {1,-18} {2,-24} {3}" -f 'USERNAME', 'GROUPS', 'FULL NAME', 'PASSWORD SET') -ForegroundColor DarkYellow
-
-    foreach ($u in ($data.MobileUsers | Sort-Object Username)) {
-        $hasPassword = $false
-        if (-not [string]::IsNullOrWhiteSpace($mobileDumpPath) -and (Test-Path $mobileDumpPath)) {
-            $passPath = Join-Path $mobileDumpPath $u.Username
-            $hasPassword = Test-Path $passPath
+    $userRows = @(foreach ($u in ($data.MobileUsers | Sort-Object Username)) {
+        $hasPassword = -not [string]::IsNullOrWhiteSpace($mobileDumpPath) -and
+            (Test-Path (Join-Path $mobileDumpPath $u.Username))
+        [pscustomobject]@{
+            Username = $u.Username; Groups = $u.Groups -join ', '; FullName = $u.Name
+            Password = if ($hasPassword) { '[+] SET' } else { '[-] PENDING' }
+            DisplayColor = if ($hasPassword) { 'Green' } else { 'Yellow' }
         }
-
-        $statusText  = if ($hasPassword) { "[+] SET" } else { "[-] PENDING" }
-        $statusColor = if ($hasPassword) { 'Green' } else { 'DarkRed' }
-        $groups      = $u.Groups -join ', '
-
-        Write-Host ("  {0,-18} {1,-18} {2,-24} " -f $u.Username, $groups, $u.Name) -ForegroundColor Yellow -NoNewline
-        Write-Host $statusText -ForegroundColor $statusColor
-    }
+    })
+    Write-MobileTable $userRows @('Username', 'Groups', 'FullName', 'Password') @('USERNAME', 'GROUPS', 'FULL NAME', 'PASSWORD SET')
 
     # --- SECTION: Windows Nodes ---
     if ($data.Windows.Count -gt 0) {
         Write-Section -Text 'WINDOWS ENDPOINTS' -Color DarkCyan
         foreach ($c in ($data.Windows | Sort-Object)) {
-            Write-Host ("  [+] {0}" -f $c) -ForegroundColor Cyan
+            Write-MobileCenteredText "[+] $c" Cyan
         }
     }
 
@@ -4733,16 +4603,13 @@ function Get-MobileOverview {
     if ($data.Linux.Count -gt 0) {
         Write-Section -Text 'LINUX ENDPOINTS' -Color DarkRed
         foreach ($c in ($data.Linux | Sort-Object)) {
-            Write-Host ("  [+] {0}" -f $c) -ForegroundColor Red
+            Write-MobileCenteredText "[+] $c" Red
         }
     }
 
     # --- SECTION: Role Expansion ---
     Write-Section -Text 'SIMULATED DEPLOYMENT ACCOUNTS' -Color DarkGreen
-    Write-Host ("  {0,-24} {1,-22} {2}" -f 'ACCOUNT NAME', 'FULL NAME', 'ROLE DESCRIPTION') -ForegroundColor DarkGreen
-    foreach ($u in $data.AllUsers) {
-        Write-Host ("  {0,-24} {1,-22} {2}" -f $u.Name, $u.FullName, $u.Description) -ForegroundColor Green
-    }
+    Write-MobileTable @($data.AllUsers) @('Name', 'FullName', 'Description') @('ACCOUNT NAME', 'FULL NAME', 'ROLE DESCRIPTION')
 
     # --- SECTION: Deep Telemetry (-Full) ---
     if ($Full) {
@@ -4762,11 +4629,7 @@ function Get-MobileOverview {
             -linComputers $data.Linux `
             -sshKeyPath $sshKeyPath
 
-        if (Get-Command Format-HostCollector -ErrorAction SilentlyContinue) {
-            $computerData | Format-HostCollector
-        } else {
-            $computerData | Format-Table -AutoSize
-        }
+        $computerData | Format-HostCollector
     }
 
     Write-Host "`n"

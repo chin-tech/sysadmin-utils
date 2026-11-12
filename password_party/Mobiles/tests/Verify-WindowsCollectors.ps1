@@ -7,7 +7,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Join-Path (Split-Path $PSScriptRoot -Parent) 'MobileManager.psm1'), [ref]$tokens, [ref]$issues)
 if ($issues.Count) { throw ($issues.Message -join "`n") }
 $names = @('Test-DeploymentTaskPlan', 'Get-DeploymentTaskSelection', 'Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
-    'Get-WindowsInformationBlock', 'Get-WindowsCollector-DiskSpace', 'Get-WindowsCollector-SecurityUpdates',
+    'Get-WindowsInformationBlock', 'Get-WindowsCollector-DiskSpace', 'Get-LinuxInformationScript', 'Get-LinuxCollector-DiskSpace',
     'Get-TaskData', 'New-WindowsPostTask-UserRights', 'Get-PostDeployScript')
 $definitions = $ast.FindAll({ param($node)
     ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names) -or
@@ -89,6 +89,13 @@ try {
         [System.Management.Automation.Language.Parser]::ParseInput($block.ToString(), [ref]$tokens, [ref]$errors) | Out-Null
         Assert ($errors.Count -eq 0) 'Composed Windows collector failed to parse'
         Assert ($block.ToString().Contains('IvantiCoreServer') -and $block.ToString().Contains('AVDefsRevision')) 'Composed summary omitted new telemetry'
+        Assert ($block.ToString() -notmatch 'PackageCount|LastUpdate|Microsoft.Update.Session|Get-HotFix|Uninstall\\') 'Unused Windows package/update collection remains'
+        $linuxBlock = Get-LinuxInformationScript
+        Assert ($linuxBlock -notmatch 'package_count|last_update|rpm -q|yum history|dnf history') 'Unused Linux package/update collection remains'
+        if (Get-Command bash -ErrorAction SilentlyContinue) {
+            $linuxBlock | & bash -n
+            Assert ($LASTEXITCODE -eq 0) 'Composed Linux collector failed to parse'
+        }
         # Optional post-deployment fragments must compose into executable PowerShell.
         $payloads = @(
             New-WindowsPostTask-UserRights

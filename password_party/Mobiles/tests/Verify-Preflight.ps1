@@ -6,7 +6,7 @@ New-Item -ItemType Directory -Path $fixture | Out-Null
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join '; ') }
-$names = @('New-TaskXML', 'ConvertTo-Base64', 'Start-WindowsPreflightScanJob', 'Get-WindowsPreflightScanWorker', 'Get-WindowsPreflightScanState', 'Get-LinuxPreflightScanWorker', 'Get-MobileDefinitionAssessment', 'Get-WindowsPreflightBlock', 'Get-LinuxPreflightScript', 'Invoke-MobilePreflight',
+$names = @('Get-MobileTerminalWidth', 'Write-MobileCenteredText', 'Write-MobileTable', 'Read-WindowsPreflightScan','Invoke-MobilePreflightQuery','Get-MobileScanOutcome','Get-MobilePreflightEvidence','New-TaskXML', 'ConvertTo-Base64', 'Start-WindowsPreflightScanJob', 'Get-WindowsPreflightScanWorker', 'Get-WindowsPreflightScanState', 'Get-LinuxPreflightScanWorker', 'Get-MobileDefinitionAssessment', 'Get-WindowsPreflightBlock', 'Get-LinuxPreflightScript', 'Invoke-MobilePreflight',
     'Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
     'ConvertTo-BashArgument', 'New-MobileRunLog', 'Write-MobileRunEvent', 'Format-MobileRunEvent', 'ConvertTo-MobileLogLines')
 $source = $ast.EndBlock.Statements | Where-Object {
@@ -88,13 +88,17 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
 25 20 0:5 / /mnt/smb rw - cifs //server/share rw
 '@ | Set-Content $mountInfoPath
                 $path = "$fixture/preflight.sh"
-                function Query-LinuxScan {
-                    [IO.File]::WriteAllText($path, (Get-LinuxPreflightScript $options).Replace('/proc/self/mountinfo', $mountInfoPath))
+                function Invoke-Linux {
+                    param($Computers,$Script,$KeyPath)
+                    [IO.File]::WriteAllText($path, $Script.Replace('/proc/self/mountinfo', $mountInfoPath))
                     & bash -n $path
-                    Assert ($LASTEXITCODE -eq 0) 'Generated async Linux script is invalid Bash'
+                    Assert ($LASTEXITCODE -eq 0) 'Generated Linux reader/dispatch script is invalid Bash'
                     $output = & bash $path
-                    Assert ($LASTEXITCODE -eq 0) 'Linux preflight dispatch/query failed'
-                    ($output -join "`n") | ConvertFrom-Json
+                    [pscustomobject]@{ Target=$Computers[0]; ExitCode=$LASTEXITCODE; StdOut=($output -join "`n"); StdErr='' }
+                }
+                function Query-LinuxScan {
+                    $observation=@(Invoke-MobilePreflightQuery -Platform Linux -Computers @('fixture-linux') -Options $options)[0]
+                    Get-MobilePreflightEvidence -Platform Linux -Observation $observation -Options $options
                 }
                 foreach ($definitionDate in @([datetime]::UtcNow.AddDays(-31).ToString('yyyy-MM-dd'), 'invalid', [datetime]::UtcNow.AddDays(1).ToString('yyyy-MM-dd'))) {
                     $env:MOBILE_TEST_DEFINITION_DATE = $definitionDate
@@ -136,6 +140,13 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 }
                 Assert ($linux.ScanStatus -eq 'Clean' -and $linux.LastScanStatus -eq 'Clean' -and $linux.LastScanCompletedUtc) 'Detached scan completion was not persisted'
                 $scanDetails = ($linux.Actions | Where-Object Category -eq AVScan).Details
+                $textRun=(Get-Content "$fixture/linux-state/latest" -Raw).Trim()
+                Assert ((Get-Content (Join-Path $textRun 'status') -Raw).Trim() -eq 'finished' -and -not (Test-Path (Join-Path $textRun 'result.json'))) 'Linux worker still maintains a JSON state machine'
+                Set-Content (Join-Path $textRun 'exit-code') -Value '' -NoNewline
+                $incomplete=Query-LinuxScan
+                Assert ($incomplete.ScanStatus -eq 'Failed') 'A finished marker without an exit code was accepted as clean'
+                '0' | Set-Content (Join-Path $textRun 'exit-code')
+
                 $excluded = @($scanDetails.Current.ExcludedNfsMounts)
                 Assert ($excluded.Count -eq 3 -and $excluded -contains '/mnt/team share.[a]+' -and $excluded -contains '/mnt/nfs4' -and $excluded -contains '/mnt/bind\path') 'NFS/NFS4/bind mount discovery or kernel path decoding failed'
                 Assert (@($scanDetails.LastCompleted.ExcludedNfsMounts).Count -eq 3) 'Completed history lost NFS exclusions'
@@ -174,8 +185,14 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 $linux = Query-LinuxScan
                 Assert ($linux.ScanStatus -eq 'TimedOut' -and @(Get-Content $env:MOBILE_TEST_DISPATCHES).Count -eq $before) 'Status-only mode lost history or dispatched a scan'
                 # An inactive unit with an unfinished state is interrupted, not clean/running.
-                $pointer = Get-Content "$fixture/linux-state/latest.json" -Raw | ConvertFrom-Json
-                '{"Status":"Running"}' | Set-Content (Join-Path $pointer.RunDirectory 'result.json')
+                $plainRun=(Get-Content "$fixture/linux-state/latest" -Raw).Trim()
+                'Running' | Set-Content (Join-Path $plainRun 'status')
+                $plainInterrupted=Query-LinuxScan
+                Assert ($plainInterrupted.ScanStatus -eq 'Interrupted') 'An inactive text-file worker was reported as running'
+
+                $runPath = (Get-Content "$fixture/linux-state/latest" -Raw).Trim()
+                Remove-Item (Join-Path $runPath 'status')
+                '{"Status":"Running"}' | Set-Content (Join-Path $runPath 'result.json')
                 $linux = Query-LinuxScan
                 Assert ($linux.ScanStatus -eq 'Interrupted') 'Missing worker was reported as still running'
                 $options.SkipScans = $false
@@ -229,17 +246,22 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 $job = & $dispatch -Options $dispatchOptions -Worker (Get-WindowsPreflightScanWorker) -Root "$fixture/windows state's" -Executable "$tools/DoScan.exe"
                 Assert ($job.State.Status -eq 'Starting' -and -not (Test-Path (Join-Path $job.RunDirectory 'worker.ps1'))) 'Preflight wrote an executable worker or lost its starting state'
                 & ([scriptblock]::Create($script:scanInvocation))
-                $dispatchResult = Get-Content (Join-Path $job.RunDirectory 'result.json') -Raw | ConvertFrom-Json
+                $dispatchResult = Read-WindowsPreflightScan $job.RunDirectory
+                $dispatchResult.Status = Get-MobileScanOutcome Windows $dispatchResult
                 Assert ($dispatchResult.Status -eq 'CompletedNeedsReview') 'Encoded worker invocation lost its quoted state path or scan result'
                 ${function:New-TaskXML} = $realXmlBuilder
                 & (Get-WindowsPreflightScanWorker) -RunDirectory $runDirectory
-                $completed = Get-Content "$runDirectory/result.json" -Raw | ConvertFrom-Json
+                $completed = Read-WindowsPreflightScan $runDirectory
+                $completed.Status = Get-MobileScanOutcome Windows $completed
                 Assert ($completed.Status -eq 'CompletedNeedsReview' -and $completed.CompletedUtc) 'SEP worker exit zero was called clean or not persisted'
                 $env:MOBILE_TEST_SEP_CODE = '2'
                 & (Get-WindowsPreflightScanWorker) -RunDirectory $runDirectory
-                $failedWorker = Get-Content "$runDirectory/result.json" -Raw | ConvertFrom-Json
+                $failedWorker = Read-WindowsPreflightScan $runDirectory
+                $failedWorker.Status = Get-MobileScanOutcome Windows $failedWorker
                 Assert ($failedWorker.Status -eq 'Failed' -and $failedWorker.ExitCode -eq 2) 'SEP worker failure was lost'
                 # Query real state logic with mocked registry/scheduler observations.
+                Remove-Item (Join-Path $runDirectory 'status')
+                Remove-Item "$fixture/windows-state/completed"
                 $completed | ConvertTo-Json -Depth 8 | Set-Content "$runDirectory/result.json"
                 $completed | ConvertTo-Json -Depth 8 | Set-Content "$fixture/windows-state/completed.json"
                 @{ RunDirectory = $runDirectory } | ConvertTo-Json | Set-Content "$fixture/windows-state/latest.json"
@@ -250,16 +272,28 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 }
                 function Get-CimInstance { [CmdletBinding()] param($ClassName) @() }
                 function Get-ScheduledTask { [CmdletBinding()] param($TaskName) [pscustomobject]@{ State = 'Ready' } }
-                $windows = & (Get-WindowsPreflightBlock) $options
+                function Invoke-Command {
+                    [CmdletBinding()] param($ComputerName,$ScriptBlock,$ArgumentList)
+                    $value = & $ScriptBlock $ArgumentList
+                    $value | Add-Member PSComputerName $ComputerName[0] -Force
+                    $value
+                }
+                function Query-WindowsScan([string]$Date=$today) {
+                    $observation=@(Invoke-MobilePreflightQuery -Platform Windows -Computers @('fixture-win') -Options $options)[0]
+                    $observation.Result.DefinitionDate=$Date
+                    Get-MobilePreflightEvidence -Platform Windows -Observation $observation -Options $options
+                }
+
+                $windows = Query-WindowsScan
                 Assert ($windows.ScanStatus -eq 'CompletedNeedsReview' -and $windows.LastScanCompletedUtc) 'SEP last completed result was not returned'
                 $script:nativeScanStatus = 8
                 $options.Rescan = $true
-                $windows = & (Get-WindowsPreflightBlock) $options
+                $windows = Query-WindowsScan
                 Assert ($windows.ScanStatus -eq 'Running' -and $windows.LastScanStatus -eq 'CompletedNeedsReview') 'Active native SEP scan was not respected'
                 $script:nativeScanStatus = 0
                 $options.Rescan = $false
                 @{ Status = 'Running'; StartedUtc = [datetime]::UtcNow.AddMinutes(-5).ToString('o') } | ConvertTo-Json | Set-Content "$runDirectory/result.json"
-                $windows = & (Get-WindowsPreflightBlock) $options
+                $windows = Query-WindowsScan
                 Assert ($windows.ScanStatus -eq 'Interrupted') 'Stale SEP worker was reported as running'
                 # Exercise dispatch decisions with only the native scheduler/ACL writer stubbed.
                 . ([scriptblock]::Create((Get-WindowsCollector-Registry)))
@@ -270,25 +304,26 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                     $directory = Join-Path $Root 'new-job'
                     New-Item -ItemType Directory -Path $directory -Force | Out-Null
                     $state = [pscustomobject]@{ Status = 'Starting'; StartedUtc = [datetime]::UtcNow.ToString('o') }
-                    $state | ConvertTo-Json | Set-Content (Join-Path $directory 'result.json')
-                    @{ RunDirectory = $directory } | ConvertTo-Json | Set-Content (Join-Path $Root 'latest.json')
+                    'Starting' | Set-Content (Join-Path $directory 'status')
+                    $state.StartedUtc | Set-Content (Join-Path $directory 'started-utc')
+                    $directory | Set-Content (Join-Path $Root 'latest')
                     [pscustomobject]@{ State = $state; RunDirectory = $directory }
                 }
                 $options.WindowsScanStateDirectory = "$fixture/dispatch-state"
                 $options.SymantecScanExecutable = "$tools/DoScan.exe"
                 foreach ($definitionDate in @([datetime]::UtcNow.AddDays(-31).ToString('yyyy-MM-dd'), '', [datetime]::UtcNow.AddDays(1).ToString('yyyy-MM-dd'))) {
-                    $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker) -DefinitionDate $definitionDate
-                    Assert ($scan.Status -eq 'BlockedDefinitions' -and $script:windowsDispatches -eq 0) 'Windows dispatched with stale/unknown/future definitions'
+                    $scan = Query-WindowsScan $definitionDate
+                    Assert ($scan.ScanStatus -eq 'BlockedDefinitions' -and $script:windowsDispatches -eq 0) 'Windows dispatched with stale/unknown/future definitions'
                 }
                 $options.ForceScan = $true
-                $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker)
+                $scan = Query-WindowsScan
                 $options.ForceScan = $false
-                Assert ($scan.Status -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows did not dispatch a missing scan'
-                $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker)
-                Assert ($scan.Status -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows duplicated a newly queued scan'
+                Assert ($scan.ScanStatus -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows did not dispatch a missing scan'
+                $scan = Query-WindowsScan
+                Assert ($scan.ScanStatus -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows duplicated a newly queued scan'
                 $options.WindowsScanStateDirectory = "$fixture/current-dispatch-state"
-                $scan = Get-WindowsPreflightScanState -Options $options -Worker (Get-WindowsPreflightScanWorker) -DefinitionDate ([datetime]::UtcNow.AddDays(-30).ToString('yyyy-MM-dd'))
-                Assert ($scan.Status -eq 'Starting' -and $script:windowsDispatches -eq 2) 'Windows rejected definitions at the 30-day boundary'
+                $scan = Query-WindowsScan ([datetime]::UtcNow.AddDays(-30).ToString('yyyy-MM-dd'))
+                Assert ($scan.ScanStatus -eq 'Starting' -and $script:windowsDispatches -eq 2) 'Windows rejected definitions at the 30-day boundary'
 
             } finally {
                 foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name]) }
