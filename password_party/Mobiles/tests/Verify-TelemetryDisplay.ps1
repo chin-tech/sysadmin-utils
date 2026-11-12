@@ -11,7 +11,7 @@ try {
         $script:lines=[Collections.Generic.List[string]]::new()
         function Write-Host {param($Object,$ForegroundColor,[switch]$NoNewline) $script:lines.Add([string]$Object)}
         function Get-MobileTerminalWidth { 240 }
-        $summary=[pscustomobject]@{Kernel='fixture-kernel';AVDefs='2026-11-10';DiskFreeGB=0;AdminRotateVersion='present';IvantiVersion='fixture-agent';IvantiCoreServer='core.example';License='Licensed'}
+        $summary=[pscustomobject]@{Kernel='fixture-kernel';AVDefs='2026-11-10';DiskFreeGB=0;IvantiVersion='fixture-agent';IvantiCoreServer='core.example';License='Licensed'}
         $windows=[pscustomobject]@{HostName='win-a';Platform='WIN11';Success=$true;Summary=$summary;Failures=@()}
         $linux=[pscustomobject]@{HostName='linux-a';Platform='RHEL-8.10';PlatformFamily='Linux';Success=$true;Summary=$summary;Failures=@()}
         $badWindows=[pscustomobject]@{HostName='win-offline';Platform='Windows';PlatformFamily='Windows';Success=$false;Summary=$null;Failures=@('Windows connection failed')}
@@ -24,7 +24,7 @@ try {
         $linuxText=$display.Substring($split)
         Assert ($winText.Contains('WIN-A') -and -not $winText.Contains('LINUX-A') -and $linuxText.Contains('LINUX-A') -and -not $linuxText.Contains('WIN-A')) 'Hosts leaked between platform tables'
         Assert ($winText.Contains('IVANTI CORE') -and $winText.Contains('LICENSE') -and -not $linuxText.Contains('IVANTI') -and -not $linuxText.Contains('LICENSE')) 'Windows-only fields leaked into the Linux table'
-        foreach($header in @('HOST','OS','KERNEL','AV DEFS','FREE GB','LAPS')){
+        foreach($header in @('HOST','OS','KERNEL','AV DEFS','FREE GB')){
             Assert ($winText.Contains($header) -and $linuxText.Contains($header)) "Shared column missing: $header"
         }
         Assert ($winText.Contains('Windows connection failed') -and -not $winText.Contains('Linux connection failed') -and $linuxText.Contains('Linux connection failed')) 'Failures were not grouped with their platform'
@@ -33,7 +33,7 @@ try {
         $script:lines.Clear()
         Format-HostCollector -InputObject @($windows)
         Assert (-not (($script:lines -join "`n").Contains('Linux hosts'))) 'Empty platform table was rendered'
-        Assert (-not (($script:lines -join "`n") -match 'LAST UPDATE|PKGS')) 'Unused telemetry columns remain'
+        Assert (-not (($script:lines -join "`n") -match 'LAST UPDATE|PKGS|LAPS')) 'Unused telemetry columns remain'
 
         # Check centering of both the table and each cell at different terminal widths.
         $fixtureRows = @([pscustomobject]@{A='a';B='longer'}; [pscustomobject]@{A='abcdef';B='x'})

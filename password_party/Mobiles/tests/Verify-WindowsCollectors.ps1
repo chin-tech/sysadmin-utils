@@ -89,9 +89,9 @@ try {
         [System.Management.Automation.Language.Parser]::ParseInput($block.ToString(), [ref]$tokens, [ref]$errors) | Out-Null
         Assert ($errors.Count -eq 0) 'Composed Windows collector failed to parse'
         Assert ($block.ToString().Contains('IvantiCoreServer') -and $block.ToString().Contains('AVDefsRevision')) 'Composed summary omitted new telemetry'
-        Assert ($block.ToString() -notmatch 'PackageCount|LastUpdate|Microsoft.Update.Session|Get-HotFix|Uninstall\\') 'Unused Windows package/update collection remains'
+        Assert ($block.ToString() -notmatch 'AdminRotateVersion|ADMIN-LAPS|PackageCount|LastUpdate|Microsoft.Update.Session|Get-HotFix|Uninstall\\') 'Unused Windows LAPS/package/update collection remains'
         $linuxBlock = Get-LinuxInformationScript
-        Assert ($linuxBlock -notmatch 'package_count|last_update|rpm -q|yum history|dnf history') 'Unused Linux package/update collection remains'
+        Assert ($linuxBlock -notmatch 'AdminRotateVersion|laps_path|laps_version|package_count|last_update|rpm -q|yum history|dnf history') 'Unused Linux LAPS/package/update collection remains'
         if (Get-Command bash -ErrorAction SilentlyContinue) {
             $linuxBlock | & bash -n
             Assert ($LASTEXITCODE -eq 0) 'Composed Linux collector failed to parse'

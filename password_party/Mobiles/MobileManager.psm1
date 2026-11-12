@@ -3477,18 +3477,6 @@ function Get-WindowsInformationBlock {
                 $osString = Get-WinVersion ([int]$osInfo.CurrentBuildNumber)
                 $cores = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property NumberOfCores -Sum).Sum
 
-                # LAPS Scheduled Task Check
-                $adminRotateScriptVersion = $null
-                if (Get-ScheduledTask -TaskName 'ADMIN-LAPS' -ErrorAction SilentlyContinue) {
-                    $xml = schtasks /query /tn ADMIN-LAPS /xml 2>$null
-                    $versionMatch = ($xml | Select-String -Pattern '<Version>(.*?)</Version>').Matches
-                    if ($versionMatch.Count) {
-                        $adminRotateScriptVersion = $versionMatch[0].Groups[1].Value
-                    } else {
-                        $adminRotateScriptVersion = "Present"
-                    }
-                }
-
                 # License Activation Check
                 $activation = Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" -ErrorAction SilentlyContinue |
                     Where-Object PartialProductKey |
@@ -3515,7 +3503,6 @@ function Get-WindowsInformationBlock {
                     Summary = [PSCustomObject]@{
                         Kernel              = $kernelString
                         Cores               = $cores
-                        AdminRotateVersion  = $adminRotateScriptVersion
                         AVDefs              = $symantecInfo.DefinitionDate
                         AVDefsRevision      = $symantecInfo.DefinitionRevision
                         AVDefsStatus        = $symantecInfo.Status
@@ -3586,15 +3573,12 @@ kernel_value="$(uname -r)"
 
 clamav_value="$(clamscan -V 2>/dev/null | awk -F'/' '{print $NF}' | xargs -I{} date -d "{}" +'%Y/%m/%d' 2>/dev/null)"
 
-laps_path="$(find /etc/systemd -iname '*laps*' -type f 2>/dev/null | head -n 1)"
-laps_version=$([[ -n "$laps_path" ]] && echo "Present" || echo "")
 
 jq -n \
     --arg hostname "$hostname_value" \
     --arg os "$os" \
     --arg kernel "$kernel_value" \
     --argjson cores "$cores_value" \
-    --arg laps "$laps_version" \
     --arg avDefs "$clamav_value" \
     --argjson disks "$disk_json" \
 '
@@ -3605,7 +3589,6 @@ jq -n \
     Summary: {
         Kernel: $kernel,
         Cores: $cores,
-        AdminRotateVersion: $laps,
         AVDefs: $avDefs,
         IvantiVersion: null,
         IvantiServicesReady: null,
@@ -4321,7 +4304,6 @@ function Format-HostCollector {
             @{ Header = 'KERNEL'; Property = 'Kernel' }
             @{ Header = 'AV DEFS'; Property = 'AVDefs' }
             @{ Header = 'FREE GB'; Property = 'DiskFreeGB' }
-            @{ Header = 'LAPS'; Property = 'AdminRotateVersion' }
         )
         $windowsColumns = @(
             @{ Header = 'IVANTI'; Property = 'IvantiVersion' }
