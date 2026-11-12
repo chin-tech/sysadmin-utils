@@ -30,6 +30,26 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
         Assert $rejected 'An incompatible or out-of-range CLI option was accepted'
     }
 
+    function Get-ParameterCompletion([string]$Arguments) {
+        $line = "& '" + $cli.Replace("'", "''") + "' " + $Arguments
+        @([System.Management.Automation.CommandCompletion]::CompleteInput($line, $line.Length, $null).CompletionMatches |
+            Where-Object ResultType -eq ParameterName | ForEach-Object CompletionText)
+    }
+    function Assert-Completion([string]$Arguments, [string[]]$Expected) {
+        $actual = @(Get-ParameterCompletion $Arguments)
+        Assert (-not (Compare-Object @($Expected | Sort-Object) @($actual | Sort-Object))) "Unexpected completion for '$Arguments': $($actual -join ', ')"
+    }
+    # Exercise discovery before the first invocation: no module/config/site work is needed.
+    Assert-Completion '-' @('-Info','-RegisterDeployment','-UnRegisterDeployment','-Preflight','-Initialize','-New','-GPO','-Name','-Full')
+    Assert-Completion '-Preflight fixture -' @('-SkipScans','-Rescan','-ForceScan','-DefinitionMaxAgeDays','-ScanTimeoutMinutes')
+    Assert-Completion '-RegisterDeployment fixture -' @('-Disjoin','-LinuxDisjoinKeytab','-DomainController','-DomainPrincipal','-DomainKeyVersion')
+    Assert-Completion '-UnRegisterDeployment fixture -' @('-Archive')
+    Assert-Completion '-Info fixture -' @('-Full')
+    Assert-Completion '-GPO fixture -' @('-Add','-Remove','-Force')
+    Assert (@(Get-ParameterCompletion '-New -').Count -eq 0) 'New offered unrelated parameters'
+    Assert (@(Get-ParameterCompletion '-Initialize -').Count -eq 0) 'Initialize offered unrelated parameters'
+    Assert (-not (Get-Module MobileManager)) 'Tab completion imported the deployment module'
+
     $result = & $cli
     Assert ($result.Command -eq 'Get-MobileOverview' -and -not $result.Options.MobileName) 'Default overview requires a mode switch or target'
     $result = & $cli fixture -Full
@@ -59,13 +79,21 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
     Assert-Rejected @{ Preflight=$true; Name='fixture'; Disjoin=$true }
     Assert-Rejected @{ RegisterDeployment=$true; Name='fixture'; Rescan=$true }
     Assert-Rejected @{ GPO=$true; Add=$true; Remove=$true; Name='fixture' }
+    Assert-Rejected @{ GPO=$true; Name='fixture' }
+    Assert-Rejected @{ GPO=$true; Add=$true; Force=$true; Name='fixture' }
+    Assert-Rejected @{ New=$true; Full=$true }
+    Assert-Rejected @{ Initialize=$true; Archive=$true }
     Assert-Rejected @{ Preflight=$true; Name='fixture'; DefinitionMaxAgeDays=-1 }
     Assert-Rejected @{ Preflight=$true; Name='fixture'; ScanTimeoutMinutes=0 }
+    $result = & $cli -force-scan -Preflight fixture -ErrorAction Stop
+    Assert ($result.Options.ForceScan) 'Options before their command selector no longer bind'
+    $result = & $cli -UnRegisterDeployment fixture -Archive:$false
+    Assert (-not $result.Options.Archive) 'Explicit false dynamic switch was enabled'
     $sets = (Get-Command $cli).ParameterSets
-    foreach ($set in ($sets | Where-Object Name -in @('Preflight','RegisterDeployment','UnRegisterDeployment','GPOAdd','GPORemove'))) {
+    foreach ($set in ($sets | Where-Object Name -in @('Preflight','RegisterDeployment','UnRegisterDeployment','GPO'))) {
         Assert ([bool]($set.Parameters | Where-Object Name -eq 'Name').IsMandatory) "Missing mandatory target for $($set.Name)"
     }
-    'PASS: all CLI modes, native parameter-set validation, config precedence, option forwarding, aliases, defaults and explicit false switches.'
+    'PASS: context-specific completion, discovery without module loading, all CLI modes, invalid combinations, config precedence, forwarding, aliases and explicit false switches.'
 } finally {
     Remove-Module MobileManager -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fixture -Recurse -Force
