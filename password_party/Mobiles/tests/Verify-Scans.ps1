@@ -6,8 +6,8 @@ New-Item -ItemType Directory -Path $fixture | Out-Null
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join '; ') }
-$names = @('Get-MobileTerminalWidth', 'Write-MobileCenteredText', 'Write-MobileTable', 'Read-WindowsPreflightScan','Invoke-MobilePreflightQuery','Get-MobileScanOutcome','Get-MobilePreflightEvidence','New-TaskXML', 'ConvertTo-Base64', 'Start-WindowsPreflightScanJob', 'Get-WindowsPreflightScanWorker', 'Get-WindowsPreflightScanState', 'Get-LinuxPreflightScanWorker', 'Get-MobileDefinitionAssessment', 'Get-WindowsPreflightBlock', 'Get-LinuxPreflightScript', 'Invoke-MobilePreflight',
-    'Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
+$names = @('Get-MobileTerminalWidth', 'Write-MobileCenteredText', 'Write-MobileTable', 'Read-WindowsScan','Invoke-MobileScanQuery','Get-MobileScanOutcome','Get-MobileScanEvidence','New-TaskXML', 'ConvertTo-Base64', 'Start-WindowsScanJob', 'Get-WindowsScanWorker', 'Get-WindowsScanState', 'Get-LinuxScanWorker', 'Get-MobileDefinitionAssessment', 'Get-WindowsScanBlock', 'Get-LinuxScanScript', 'Invoke-MobileScan',
+    'Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec',
     'ConvertTo-BashArgument', 'New-MobileRunLog', 'Write-MobileRunEvent', 'Format-MobileRunEvent', 'ConvertTo-MobileLogLines')
 $source = $ast.EndBlock.Statements | Where-Object {
     $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -in $names
@@ -17,6 +17,7 @@ try {
     & $module {
         param($fixture, $root)
         function Assert($condition, $message) { if (-not $condition) { throw $message } }
+        Assert ((Get-WindowsScanBlock).ToString() -notmatch 'Get-IvantiInformation') 'Scan payload still includes unrelated inventory'
         $today = [datetime]::UtcNow.ToString('yyyy-MM-dd')
         Assert ((Get-MobileDefinitionAssessment $today).Status -eq 'Current') 'Current definitions were rejected'
         Assert ((Get-MobileDefinitionAssessment ([datetime]::UtcNow.AddDays(-31).ToString('yyyy-MM-dd'))).Status -eq 'Stale') 'Stale definitions were not flagged'
@@ -28,11 +29,11 @@ try {
             MobileDeployments = "$fixture/logs"; SSHKeyPath = "$fixture/key"
         }
         $options = [pscustomobject]@{
-            SkipScans = $false; ScanTimeoutMinutes = 1; ForceScan = $false; DefinitionMaxAgeDays = 30
+            ScanTimeoutMinutes = 1; Force = $false; DefinitionMaxAgeDays = 30
             LinuxScanPaths = @("/fixture path/with 'quote'"); WindowsScanPaths = @('C:')
             SymantecScanName = ''; SymantecScanExecutable = ''
         }
-        Assert ((Get-LinuxPreflightScript $options).Contains('/usr/local/bin')) 'Older configuration did not receive default tool directories'
+        Assert ((Get-LinuxScanScript $options).Contains('/usr/local/bin')) 'Older configuration did not receive default tool directories'
         if ((Get-Command bash -ErrorAction SilentlyContinue) -and (Get-Command jq -ErrorAction SilentlyContinue)) {
             $tools = Join-Path $fixture 'tools'
             New-Item -ItemType Directory -Path $tools | Out-Null
@@ -97,28 +98,24 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                     [pscustomobject]@{ Target=$Computers[0]; ExitCode=$LASTEXITCODE; StdOut=($output -join "`n"); StdErr='' }
                 }
                 function Query-LinuxScan {
-                    $observation=@(Invoke-MobilePreflightQuery -Platform Linux -Computers @('fixture-linux') -Options $options)[0]
-                    Get-MobilePreflightEvidence -Platform Linux -Observation $observation -Options $options
+                    $observation=@(Invoke-MobileScanQuery -Platform Linux -Computers @('fixture-linux') -Options $options)[0]
+                    Get-MobileScanEvidence -Platform Linux -Observation $observation -Options $options
                 }
                 foreach ($definitionDate in @([datetime]::UtcNow.AddDays(-31).ToString('yyyy-MM-dd'), 'invalid', [datetime]::UtcNow.AddDays(1).ToString('yyyy-MM-dd'))) {
                     $env:MOBILE_TEST_DEFINITION_DATE = $definitionDate
                     $linux = Query-LinuxScan
                     Assert ($linux.ScanStatus -eq 'BlockedDefinitions' -and -not (Test-Path $env:MOBILE_TEST_DISPATCHES)) 'Linux dispatched with stale/unknown/future definitions'
                 }
-                $options.ForceScan = $true
-                $options.SkipScans = $true
+                $options.Force = $true
                 $linux = Query-LinuxScan
-                Assert ($linux.ScanStatus -eq 'NotStarted' -and -not (Test-Path $env:MOBILE_TEST_DISPATCHES)) 'ForceScan overrode query-only mode'
-                $options.SkipScans = $false
-                $linux = Query-LinuxScan
-                Assert ($linux.ScanStatus -eq 'Starting') 'ForceScan did not override Linux definition gate'
+                Assert ($linux.ScanStatus -eq 'Starting') 'Force did not override Linux definition gate'
                 for ($i = 0; $i -lt 100; $i++) {
                     Start-Sleep -Milliseconds 40
                     $linux = Query-LinuxScan
                     if ($linux.ScanStatus -eq 'Clean') { break }
                 }
                 Assert ($linux.ScanStatus -eq 'Clean') 'Forced Linux scan did not complete'
-                $options.ForceScan = $false
+                $options.Force = $false
                 Remove-Item Env:MOBILE_TEST_DEFINITION_DATE
                 Remove-Item $options.LinuxScanStateDirectory -Recurse -Force
                 Remove-Item $env:MOBILE_TEST_DISPATCHES
@@ -155,7 +152,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 Assert (-not ($scanArgs -match 'mnt/local|mnt/smb')) 'Local/SMB mounts were excluded as NFS'
                 Assert ($linux.DefinitionDate -eq $today) 'Async scan lost definition inventory'
                 Assert ('SmbReadiness' -notin $linux.PSObject.Properties.Name -and @($linux.Actions | Where-Object Name -eq 'Workgroup SMB').Count -eq 0) 'Preflight still returned SMB readiness'
-                Assert (-not (Get-LinuxPreflightScript $options).Contains('/proc/sys/crypto/fips_enabled')) 'Preflight still queries FIPS state'
+                Assert (-not (Get-LinuxScanScript $options).Contains('/proc/sys/crypto/fips_enabled')) 'Preflight still queries FIPS state'
                 $linux = Query-LinuxScan
                 Assert (@(Get-Content $env:MOBILE_TEST_DISPATCHES).Count -eq 1) 'Status query restarted a completed scan'
                 Assert ((Get-Content $env:MOBILE_TEST_SCAN_ARGS) -contains "/fixture path/with 'quote'") 'Scan path quoting changed'
@@ -180,7 +177,6 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                     Assert ($linux.ScanStatus -eq $expected) 'Background ClamAV exit-code handling failed'
                     Assert (@(($linux.Actions | Where-Object Category -eq AVScan).Details.Current.ExcludedNfsMounts).Count -eq 0) 'Worker reused old NFS exclusions after mounts changed'
                 }
-                $options.SkipScans = $true
                 $before = @(Get-Content $env:MOBILE_TEST_DISPATCHES).Count
                 $linux = Query-LinuxScan
                 Assert ($linux.ScanStatus -eq 'TimedOut' -and @(Get-Content $env:MOBILE_TEST_DISPATCHES).Count -eq $before) 'Status-only mode lost history or dispatched a scan'
@@ -195,7 +191,6 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 '{"Status":"Running"}' | Set-Content (Join-Path $runPath 'result.json')
                 $linux = Query-LinuxScan
                 Assert ($linux.ScanStatus -eq 'Interrupted') 'Missing worker was reported as still running'
-                $options.SkipScans = $false
 
                 Remove-Item $mountInfoPath
                 Remove-Item $env:MOBILE_TEST_SCAN_ARGS
@@ -220,7 +215,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 $env:MOBILE_TEST_SEP_CODE = '0'
                 # Exercise dispatch itself, replacing only the Windows-only ACL setup and scheduler.
                 # The shared XML builder's real encoding/settings are covered in Verify-TaskXml.
-                $dispatchSource = ${function:Start-WindowsPreflightScanJob}.ToString()
+                $dispatchSource = ${function:Start-WindowsScanJob}.ToString()
                 $aclStart = $dispatchSource.IndexOf('    $acl =')
                 $aclEnd = $dispatchSource.IndexOf('    $runDirectory =', $aclStart)
                 $dispatchSource = $dispatchSource.Remove($aclStart, $aclEnd - $aclStart)
@@ -243,20 +238,20 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 function New-ScheduledTaskAction { throw 'Preflight bypassed New-TaskXML' }
                 function New-ScheduledTaskSettingsSet { throw 'Preflight bypassed New-TaskXML' }
                 $dispatchOptions = [pscustomobject]@{ WindowsScanPaths=@('C:'); SymantecScanName=''; ScanTimeoutMinutes=1 }
-                $job = & $dispatch -Options $dispatchOptions -Worker (Get-WindowsPreflightScanWorker) -Root "$fixture/windows state's" -Executable "$tools/DoScan.exe"
+                $job = & $dispatch -Options $dispatchOptions -Worker (Get-WindowsScanWorker) -Root "$fixture/windows state's" -Executable "$tools/DoScan.exe"
                 Assert ($job.State.Status -eq 'Starting' -and -not (Test-Path (Join-Path $job.RunDirectory 'worker.ps1'))) 'Preflight wrote an executable worker or lost its starting state'
                 & ([scriptblock]::Create($script:scanInvocation))
-                $dispatchResult = Read-WindowsPreflightScan $job.RunDirectory
+                $dispatchResult = Read-WindowsScan $job.RunDirectory
                 $dispatchResult.Status = Get-MobileScanOutcome Windows $dispatchResult
                 Assert ($dispatchResult.Status -eq 'CompletedNeedsReview') 'Encoded worker invocation lost its quoted state path or scan result'
                 ${function:New-TaskXML} = $realXmlBuilder
-                & (Get-WindowsPreflightScanWorker) -RunDirectory $runDirectory
-                $completed = Read-WindowsPreflightScan $runDirectory
+                & (Get-WindowsScanWorker) -RunDirectory $runDirectory
+                $completed = Read-WindowsScan $runDirectory
                 $completed.Status = Get-MobileScanOutcome Windows $completed
                 Assert ($completed.Status -eq 'CompletedNeedsReview' -and $completed.CompletedUtc) 'SEP worker exit zero was called clean or not persisted'
                 $env:MOBILE_TEST_SEP_CODE = '2'
-                & (Get-WindowsPreflightScanWorker) -RunDirectory $runDirectory
-                $failedWorker = Read-WindowsPreflightScan $runDirectory
+                & (Get-WindowsScanWorker) -RunDirectory $runDirectory
+                $failedWorker = Read-WindowsScan $runDirectory
                 $failedWorker.Status = Get-MobileScanOutcome Windows $failedWorker
                 Assert ($failedWorker.Status -eq 'Failed' -and $failedWorker.ExitCode -eq 2) 'SEP worker failure was lost'
                 # Query real state logic with mocked registry/scheduler observations.
@@ -279,9 +274,9 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                     $value
                 }
                 function Query-WindowsScan([string]$Date=$today) {
-                    $observation=@(Invoke-MobilePreflightQuery -Platform Windows -Computers @('fixture-win') -Options $options)[0]
+                    $observation=@(Invoke-MobileScanQuery -Platform Windows -Computers @('fixture-win') -Options $options)[0]
                     $observation.Result.DefinitionDate=$Date
-                    Get-MobilePreflightEvidence -Platform Windows -Observation $observation -Options $options
+                    Get-MobileScanEvidence -Platform Windows -Observation $observation -Options $options
                 }
 
                 $windows = Query-WindowsScan
@@ -298,7 +293,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 # Exercise dispatch decisions with only the native scheduler/ACL writer stubbed.
                 . ([scriptblock]::Create((Get-WindowsCollector-Registry)))
                 $script:windowsDispatches = 0
-                function Start-WindowsPreflightScanJob {
+                function Start-WindowsScanJob {
                     param($Options, $Worker, $Root, $Executable)
                     $script:windowsDispatches++
                     $directory = Join-Path $Root 'new-job'
@@ -315,9 +310,9 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                     $scan = Query-WindowsScan $definitionDate
                     Assert ($scan.ScanStatus -eq 'BlockedDefinitions' -and $script:windowsDispatches -eq 0) 'Windows dispatched with stale/unknown/future definitions'
                 }
-                $options.ForceScan = $true
+                $options.Force = $true
                 $scan = Query-WindowsScan
-                $options.ForceScan = $false
+                $options.Force = $false
                 Assert ($scan.ScanStatus -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows did not dispatch a missing scan'
                 $scan = Query-WindowsScan
                 Assert ($scan.ScanStatus -eq 'Starting' -and $script:windowsDispatches -eq 1) 'Windows duplicated a newly queued scan'
@@ -341,7 +336,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'ClamAV'; Status = 'Clean'; Details = $null }); Failures = @() }
             [pscustomobject]@{ Target = 'linux-host'; ExitCode = 0; StdOut = ($result | ConvertTo-Json -Depth 8); StdErr = '' }
         }
-        $results = @(Invoke-MobilePreflight fixture -PassThru)
+        $results = @(Invoke-MobileScan fixture -PassThru)
         Assert ($results.Count -eq 3) 'Missing target disappeared from preflight report'
         Assert ($results[1].Definitions -eq 'Stale' -and $results[2].Scan -eq 'Unknown') 'Preflight normalization lost stale/unreachable status'
         Assert (@($results | Where-Object Success).Count -eq 0) 'Preflight claimed readiness without sufficient evidence'
@@ -349,7 +344,7 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
         $events = @(Get-Content $log.FullName | ForEach-Object { $_ | ConvertFrom-Json })
         Assert (@($events | Where-Object Event -eq HostResult).Count -eq 3 -and -not $events[-1].Data.Success) 'Preflight failed to persist per-host evidence'
         function Invoke-Linux { param($Computers, $Script, $KeyPath) throw 'fixture SSH dispatch failure' }
-        $results = @(Invoke-MobilePreflight dispatch-failed -PassThru)
+        $results = @(Invoke-MobileScan dispatch-failed -PassThru)
         Assert ($results.Count -eq 3 -and $results[1].Failures[0].Contains('fixture SSH dispatch failure')) 'Dispatch failure removed planned hosts from the report'
         function Get-MobileData { param($MobileName) [pscustomobject]@{ Windows = @(); Linux = @('linux-host') } }
         function Invoke-Linux { param($Computers, $Script, $KeyPath)
@@ -357,21 +352,36 @@ if [[ -n "$state" && "$state" != Z* ]]; then echo ActiveState=active; else echo 
                 Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'ClamAV'; Status = 'Clean'; Details = $null }); Failures = @() }
             [pscustomobject]@{ Target = 'linux-host'; ExitCode = 0; StdOut = ($result | ConvertTo-Json -Depth 8); StdErr = '' }
         }
-        $results = @(Invoke-MobilePreflight av-ready -PassThru)
+        $results = @(Invoke-MobileScan av-ready -PassThru)
         Assert ($results[0].Success -and $results[0].Readiness -eq 'Ready' -and 'SMB' -notin $results[0].PSObject.Properties.Name) 'AV readiness still depends on SMB checks'
         function Get-MobileData { param($MobileName) [pscustomobject]@{ Windows = @('win-host'); Linux = @() } }
         function Invoke-Command { [CmdletBinding()] param($ComputerName, $ScriptBlock, $ArgumentList)
             [pscustomobject]@{ PSComputerName = 'win-host'; DefinitionDate = $today; ScanStatus = 'Running'
                 Actions = @([pscustomobject]@{ Category = 'AVScan'; Name = 'Symantec'; Status = 'Running'; Details = $null }); Failures = @() }
         }
-        $results = @(Invoke-MobilePreflight pending -PassThru)
+        $results = @(Invoke-MobileScan pending -PassThru)
         Assert ($results[0].Readiness -eq 'Pending') 'Running scan was labeled as failed'
         $pending = Get-ChildItem "$fixture/logs" -Filter '*-pending-*.log' | Select-Object -First 1
         Assert ((Get-Content $pending.FullName -Raw).Contains('Overall result: PENDING')) 'Pending audit summary was labeled as failed'
-        $rejected = $false
-        try { Invoke-MobilePreflight conflict -SkipScans -Rescan } catch { $rejected = $true }
-        Assert $rejected 'Conflicting scan options were accepted'
-        'PASS: detached scans, persistent results, duplicate suppression, rescan/status-only modes, pending/interrupted states, scope checks, AV-only readiness, and audit records.'
+        $null = Invoke-MobileScan forced-controls -Rescan -Force -PassThru
+        $controlLog = Get-ChildItem "$fixture/logs" -Filter '*-forced-controls-*.jsonl' | Select-Object -First 1
+        $controlEvents = @(Get-Content $controlLog.FullName | ForEach-Object { $_ | ConvertFrom-Json })
+        $controls = ($controlEvents | Where-Object Event -eq ScanOptions).Data
+        Assert ($controls.Force -and $controls.Rescan -and $controls.DefinitionMaxAgeDays -eq 30 -and $controls.ScanTimeoutMinutes -eq 240) 'Scan controls or configured policy were not propagated'
+        Assert (@($controlEvents | Where-Object Procedure -ne Scan).Count -eq 0) 'New scan audits retained the old procedure name'
+        $savedTimeout = $script:Config.Preflight.ScanTimeoutMinutes
+        try {
+            $script:Config.Preflight.ScanTimeoutMinutes = 0
+            $rejected = $false
+            try { Invoke-MobileScan invalid-policy } catch { $rejected = $true }
+            Assert $rejected 'Invalid configured scan timeout was accepted'
+        } finally { $script:Config.Preflight.ScanTimeoutMinutes = $savedTimeout }
+        foreach ($retired in @('SkipScans','ForceScan','DefinitionMaxAgeDays','ScanTimeoutMinutes')) {
+            $rejected = $false
+            try { Invoke-MobileScan -MobileName conflict @{$retired=1} } catch [System.Management.Automation.ParameterBindingException] { $rejected = $true }
+            Assert $rejected "Removed public scan option still accepted: $retired"
+        }
+        'PASS: detached scans, persistent results, duplicate suppression, rescans and repeated status queries, pending/interrupted states, scope checks, AV-only readiness, and audit records.'
     } $fixture $root
 } finally {
     Remove-Module $module -ErrorAction SilentlyContinue

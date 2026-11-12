@@ -7,8 +7,8 @@ param(
     [switch]$RegisterDeployment,
     [Parameter(Mandatory, ParameterSetName = 'UnRegisterDeployment')]
     [switch]$UnRegisterDeployment,
-    [Parameter(Mandatory, ParameterSetName = 'Preflight')]
-    [switch]$Preflight,
+    [Parameter(Mandatory, ParameterSetName = 'Scan')]
+    [switch]$Scan,
     [Parameter(Mandatory, ParameterSetName = 'Initialize')]
     [switch]$Initialize,
     [Parameter(Mandatory, ParameterSetName = 'NewMobile')]
@@ -20,22 +20,20 @@ param(
     [Parameter(Position = 0, ParameterSetName = 'Info')]
     [Parameter(Mandatory, Position = 0, ParameterSetName = 'RegisterDeployment')]
     [Parameter(Mandatory, Position = 0, ParameterSetName = 'UnRegisterDeployment')]
-    [Parameter(Mandatory, Position = 0, ParameterSetName = 'Preflight')]
+    [Parameter(Mandatory, Position = 0, ParameterSetName = 'Scan')]
     [Parameter(Mandatory, Position = 0, ParameterSetName = 'GPO')]
     [string]$Name,
 
     # Explicitly callable, but kept out of the everyday completion menu.
     [Parameter(DontShow)]
-    [hashtable]$ConfigOverride,
-    [Parameter(DontShow)]
-    [switch]$enableDebug
+    [hashtable]$ConfigOverride
 )
 
 dynamicparam {
     # Keep discovery local: completing a command must not import the module,
     # read site configuration, or contact endpoints.
     $mode = 'Info'
-    foreach ($command in @('Info', 'RegisterDeployment', 'UnRegisterDeployment', 'Preflight', 'Initialize', 'New', 'GPO')) {
+    foreach ($command in @('Info', 'RegisterDeployment', 'UnRegisterDeployment', 'Scan', 'Initialize', 'New', 'GPO')) {
         if ($PSBoundParameters.ContainsKey($command)) { $mode = $command; break }
     }
     $options = switch ($mode) {
@@ -48,13 +46,7 @@ dynamicparam {
             DomainKeyVersion = [int]
         } }
         'UnRegisterDeployment' { [ordered]@{ Archive = [switch] } }
-        'Preflight' { [ordered]@{
-            SkipScans = [switch]
-            Rescan = [switch]
-            ForceScan = [switch]
-            DefinitionMaxAgeDays = [int]
-            ScanTimeoutMinutes = [int]
-        } }
+        'Scan' { [ordered]@{ Rescan = [switch]; Force = [switch] } }
         'GPO' { [ordered]@{ Add = [switch]; Remove = [switch]; Force = [switch] } }
         default { [ordered]@{} }
     }
@@ -64,11 +56,6 @@ dynamicparam {
         $parameter = [System.Management.Automation.ParameterAttribute]::new()
         $parameter.ParameterSetName = $mode
         $attributes.Add($parameter)
-        switch ($option) {
-            'ForceScan' { $attributes.Add([System.Management.Automation.AliasAttribute]::new('force-scan')) }
-            'DefinitionMaxAgeDays' { $attributes.Add([System.Management.Automation.ValidateRangeAttribute]::new(0, 3650)) }
-            'ScanTimeoutMinutes' { $attributes.Add([System.Management.Automation.ValidateRangeAttribute]::new(1, 1440)) }
-        }
         $parameters.Add($option, [System.Management.Automation.RuntimeDefinedParameter]::new($option, $options[$option], $attributes))
     }
     return $parameters
@@ -97,15 +84,14 @@ end {
     foreach ($option in @('Verbose', 'Debug')) {
         if ($PSBoundParameters.ContainsKey($option)) { $commandOptions[$option] = $PSBoundParameters[$option] }
     }
-    if ($enableDebug) { $commandOptions.Debug = $true }
 
     switch ($PSCmdlet.ParameterSetName) {
         'Info' { Get-MobileOverview -MobileName $Name -Full:([bool]$PSBoundParameters['Full']) @commandOptions }
-        'Preflight' {
-            foreach ($option in @('SkipScans', 'Rescan', 'ForceScan', 'DefinitionMaxAgeDays', 'ScanTimeoutMinutes')) {
+        'Scan' {
+            foreach ($option in @('Rescan', 'Force')) {
                 if ($PSBoundParameters.ContainsKey($option)) { $commandOptions[$option] = $PSBoundParameters[$option] }
             }
-            Invoke-MobilePreflight -MobileName $Name @commandOptions
+            Invoke-MobileScan -MobileName $Name @commandOptions
         }
         'RegisterDeployment' {
             foreach ($option in @('Disjoin', 'LinuxDisjoinKeytab', 'DomainController', 'DomainPrincipal', 'DomainKeyVersion')) {

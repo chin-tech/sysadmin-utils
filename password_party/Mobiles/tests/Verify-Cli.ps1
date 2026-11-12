@@ -11,12 +11,12 @@ try {
     $source = @'
 function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides }
 '@
-    foreach ($name in @('Get-MobileOverview','Invoke-MobilePreflight','Register-MobileDeployment','Unregister-Deployment','Set-MobileGpoPermission','New-MobileDeployment','Initialize-Environment')) {
+    foreach ($name in @('Get-MobileOverview','Invoke-MobileScan','Register-MobileDeployment','Unregister-Deployment','Set-MobileGpoPermission','New-MobileDeployment','Initialize-Environment')) {
         $source += "`nfunction $name {" + @'
     [CmdletBinding()]
     param([string]$MobileName, [switch]$Full, [switch]$Archive, [switch]$Disjoin,
         [string]$LinuxDisjoinKeytab, [string]$DomainController, [string]$DomainPrincipal, [int]$DomainKeyVersion,
-        [switch]$SkipScans, [switch]$Rescan, [switch]$ForceScan, [int]$DefinitionMaxAgeDays, [int]$ScanTimeoutMinutes,
+        [switch]$Rescan,
         [switch]$Add, [switch]$Remove, [switch]$Force, [switch]$Console)
     [pscustomobject]@{ Command=$MyInvocation.MyCommand.Name; Options=@{} + $PSBoundParameters; Config=$script:configuration }
 }
@@ -40,8 +40,8 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
         Assert (-not (Compare-Object @($Expected | Sort-Object) @($actual | Sort-Object))) "Unexpected completion for '$Arguments': $($actual -join ', ')"
     }
     # Exercise discovery before the first invocation: no module/config/site work is needed.
-    Assert-Completion '-' @('-Info','-RegisterDeployment','-UnRegisterDeployment','-Preflight','-Initialize','-New','-GPO','-Name','-Full')
-    Assert-Completion '-Preflight fixture -' @('-SkipScans','-Rescan','-ForceScan','-DefinitionMaxAgeDays','-ScanTimeoutMinutes')
+    Assert-Completion '-' @('-Info','-RegisterDeployment','-UnRegisterDeployment','-Scan','-Initialize','-New','-GPO','-Name','-Full')
+    Assert-Completion '-Scan fixture -' @('-Rescan','-Force')
     Assert-Completion '-RegisterDeployment fixture -' @('-Disjoin','-LinuxDisjoinKeytab','-DomainController','-DomainPrincipal','-DomainKeyVersion')
     Assert-Completion '-UnRegisterDeployment fixture -' @('-Archive')
     Assert-Completion '-Info fixture -' @('-Full')
@@ -57,13 +57,15 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
     $result = & $cli -Info -Name fixture -ConfigOverride @{ Priority='explicit' } -Verbose:$false -Debug:$false
     Assert ($result.Config.Priority -eq 'explicit' -and $result.Config.OnlyFile -eq 'retained') 'Configuration precedence changed'
     Assert (-not $result.Options.Debug -and -not $result.Options.Verbose) 'Explicit false common switches were enabled'
-    $result = & $cli -Info -enableDebug
-    Assert ([bool]$result.Options.Debug) 'Legacy enableDebug no longer forwards Debug'
+    $result = & $cli -Info -Debug
+    Assert ([bool]$result.Options.Debug) 'Debug no longer forwards to module commands'
+    Assert-Rejected @{ Info=$true; enableDebug=$true }
+    Assert-Rejected @{ Preflight=$true; Name='fixture' }
 
-    $result = & $cli -Preflight fixture -force-scan -SkipScans:$false -Rescan -DefinitionMaxAgeDays 0 -ScanTimeoutMinutes 12
-    Assert ($result.Command -eq 'Invoke-MobilePreflight' -and $result.Options.ForceScan -and $result.Options.Rescan -and -not $result.Options.SkipScans -and $result.Options.DefinitionMaxAgeDays -eq 0 -and $result.Options.ScanTimeoutMinutes -eq 12) 'Preflight options/default-sensitive values were not forwarded'
-    $result = & $cli -Preflight fixture
-    Assert (-not $result.Options.ContainsKey('DefinitionMaxAgeDays') -and -not $result.Options.ContainsKey('ScanTimeoutMinutes')) 'Omitted AV settings override module defaults'
+    $result = & $cli -Scan fixture -Rescan -Force
+    Assert ($result.Command -eq 'Invoke-MobileScan' -and $result.Options.Force -and $result.Options.Rescan) 'Scan controls were not forwarded'
+    $result = & $cli -Scan fixture
+    Assert (-not $result.Options.ContainsKey('Force') -and -not $result.Options.ContainsKey('Rescan')) 'Omitted scan controls were forwarded'
     $result = & $cli -RegisterDeployment fixture -Disjoin -LinuxDisjoinKeytab fixture-keytab -DomainController dc -DomainPrincipal admin -DomainKeyVersion 3
     Assert ($result.Command -eq 'Register-MobileDeployment' -and $result.Options.Disjoin -and $result.Options.LinuxDisjoinKeytab -eq 'fixture-keytab' -and $result.Options.DomainController -eq 'dc' -and $result.Options.DomainPrincipal -eq 'admin' -and $result.Options.DomainKeyVersion -eq 3) 'Check-out options were not forwarded'
     $result = & $cli -UnRegisterDeployment fixture -Archive
@@ -76,21 +78,23 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
     $result = & $cli -Initialize
     Assert ($result.Command -eq 'Initialize-Environment' -and $result.Options.Console) 'Initialization dispatch changed'
 
-    Assert-Rejected @{ Preflight=$true; Name='fixture'; Disjoin=$true }
+    Assert-Rejected @{ Scan=$true; Name='fixture'; Disjoin=$true }
     Assert-Rejected @{ RegisterDeployment=$true; Name='fixture'; Rescan=$true }
     Assert-Rejected @{ GPO=$true; Add=$true; Remove=$true; Name='fixture' }
     Assert-Rejected @{ GPO=$true; Name='fixture' }
     Assert-Rejected @{ GPO=$true; Add=$true; Force=$true; Name='fixture' }
     Assert-Rejected @{ New=$true; Full=$true }
     Assert-Rejected @{ Initialize=$true; Archive=$true }
-    Assert-Rejected @{ Preflight=$true; Name='fixture'; DefinitionMaxAgeDays=-1 }
-    Assert-Rejected @{ Preflight=$true; Name='fixture'; ScanTimeoutMinutes=0 }
-    $result = & $cli -force-scan -Preflight fixture -ErrorAction Stop
-    Assert ($result.Options.ForceScan) 'Options before their command selector no longer bind'
+    foreach ($retired in @('SkipScans','ForceScan','force-scan','DefinitionMaxAgeDays','ScanTimeoutMinutes')) {
+        $arguments = @{ Scan=$true; Name='fixture'; $retired=1 }
+        Assert-Rejected $arguments
+    }
+    $result = & $cli -Force -Scan fixture -ErrorAction Stop
+    Assert ($result.Options.Force) 'Options before their command selector no longer bind'
     $result = & $cli -UnRegisterDeployment fixture -Archive:$false
     Assert (-not $result.Options.Archive) 'Explicit false dynamic switch was enabled'
     $sets = (Get-Command $cli).ParameterSets
-    foreach ($set in ($sets | Where-Object Name -in @('Preflight','RegisterDeployment','UnRegisterDeployment','GPO'))) {
+    foreach ($set in ($sets | Where-Object Name -in @('Scan','RegisterDeployment','UnRegisterDeployment','GPO'))) {
         Assert ([bool]($set.Parameters | Where-Object Name -eq 'Name').IsMandatory) "Missing mandatory target for $($set.Name)"
     }
     'PASS: context-specific completion, discovery without module loading, all CLI modes, invalid combinations, config precedence, forwarding, aliases and explicit false switches.'

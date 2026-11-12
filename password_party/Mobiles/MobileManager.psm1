@@ -2079,7 +2079,7 @@ function New-MobileRunLog {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')][string]$MobileName,
-        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out', 'Preflight')][string]$Procedure,
+        [Parameter(Mandatory)][ValidateSet('Check-in', 'Check-out', 'Scan')][string]$Procedure,
         [string]$LogRoot = $script:Config.MobileDeployments
     )
     New-Item -ItemType Directory -Path $LogRoot -Force -ErrorAction Stop | Out-Null
@@ -3712,7 +3712,7 @@ function Invoke-InformationCollector([array]$winComputers, [array]$linComputers,
 
 #endregion
 
-#region Standalone preflight scans and readiness reporting
+#region AV scans and readiness reporting
 
 function Get-MobileDefinitionAssessment([string]$Date, [ValidateRange(0, 3650)][int]$MaximumAgeDays = 30) {
     $parsed = [datetime]::MinValue
@@ -3726,7 +3726,7 @@ function Get-MobileDefinitionAssessment([string]$Date, [ValidateRange(0, 3650)][
     }
 }
 
-function Get-WindowsPreflightScanWorker {
+function Get-WindowsScanWorker {
     return {
         param([string]$RunDirectory)
         $ErrorActionPreference = 'Stop'
@@ -3770,7 +3770,7 @@ function Get-WindowsPreflightScanWorker {
     }
 }
 
-function Read-WindowsPreflightScan([string]$Directory) {
+function Read-WindowsScan([string]$Directory) {
     if (-not $Directory) { return }
     if (-not (Test-Path (Join-Path $Directory 'status'))) {
         # Retain reports from the previous JSON-based workers.
@@ -3793,7 +3793,7 @@ function Read-WindowsPreflightScan([string]$Directory) {
     [PSCustomObject]$scan
 }
 
-function Start-WindowsPreflightScanJob {
+function Start-WindowsScanJob {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Options, [Parameter(Mandatory)][scriptblock]$Worker,
         [Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Executable)
@@ -3825,7 +3825,7 @@ function Start-WindowsPreflightScanJob {
     try {
         $invocation = "& {`n$($Worker.ToString())`n} -RunDirectory '$($runDirectory.Replace("'", "''"))'"
         $timeLimit = [Xml.XmlConvert]::ToString([TimeSpan]::FromMinutes($Options.ScanTimeoutMinutes + 5))
-        $taskXml = New-TaskXML -Description 'Mobile AV preflight scan' -ToEncode $invocation `
+        $taskXml = New-TaskXML -Description 'Mobile AV scan' -ToEncode $invocation `
             -TriggerConfigs @() -ExecutionTimeLimit $timeLimit
         Register-ScheduledTask -TaskName $taskName -Xml $taskXml -User SYSTEM -Force -ErrorAction Stop | Out-Null
         Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
@@ -3841,7 +3841,7 @@ function Start-WindowsPreflightScanJob {
 }
 
 
-function Get-WindowsPreflightScanState {
+function Get-WindowsScanState {
     param($Options, [scriptblock]$Worker)
     $root = if ($Options.WindowsScanStateDirectory) { $Options.WindowsScanStateDirectory } else { Join-Path $env:ProgramData 'Mobiles\Preflight' }
     $mutex = [Threading.Mutex]::new($false, 'Global\Mobiles-PreflightAV')
@@ -3852,8 +3852,8 @@ function Get-WindowsPreflightScanState {
         $directory = $null; $previous = $null
         if (Test-Path (Join-Path $root 'latest')) { $directory = (Get-Content (Join-Path $root 'latest') -Raw).Trim() }
         elseif (Test-Path (Join-Path $root 'latest.json')) { $directory = (Get-Content (Join-Path $root 'latest.json') -Raw | ConvertFrom-Json).RunDirectory }
-        $current = Read-WindowsPreflightScan $directory
-        if (Test-Path (Join-Path $root 'completed')) { $previous = Read-WindowsPreflightScan ((Get-Content (Join-Path $root 'completed') -Raw).Trim()) }
+        $current = Read-WindowsScan $directory
+        if (Test-Path (Join-Path $root 'completed')) { $previous = Read-WindowsScan ((Get-Content (Join-Path $root 'completed') -Raw).Trim()) }
         elseif (Test-Path (Join-Path $root 'completed.json')) { $previous = Get-Content (Join-Path $root 'completed.json') -Raw | ConvertFrom-Json }
         $native = $null
         $activeValues = @(1,2,3,5,6,7,8,11,12,13,14,15,16,17,18,19,20,21,22)
@@ -3879,7 +3879,7 @@ function Get-WindowsPreflightScanState {
             }
             $executable = $candidates | Where-Object { $_ -and (Test-Path $_ -PathType Leaf) } | Select-Object -First 1
             if (-not $executable) { throw 'Symantec DoScan.exe was not found.' }
-            $job = Start-WindowsPreflightScanJob $Options $Worker $root $executable
+            $job = Start-WindowsScanJob $Options $Worker $root $executable
             $current=$job.State; $status='Starting'
         }
         $logs = if ($env:ProgramData) {
@@ -3893,25 +3893,25 @@ function Get-WindowsPreflightScanState {
     } finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
 }
 
-function Get-WindowsPreflightBlock {
-    $parts = @('param($Options)',(Get-WindowsCollector-Registry),(Get-WindowsCollector-Symantec),(Get-WindowsCollector-Ivanti))
-    foreach ($name in @('ConvertTo-Base64','New-TaskXML','Read-WindowsPreflightScan','Start-WindowsPreflightScanJob','Get-WindowsPreflightScanState')) {
+function Get-WindowsScanBlock {
+    $parts = @('param($Options)',(Get-WindowsCollector-Registry),(Get-WindowsCollector-Symantec))
+    foreach ($name in @('ConvertTo-Base64','New-TaskXML','Read-WindowsScan','Start-WindowsScanJob','Get-WindowsScanState')) {
         $parts += 'function ' + $name + ' {' + (Get-Command $name).Definition + '}'
     }
-    $parts += '$scanWorker = {' + (Get-WindowsPreflightScanWorker).ToString() + '}'
+    $parts += '$scanWorker = {' + (Get-WindowsScanWorker).ToString() + '}'
     $parts += ({
         $symantec = Get-SymantecInformation
         $date = [string]$symantec.DefinitionDate
         if ($date -match '^(\d{4})[-/](\d{2})[-/](\d{2})(?:$|[ T])') { $date = '{0}-{1}-{2}' -f $Matches[1],$Matches[2],$Matches[3] }
         elseif ($date -notmatch '^\d{8}$') { $date = '' }
-        try { $scan = Get-WindowsPreflightScanState -Options $Options -Worker $scanWorker }
+        try { $scan = Get-WindowsScanState -Options $Options -Worker $scanWorker }
         catch { $scan = [PSCustomObject]@{ Status='Failed'; Current=[PSCustomObject]@{ Error=$_.Exception.Message } } }
-        [PSCustomObject]@{ HostName=$env:COMPUTERNAME; Platform='Windows'; DefinitionDate=$date; Scan=$scan; Inventory=$symantec; Ivanti=(Get-IvantiInformation) }
+        [PSCustomObject]@{ HostName=$env:COMPUTERNAME; Platform='Windows'; DefinitionDate=$date; Scan=$scan; Inventory=$symantec }
     }).ToString()
     [scriptblock]::Create($parts -join "`n")
 }
 
-function Get-LinuxPreflightScanWorker {
+function Get-LinuxScanWorker {
     return @'
 #!/usr/bin/env bash
 set -o pipefail
@@ -3949,7 +3949,7 @@ mv -f "$(dirname "$run_dir")/completed.tmp" "$(dirname "$run_dir")/completed"
 '@
 }
 
-function Get-LinuxPreflightScript($Options) {
+function Get-LinuxScanScript($Options) {
     $root = if ($Options.LinuxScanStateDirectory) { $Options.LinuxScanStateDirectory } else { '/var/log/mobiles/preflight' }
     if (-not $root.StartsWith('/')) { throw 'LinuxScanStateDirectory must be an absolute path.' }
     $directories = if ($Options.LinuxToolDirectories) { @($Options.LinuxToolDirectories) } else { @('/usr/local/sbin','/usr/local/bin','/usr/sbin','/usr/bin','/sbin','/bin') }
@@ -3968,7 +3968,7 @@ rescan=$(([bool]$Options.Rescan).ToString().ToLowerInvariant())
 set -o pipefail
 export LC_ALL=C
 umask 077
-for tool in jq flock; do command -v "$tool" >/dev/null || { echo "Preflight requires $tool; searched PATH=$PATH" >&2; exit 2; }; done
+for tool in jq flock; do command -v "$tool" >/dev/null || { echo "AV scan requires $tool; searched PATH=$PATH" >&2; exit 2; }; done
 mkdir -p "$state_root" && chmod 700 "$state_root" || exit 2
 exec 9> "$state_root/dispatch.lock"
 # Scan execution only writes text files. Convert them to JSON once, when reporting.
@@ -4031,20 +4031,20 @@ jq -n --arg host "$(hostname -s)" --arg date "$definition_date" --arg version "$
     {HostName:$host,Platform:"Linux",DefinitionDate:$date,DefinitionVersion:$version,
      Scan:{Status:$status,StateDirectory:$directory,Current:$current,LastCompleted:$previous}}'
 '@
-    $worker = if ($Options.StartScan) { Get-LinuxPreflightScanWorker } else { '' }
+    $worker = if ($Options.StartScan) { Get-LinuxScanWorker } else { '' }
     $delimiter='MOBILE_PREFLIGHT_'+[guid]::NewGuid().ToString('N')
     ("dzdo bash <<'$delimiter'`n"+$prefix+"`n"+$body+"`n"+$worker+"`n"+$after+"`n$delimiter`n").Replace("`r`n","`n")
 }
 
 # Query first; only the controller decides whether definitions permit a new scan.
-function Invoke-MobilePreflightQuery([string]$Platform, [array]$Computers, $Options, [switch]$StartScan) {
+function Invoke-MobileScanQuery([string]$Platform, [array]$Computers, $Options, [switch]$StartScan) {
     $request=$Options.PSObject.Copy()
     $request | Add-Member StartScan ([bool]$StartScan) -Force
     $errors=@(); $raw=@(); $transportError=$null
     try {
         if ($Platform -eq 'Windows') {
-            $raw=@(Invoke-Command -ComputerName $Computers -ScriptBlock (Get-WindowsPreflightBlock) -ArgumentList $request -ErrorAction SilentlyContinue -ErrorVariable errors)
-        } else { $raw=@(Invoke-Linux -Computers $Computers -Script (Get-LinuxPreflightScript $request) -KeyPath $script:Config.SSHKeyPath) }
+            $raw=@(Invoke-Command -ComputerName $Computers -ScriptBlock (Get-WindowsScanBlock) -ArgumentList $request -ErrorAction SilentlyContinue -ErrorVariable errors)
+        } else { $raw=@(Invoke-Linux -Computers $Computers -Script (Get-LinuxScanScript $request) -KeyPath $script:Config.SSHKeyPath) }
     } catch { $transportError=$_.Exception.Message }
     foreach ($computer in $Computers) {
         try {
@@ -4052,11 +4052,11 @@ function Invoke-MobilePreflightQuery([string]$Platform, [array]$Computers, $Opti
                 $result=$raw | Where-Object PSComputerName -eq $computer | Select-Object -First 1
                 if (-not $result) {
                     $messages=@($errors | Where-Object { $_.TargetObject -eq $computer -or $_.OriginInfo.PSComputerName -eq $computer } | ForEach-Object { $_.Exception.Message }) -join '; '
-                    throw "No preflight result returned. $transportError $messages"
+                    throw "No scan result returned. $transportError $messages"
                 }
             } else {
                 $response=$raw | Where-Object Target -eq $computer | Select-Object -First 1
-                if (-not $response) { throw "No preflight result returned. $transportError" }
+                if (-not $response) { throw "No scan result returned. $transportError" }
                 if ($response.ExitCode -ne 0) { throw "SSH exited $($response.ExitCode): $($response.StdErr)" }
                 $result=$response.StdOut | ConvertFrom-Json -ErrorAction Stop
             }
@@ -4073,18 +4073,18 @@ function Get-MobileScanOutcome([string]$Platform, $Scan) {
     switch ([int]$Scan.ExitCode) { 0 { 'Clean' }; 1 { 'ThreatsDetected' }; default { 'Failed' } }
 }
 
-function Get-MobilePreflightEvidence([string]$Platform, $Observation, $Options) {
+function Get-MobileScanEvidence([string]$Platform, $Observation, $Options) {
     if ($Observation.Error) { throw $Observation.Error }
     $result=$Observation.Result
     # Accept the previous response shape during upgrades as well as stored legacy history.
     if ($result.ScanStatus -and $result.Actions) { return $result }
-    if (-not $result.Scan.Status) { throw 'Malformed preflight response.' }
+    if (-not $result.Scan.Status) { throw 'Malformed scan response.' }
     $definition=Get-MobileDefinitionAssessment -Date $result.DefinitionDate -MaximumAgeDays $Options.DefinitionMaxAgeDays
     $scan=$result.Scan
-    $start = -not $Options.SkipScans -and $scan.Status -notin @('Starting','Running') -and ($Options.Rescan -or $scan.Status -eq 'NotStarted')
-    $blocked=$start -and -not $Options.ForceScan -and $definition.Status -ne 'Current'
+    $start = $scan.Status -notin @('Starting','Running') -and ($Options.Rescan -or $scan.Status -eq 'NotStarted')
+    $blocked=$start -and -not $Options.Force -and $definition.Status -ne 'Current'
     if ($start -and -not $blocked) {
-        $reply=@(Invoke-MobilePreflightQuery -Platform $Platform -Computers @($Observation.Target) -Options $Options -StartScan)[0]
+        $reply=@(Invoke-MobileScanQuery -Platform $Platform -Computers @($Observation.Target) -Options $Options -StartScan)[0]
         if ($reply.Error) { throw $reply.Error }
         $result=$reply.Result; $scan=$result.Scan
     }
@@ -4098,14 +4098,13 @@ function Get-MobilePreflightEvidence([string]$Platform, $Observation, $Options) 
         $definitions=$scan.Current.DefinitionVersion -ceq $result.DefinitionVersion
     }
     $scan | Add-Member -NotePropertyMembers @{ Status=$status; ScanBlocked=$blocked
-        Note=$(if ($blocked) { 'Definitions are stale, unknown, or future-dated; use -ForceScan to override.' }) } -Force
+        Note=$(if ($blocked) { 'Definitions are stale, unknown, or future-dated; use -Force to override.' }) } -Force
     if ($Platform -eq 'Linux') { $scan | Add-Member -NotePropertyMembers @{ ScopeMatches=$scope; DefinitionsMatch=$definitions } -Force }
     else { $scan | Add-Member -NotePropertyMembers @{ DefinitionAssessment=$definition; Review='SEP completion is not a clean verdict; review native AV logs.' } -Force }
     $name=if ($Platform -eq 'Linux') { 'ClamAV' } else { 'Symantec' }
     $inventory=if ($Platform -eq 'Linux') { [PSCustomObject]@{ Version=$result.DefinitionVersion; DefinitionDate=$result.DefinitionDate } } else { $result.Inventory }
     $inventoryStatus = if ($inventory.Status) { $inventory.Status } elseif ($result.DefinitionDate) { 'Collected' } else { 'Unknown' }
     $actions=@([PSCustomObject]@{ Category='Inventory'; Name=$name; Status=$inventoryStatus; Details=$inventory })
-    if ($result.Ivanti) { $actions += [PSCustomObject]@{ Category='Inventory'; Name='Ivanti'; Status=$result.Ivanti.Status; Details=$result.Ivanti } }
     $actions += [PSCustomObject]@{ Category='AVScan'; Name=$name; Status=$status; Details=$scan }
     [PSCustomObject]@{ HostName=$Observation.Target; Platform=$Platform; DefinitionDate=$result.DefinitionDate; ScanStatus=$status
         LastScanStatus=$scan.LastCompleted.Status; LastScanCompletedUtc=$scan.LastCompleted.CompletedUtc
@@ -4113,26 +4112,25 @@ function Get-MobilePreflightEvidence([string]$Platform, $Observation, $Options) 
         Failures=@(if ($status -in @('Failed','TimedOut','Interrupted','ThreatsDetected')) { "$name scan: $status. $($scan.Current.Error) $($scan.Current.StdErr)" }) }
 }
 
-function Invoke-MobilePreflight {
+function Invoke-MobileScan {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$MobileName,
-        [ValidateRange(0, 3650)][int]$DefinitionMaxAgeDays = $script:Config.Preflight.DefinitionMaxAgeDays,
-        [ValidateRange(1, 1440)][int]$ScanTimeoutMinutes = $script:Config.Preflight.ScanTimeoutMinutes,
-        [switch]$SkipScans,
         [switch]$Rescan,
-        [Alias('force-scan')][switch]$ForceScan,
+        [switch]$Force,
         [switch]$PassThru
     )
-    if ($SkipScans -and $Rescan) { throw '-SkipScans and -Rescan cannot be used together.' }
-    $run = New-MobileRunLog -MobileName $MobileName -Procedure 'Preflight'
+    # Scan policy belongs in configuration; calls only request a fresh attempt or a gate override.
+    [ValidateRange(0, 3650)][int]$DefinitionMaxAgeDays = $script:Config.Preflight.DefinitionMaxAgeDays
+    [ValidateRange(1, 1440)][int]$ScanTimeoutMinutes = $script:Config.Preflight.ScanTimeoutMinutes
+    $run = New-MobileRunLog -MobileName $MobileName -Procedure 'Scan'
     $results = [System.Collections.Generic.List[object]]::new()
     $runSuccess = $false
     $runStatus = 'Failed'
     try {
         $data = Get-MobileData -MobileName $MobileName
         $options = [PSCustomObject]@{
-            SkipScans = [bool]$SkipScans; Rescan = [bool]$Rescan; ForceScan = [bool]$ForceScan; DefinitionMaxAgeDays = $DefinitionMaxAgeDays; ScanTimeoutMinutes = $ScanTimeoutMinutes
+            Rescan = [bool]$Rescan; Force = [bool]$Force; DefinitionMaxAgeDays = $DefinitionMaxAgeDays; ScanTimeoutMinutes = $ScanTimeoutMinutes
             WindowsScanStateDirectory = $script:Config.Preflight.WindowsScanStateDirectory
             LinuxScanStateDirectory = $script:Config.Preflight.LinuxScanStateDirectory
             LinuxToolDirectories = $script:Config.Preflight.LinuxToolDirectories
@@ -4142,19 +4140,19 @@ function Invoke-MobilePreflight {
             LinuxScanPaths = @($script:Config.Preflight.LinuxScanPaths)
         }
         if (-not $options.LinuxScanPaths.Count -or @($options.LinuxScanPaths | Where-Object { [string]::IsNullOrWhiteSpace($_) -or -not $_.StartsWith('/') }).Count) {
-            throw 'Preflight LinuxScanPaths must contain absolute paths.'
+            throw 'Scan LinuxScanPaths must contain absolute paths.'
         }
         if (-not $options.WindowsScanPaths.Count -and -not $options.SymantecScanName) { throw 'Configure WindowsScanPaths or SymantecScanName.' }
         Write-MobileRunEvent -Run $run -Event 'Targets' -Data @{ Windows = @($data.Windows); Linux = @($data.Linux) }
-        Write-MobileRunEvent -Run $run -Event 'PreflightOptions' -Data $options
+        Write-MobileRunEvent -Run $run -Event 'ScanOptions' -Data $options
         foreach ($platform in @('Windows', 'Linux')) {
             $hosts = @($data.$platform)
             if (-not $hosts.Count) { continue }
-            Write-Host "[+] Preflight $platform targets: $($hosts -join ', '); scans $(if ($SkipScans) { 'status only' } else { 'status/start if needed' })."
-            foreach ($observation in @(Invoke-MobilePreflightQuery -Platform $platform -Computers $hosts -Options $options)) {
+            Write-Host "[+] Scan $platform targets: $($hosts -join ', '); scans status/start if needed."
+            foreach ($observation in @(Invoke-MobileScanQuery -Platform $platform -Computers $hosts -Options $options)) {
                 $target=$observation.Target
                 try {
-                    $result=Get-MobilePreflightEvidence -Platform $platform -Observation $observation -Options $options
+                    $result=Get-MobileScanEvidence -Platform $platform -Observation $observation -Options $options
                     $definition = Get-MobileDefinitionAssessment -Date $result.DefinitionDate -MaximumAgeDays $DefinitionMaxAgeDays
                     $actions = @($result.Actions) + @([PSCustomObject]@{
                             Category = 'Readiness'; Name = 'AV definition age'; Status = $definition.Status
@@ -4184,7 +4182,7 @@ function Invoke-MobilePreflight {
         $runStatus = if ($runSuccess) { 'Ready' } elseif (@($results | Where-Object Readiness -eq 'Failed').Count) { 'Failed' }
         elseif (@($results | Where-Object Readiness -eq 'Pending').Count) { 'Pending' } else { 'NeedsReview' }
         Write-MobileTable @($results) @('HostName', 'Platform', 'Definitions', 'Scan', 'LastScan', 'LastScanUtc')
-        Write-Host 'Scans run independently on endpoints. Repeat -Preflight for status/latest results; use -Rescan for a fresh scan. SEP completion still requires AV-log review.'
+        Write-Host 'Scans run independently on endpoints. Repeat -Scan for status/latest results; use -Rescan for a fresh scan. SEP completion still requires AV-log review.'
         if ($PassThru) { $results.ToArray() }
     } catch {
         $runSuccess = $false
@@ -4193,7 +4191,7 @@ function Invoke-MobilePreflight {
         throw
     } finally {
         Write-MobileRunEvent -Run $run -Event 'RunCompleted' -Data @{ Success = $runSuccess; Status = $runStatus }
-        Write-Host "[+] Preflight audit log: $($run.ReadablePath)"
+        Write-Host "[+] Scan audit log: $($run.ReadablePath)"
     }
 }
 

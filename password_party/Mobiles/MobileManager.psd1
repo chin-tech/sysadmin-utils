@@ -28,7 +28,7 @@
         'Write-MobileFile'
         'Set-MobileConfig'
         'Show-MobileRunLog'
-        'Invoke-MobilePreflight'
+        'Invoke-MobileScan'
         'Initialize-Environment'
     )
 
@@ -51,6 +51,7 @@
                 adminRoot = "C:\TEMP"
                 nfsHomeRoot   = "C:\TEMP\"
 
+                # AV scan policy. Keep this key and endpoint paths stable across command renames.
                 Preflight = @{
                     DefinitionMaxAgeDays = 30
                     ScanTimeoutMinutes = 240
