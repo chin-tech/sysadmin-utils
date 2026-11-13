@@ -4,10 +4,11 @@ Administrator setup for mobile deployment directories, SSH, certificates, and GP
 .DESCRIPTION
 Run explicitly for initial provisioning or deliberate repairs, using the operator
 account and configuration that will manage deployments. Routine mobile commands
-never invoke this setup script.
+never invoke this setup script. Ordinary repeats preserve matching state; use
+-ForceGpoRefresh to back up and deliberately republish the managed GPO content.
 #>
 [CmdletBinding()]
-param([hashtable]$ConfigOverride)
+param([hashtable]$ConfigOverride, [switch]$ForceGpoRefresh)
 
 $manager = Import-Module (Join-Path $PSScriptRoot 'MobileManager.psd1') -Force -PassThru
 $configPath = Join-Path $PSScriptRoot 'cfg.psd1'
@@ -20,7 +21,7 @@ if ($ConfigOverride) {
 Set-MobileConfig -Overrides $overrides
 
 $options = @{}
-foreach ($option in @('Verbose', 'Debug')) {
+foreach ($option in @('Verbose', 'Debug', 'ForceGpoRefresh')) {
     if ($PSBoundParameters.ContainsKey($option)) { $options[$option] = $PSBoundParameters[$option] }
 }
 # Setup helpers share the configured module's private state, but are loaded only

@@ -1,6 +1,8 @@
 # Administrator-only setup helpers. Loaded by Initialize-Mobiles.ps1 into the
 # configured manager's scope; normal mobile commands do not load this file.
 
+. (Join-Path $PSScriptRoot 'Gpo.ps1')
+
 function New-InitResult {
     param(
         [Parameter(Mandatory)][string]$Component,
@@ -14,164 +16,6 @@ function New-InitResult {
         Details   = $Details
         Fatal     = [bool]$Fatal
     }
-}
-
-function New-ShortcutGPO {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$TargetOUFriendlyName,
-
-        [Parameter()]
-        [string]$GpoID = $script:Config.GpoID,
-
-        [Parameter()]
-        [string]$ShortcutName = "LocalAccountCreator",
-
-        [Parameter()]
-        [string]$TargetPath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-
-        [Parameter()]
-        [string]$Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File ""C:\Supportbin\script.ps1""",
-
-        [Parameter()]
-        [string]$IconPath = "%SystemRoot%\System32\SHELL32.dll",
-
-        [Parameter()]
-        [int]$IconIndex = 301,
-
-        [Parameter()]
-        [string]$Comment = "LOCAL ACCOUNTS",
-        [switch]$Quiet
-    )
-
-    try {
-        $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
-        $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
-        $gpoName = "Mobile Logon"
-
-        $rootDSE = [ADSI]"LDAP://RootDSE"
-        $ctx = $rootDSE.DefaultNamingContext
-        $policyContainerPath = "CN=Policies,CN=System,$ctx"
-        $targetOU_DN = "OU=$TargetOUFriendlyName,$ctx"
-        $gpoLdapPath = "[LDAP://CN=$cleanGpoID,$policyContainerPath;0]"
-        $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
-
-        #
-        # 1. Active Directory GPC Object
-        #
-        $policiesContainer = [ADSI]"LDAP://$policyContainerPath"
-        $gpoLdapUri = "LDAP://CN=$cleanGpoID,$policyContainerPath"
-
-        $isNew = $false
-        if ([System.DirectoryServices.DirectoryEntry]::Exists($gpoLdapUri)) {
-            $gpoEntry = [ADSI]$gpoLdapUri
-        } else {
-            $gpoEntry = $policiesContainer.Create("groupPolicyContainer", "CN=$cleanGpoID")
-            $isNew = $true
-        }
-
-        # Verified extension GUIDs from working GPO
-        $exactExtensionWithLogon = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B66650-4972-11D1-A7CA-0000F87571E3}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
-        $exactExtension = "[{00000000-0000-0000-0000-000000000000}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}][{C418DD9D-0D14-4EFB-8FBF-CFE535C8FAC7}{CEFFA6E2-E3BD-421B-852C-6F6A79A59BC1}]"
-
-        $versionNumber = (1 -shl 16) # User version = 1, Computer version = 0
-
-        $gpoEntry.Put("displayName", $gpoName)
-        $gpoEntry.Put("flags", 0)
-        $gpoEntry.Put("gPCFunctionalityVersion", 2)
-        $gpoEntry.Put("gPCFileSysPath", $gpoSysvolPath)
-        $gpoEntry.Put("gPCUserExtensionNames", $exactExtension)
-        $gpoEntry.Put("versionNumber", $versionNumber)
-        $gpoEntry.Put("showInAdvancedViewOnly", "TRUE")
-
-        # Clone parent ACL to avoid Access Denied in GPMC
-        if ($isNew) {
-            $parentSec = $policiesContainer.Properties["ntSecurityDescriptor"].Value
-            if ($parentSec) {
-                $gpoEntry.Properties["ntSecurityDescriptor"].Value = $parentSec
-            }
-        }
-
-        $gpoEntry.SetInfo()
-
-        #
-        # 2. Build SYSVOL Directory Structure
-        #
-        $userPrefPath = Join-Path $gpoSysvolPath "User\Preferences\Shortcuts"
-        $machinePath  = Join-Path $gpoSysvolPath "Machine"
-
-        @($gpoSysvolPath, $userPrefPath, $machinePath) | ForEach-Object {
-            if (-not (Test-Path $_)) {
-                New-Item -Path $_ -ItemType Directory -Force | Out-Null
-            }
-        }
-
-        try {
-            icacls.exe $gpoSysvolPath /inheritance:e /T /C /Q 2>$null | Out-Null
-        } catch { }
-
-        #
-        # 3. gpt.ini
-        #
-        $gptIni = @"
-[General]
-Version=$versionNumber
-displayName=$gpoName
-"@
-        Set-Content -Path (Join-Path $gpoSysvolPath "gpt.ini") -Value $gptIni -Encoding Ascii
-
-        #
-        # 4. Generate Working Shortcuts.xml
-        #
-        $timeNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-        $desktopUid = [Guid]::NewGuid().ToString("B").ToUpper()
-        $startMenuUid = [Guid]::NewGuid().ToString("B").ToUpper()
-
-        # Escape XML entities in arguments
-        $xmlEscapedArgs = [System.Security.SecurityElement]::Escape($Arguments)
-
-        $xmlContent = @"
-<?xml version="1.0" encoding="utf-8"?>
-<Shortcuts clsid="{872ECB34-B2EC-401b-A585-D32574AA90EE}">
-  <Shortcut clsid="{4F2F7C55-2790-433e-8127-0739D1CFA327}" name="$ShortcutName" status="$ShortcutName" image="1" changed="$timeNow" uid="$desktopUid" userContext="1" bypassErrors="1" removePolicy="1">
-    <Properties pidl="" targetType="FILESYSTEM" action="U" comment="$Comment" shortcutKey="0" startIn="" arguments="$xmlEscapedArgs" iconIndex="$IconIndex" targetPath="$TargetPath" iconPath="$IconPath" window="MIN" shortcutPath="%DesktopDir%\$ShortcutName" />
-  </Shortcut>
-  <Shortcut clsid="{4F2F7C55-2790-433e-8127-0739D1CFA327}" name="$ShortcutName" status="$ShortcutName" image="1" changed="$timeNow" uid="$startMenuUid" userContext="1" bypassErrors="1" removePolicy="1">
-    <Properties pidl="" targetType="FILESYSTEM" action="U" comment="$Comment" shortcutKey="0" startIn="" arguments="$xmlEscapedArgs" iconIndex="$IconIndex" targetPath="$TargetPath" iconPath="$IconPath" window="MIN" shortcutPath="%StartMenuDir%\$ShortcutName" />
-  </Shortcut>
-</Shortcuts>
-"@
-
-        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-        [System.IO.File]::WriteAllText((Join-Path $userPrefPath "Shortcuts.xml"), $xmlContent.Trim(), $utf8NoBom)
-
-        #
-        # 5. Link to OU
-        #
-        if ([System.DirectoryServices.DirectoryEntry]::Exists("LDAP://$targetOU_DN")) {
-            $targetOU = [ADSI]"LDAP://$targetOU_DN"
-            $existingLinks = $targetOU.Properties['gPLink'].Value
-            if ($existingLinks) {
-                if ($existingLinks -notlike "*$cleanGpoID*") {
-                    $targetOU.Properties['gPLink'].Value = "$gpoLdapPath$existingLinks"
-                }
-            } else {
-                $targetOU.Properties['gPLink'].Value = $gpoLdapPath
-            }
-
-            if (-not $targetOU.Properties['gPOptions'].Value) { $targetOU.Properties['gPOptions'].Value = 0 }
-
-            $targetOU.SetInfo()
-        } else {
-            Write-Warning "Target OU '$TargetOUFriendlyName' not found. Link skipped."
-        }
-
-        return (New-InitResult -Component 'GPO' -Status 'CREATED' -Details "'$gpoName' : $($gpoID) -> '$TargetOUFriendlyName'")
-    } catch {
-        return (New-InitResult -Component 'GPO' -Status 'FAILED' -Details "Creation failed: $($_.Exception.Message)" -Fatal)
-    }
-
 }
 
 function Test-AndFixDirectories {
@@ -203,6 +47,27 @@ function Test-AndFixDirectories {
     return $results
 }
 
+function Set-MobileSetupPermissions([string]$Path, [switch]$Directory) {
+    $identity = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $rights = if ($Directory) { [Security.AccessControl.FileSystemRights]::FullControl } else {
+        [Security.AccessControl.FileSystemRights]::Read -bor [Security.AccessControl.FileSystemRights]::Synchronize
+    }
+    $inheritance = if ($Directory) {
+        [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    } else { [Security.AccessControl.InheritanceFlags]::None }
+    $matches = @($acl.Access | Where-Object {
+        $_.IdentityReference.Value -ieq $identity -and -not $_.IsInherited -and
+        $_.AccessControlType -eq 'Allow' -and $_.FileSystemRights -eq $rights -and
+        $_.InheritanceFlags -eq $inheritance -and $_.PropagationFlags -eq 'None'
+    })
+    if ($acl.AreAccessRulesProtected -and $matches.Count -eq 1) { return $false }
+    $grant = if ($Directory) { '(OI)(CI)(F)' } else { '(R)' }
+    $null = icacls.exe $Path /inheritance:r /grant:r "${identity}:$grant" 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "Could not set SSH permissions on '$Path' (icacls exit $LASTEXITCODE)." }
+    return $true
+}
+
 function Test-AndFixSshEnvironment {
     [CmdletBinding()]
     param(
@@ -228,8 +93,9 @@ function Test-AndFixSshEnvironment {
         }
 
         # 2. Permissions lock-down (Inheritance removal + single-owner grant)
-        icacls.exe $localSsh /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)(F)" 2>$null | Out-Null
-        icacls.exe $nfsSsh   /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)(F)" 2>$null | Out-Null
+        $permissionsChanged = $false
+        if (Set-MobileSetupPermissions $localSsh -Directory) { $permissionsChanged = $true }
+        if (Set-MobileSetupPermissions $nfsSsh -Directory) { $permissionsChanged = $true }
 
         # 3. Keypair generation
         $keyCreated = $false
@@ -240,7 +106,7 @@ function Test-AndFixSshEnvironment {
             $keyCreated = $true
         }
 
-        icacls.exe $KeyPath /inheritance:r /grant:r "$($env:USERNAME):(R)" 2>$null | Out-Null
+        if (Set-MobileSetupPermissions $KeyPath) { $permissionsChanged = $true }
 
         # 4. Authorized keys enrollment
         $pubKey = (ssh-keygen -yf $KeyPath).Trim()
@@ -249,12 +115,13 @@ function Test-AndFixSshEnvironment {
         }
 
         $existingAuth = Get-Content -Path $rAuthorized -ErrorAction SilentlyContinue
-        if ($existingAuth -notcontains $pubKey) {
+        $enrolled = $existingAuth -notcontains $pubKey
+        if ($enrolled) {
             Add-Content -Path $rAuthorized -Value $pubKey -Encoding UTF8
-            icacls.exe $rAuthorized /inheritance:r /grant:r "$($env:USERNAME):(R)" 2>$null | Out-Null
         }
+        if (Set-MobileSetupPermissions $rAuthorized) { $permissionsChanged = $true }
 
-        $status = if ($keyCreated) { 'CREATED' } else { 'OK' }
+        $status = if ($keyCreated) { 'CREATED' } elseif ($permissionsChanged -or $enrolled) { 'REPAIRED' } else { 'OK' }
         if ($quiet) { return $true }
         return (New-InitResult -Component 'SSH:Environment' -Status $status -Details "Key at $KeyPath enrolled in $rAuthorized")
     } catch {
@@ -336,6 +203,7 @@ function Initialize-Environment {
         [Parameter()][string]$MobileEntries = $Script:Config.MobileEntries,
         [Parameter()][string]$OUPath        = $Script:Config.MobileOU,
         [Parameter()][string]$CertName      = $(if ($Script:Config.CertName) { $Script:Config.CertName } else { 'MobileDeployer' }),
+        [Parameter()][switch]$ForceGpoRefresh,
         [Parameter()][switch]$HaltOnError,
         [Parameter()][switch]$Console
     )
@@ -361,23 +229,9 @@ function Initialize-Environment {
 
     # Do not publish a logon script when certificate or other preflight checks failed.
     if (-not @($results | Where-Object { $_.Fatal -and $_.Status -eq 'FAILED' }).Count) {
-        $LogOnScript = (Get-Content (Join-Path (Split-Path $PSScriptRoot -Parent) 'MobileLogon.ps1') -ErrorAction Stop) `
+        $logonScript = (Get-Content (Join-Path (Split-Path $PSScriptRoot -Parent) 'MobileLogon.ps1') -Raw -ErrorAction Stop) `
             -replace 'PASTE_YOUR_BASE64_CERT_BLOB_HERE', $certProvision.CertificateBase64
-
-        $GpoID = $script:Config.GpoID
-        $cleanGpoID = if ($GpoID -match '^\{[0-9a-fA-F-]+\}$') { $GpoID.ToUpper() } else { "{$($GpoID.ToUpper())}" }
-        $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name
-        $rootDSE = [ADSI]"LDAP://RootDSE"
-        $gpoSysvolPath = "\\$domain\sysvol\$domain\policies\$cleanGpoID"
-        $outPath = Join-Path $gpoSysvolPath "CreateLocalAccounts.ps1"
-        $actualRunFile = Join-Path $gpoSysvolPath "Run.ps1"
-
-        $results.Add((New-ShortcutGPO -TargetOUFriendlyName "$OUPath" -quiet -Arguments "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$actualRunFile`""))
-        $runContent = @"
-powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "$outPath" -MobileDumpPath $($Script:Config.MobileDump) -MobileEntriesPath $($Script:Config.MobileEntries)
-"@
-        $LogonScript | Set-Content -Path $outPath
-        $runContent | Set-Content -Path $actualRunFile
+        $results.Add((New-ShortcutGPO -TargetOUFriendlyName $OUPath -LogonScript $logonScript -ForceGpoRefresh:$ForceGpoRefresh))
 
     }
 
