@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-    (Join-Path (Split-Path $PSScriptRoot -Parent) 'MobileManager.psm1'), [ref]$tokens, [ref]$errors)
+    (Join-Path (Split-Path $PSScriptRoot -Parent) 'Setup/MobileEnvironment.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors.Message -join "`n") }
 $names = @('New-InitResult', 'Test-AndFixDeployerCert', 'Initialize-Environment')
 $source = $ast.FindAll({ param($node)

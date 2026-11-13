@@ -83,7 +83,9 @@ try {
         function Get-MobileData {
             [pscustomobject]@{AllMobiles=@('demo');MobileUsers=@([pscustomobject]@{Username='alice';Groups=@('users');Name='Alice Example'});Windows=@('win-a');Linux=@('linux-a');AllUsers=$users}
         }
-        Get-MobileOverview -MobileName demo -mobileDumpPath ''
+        function Initialize-Environment { throw 'Telemetry invoked setup' }
+        function Invoke-InformationCollector { param($winComputers,$linComputers,$sshKeyPath) @($windows,$linux) }
+        Get-MobileOverview -MobileName demo -mobileDumpPath '' -nfsHome 'fixture-home' -sshKeyPath 'fixture-key' -Full
         $report = $script:lines -join "`n"
         Assert ($report.Contains('Alice Example') -and $report.Contains('[-] PENDING') -and $report.Contains('MOBILE: demo')) 'Overview information was lost'
         Assert (@($script:lines | Where-Object Length -gt 120).Count -eq 0) 'Overview exceeded terminal width'

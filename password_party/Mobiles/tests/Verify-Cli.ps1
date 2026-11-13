@@ -11,7 +11,7 @@ try {
     $source = @'
 function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides }
 '@
-    foreach ($name in @('Get-MobileOverview','Invoke-MobileScan','Register-MobileDeployment','Unregister-Deployment','Set-MobileGpoPermission','New-MobileDeployment','Initialize-Environment')) {
+    foreach ($name in @('Get-MobileOverview','Invoke-MobileScan','Register-MobileDeployment','Unregister-Deployment','Set-MobileGpoPermission','New-MobileDeployment')) {
         $source += "`nfunction $name {" + @'
     [CmdletBinding()]
     param([string]$MobileName, [switch]$Full, [switch]$Archive, [switch]$Disjoin,
@@ -40,14 +40,13 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
         Assert (-not (Compare-Object @($Expected | Sort-Object) @($actual | Sort-Object))) "Unexpected completion for '$Arguments': $($actual -join ', ')"
     }
     # Exercise discovery before the first invocation: no module/config/site work is needed.
-    Assert-Completion '-' @('-Info','-RegisterDeployment','-UnRegisterDeployment','-Scan','-Initialize','-New','-GPO','-Name','-Full')
+    Assert-Completion '-' @('-Info','-RegisterDeployment','-UnRegisterDeployment','-Scan','-New','-GPO','-Name','-Full')
     Assert-Completion '-Scan fixture -' @('-Rescan','-Force')
     Assert-Completion '-RegisterDeployment fixture -' @('-Disjoin','-LinuxDisjoinKeytab','-DomainPrincipal','-DomainKeyVersion')
     Assert-Completion '-UnRegisterDeployment fixture -' @('-Archive')
     Assert-Completion '-Info fixture -' @('-Full')
     Assert-Completion '-GPO fixture -' @('-Add','-Remove','-Force')
     Assert (@(Get-ParameterCompletion '-New -').Count -eq 0) 'New offered unrelated parameters'
-    Assert (@(Get-ParameterCompletion '-Initialize -').Count -eq 0) 'Initialize offered unrelated parameters'
     Assert (-not (Get-Module MobileManager)) 'Tab completion imported the deployment module'
 
     $result = & $cli
@@ -75,8 +74,7 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
     $result = & $cli -GPO -Remove fixture -Force
     Assert ($result.Command -eq 'Set-MobileGpoPermission' -and $result.Options.Remove -and $result.Options.Force) 'GPO remove dispatch changed'
     Assert ((& $cli -New).Command -eq 'New-MobileDeployment') 'New mobile dispatch changed'
-    $result = & $cli -Initialize
-    Assert ($result.Command -eq 'Initialize-Environment' -and $result.Options.Console) 'Initialization dispatch changed'
+    Assert-Rejected @{ Initialize=$true }
 
     Assert-Rejected @{ Scan=$true; Name='fixture'; Disjoin=$true }
     Assert-Rejected @{ RegisterDeployment=$true; Name='fixture'; DomainController='dc' }

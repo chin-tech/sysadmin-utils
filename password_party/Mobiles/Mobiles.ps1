@@ -9,8 +9,6 @@ param(
     [switch]$UnRegisterDeployment,
     [Parameter(Mandatory, ParameterSetName = 'Scan')]
     [switch]$Scan,
-    [Parameter(Mandatory, ParameterSetName = 'Initialize')]
-    [switch]$Initialize,
     [Parameter(Mandatory, ParameterSetName = 'NewMobile')]
     [switch]$New,
     [Parameter(Mandatory, ParameterSetName = 'GPO')]
@@ -33,7 +31,7 @@ dynamicparam {
     # Keep discovery local: completing a command must not import the module,
     # read site configuration, or contact endpoints.
     $mode = 'Info'
-    foreach ($command in @('Info', 'RegisterDeployment', 'UnRegisterDeployment', 'Scan', 'Initialize', 'New', 'GPO')) {
+    foreach ($command in @('Info', 'RegisterDeployment', 'UnRegisterDeployment', 'Scan', 'New', 'GPO')) {
         if ($PSBoundParameters.ContainsKey($command)) { $mode = $command; break }
     }
     $options = switch ($mode) {
@@ -104,6 +102,5 @@ end {
             else { Set-MobileGpoPermission -MobileName $Name -Remove -Force:([bool]$PSBoundParameters['Force']) @commandOptions }
         }
         'NewMobile' { New-MobileDeployment @commandOptions }
-        'Initialize' { Initialize-Environment -Console @commandOptions }
     }
 }

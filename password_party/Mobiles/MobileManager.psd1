@@ -29,7 +29,6 @@
         'Set-MobileConfig'
         'Show-MobileRunLog'
         'Invoke-MobileScan'
-        'Initialize-Environment'
     )
 
     # Cmdlets, Variables, and Aliases to export

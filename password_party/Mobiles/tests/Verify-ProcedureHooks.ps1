@@ -166,11 +166,13 @@ record_failure 'fixture failure'
         function Get-MobileData { param($MobileName)
             [pscustomobject]@{ Windows = @('fixture-host'); Linux = @(); AllUsers = @([pscustomobject]@{ Name = 'fixture' }) }
         }
-        function Initialize-Environment { $true }
+        function Initialize-Environment { throw 'Routine deployment invoked setup' }
+        function Assert-MobileEnvironment { param([switch]$Linux) if ($script:missingSetup) { throw 'fixture missing setup' } }
         function Get-UserCreds { param($MobileName, $AllUsers, $mobileDumpPath) $AllUsers }
         function Get-TaskData { param($hasLinux) @() }
         function Format-DeploymentResults { param($results, $allUsers, [switch]$Unregister) }
         function Invoke-Command { [CmdletBinding()] param($ComputerName, $ScriptBlock, $ArgumentList)
+            $script:transportCalls++
             if ($script:transportFails) { throw 'fixture transport failure' }
             [pscustomobject]@{ PSComputerName = 'fixture-host'; Success = $true
                 Actions = @([pscustomobject]@{ Category = 'Fixture'; Name = 'Built-in action'; Status = 'Success'; Details = [pscustomobject]@{ Nested = [pscustomobject]@{ Items = @('one', 'two') }; StdOut = "line one`nline two" } }); Failures = @() }
@@ -202,6 +204,15 @@ record_failure 'fixture failure'
         }
         $rendered = (Format-MobileRunEvent $fixtureEvent) -join "`n"
         Assert ($rendered.Contains('ERROR: first failure') -and $rendered.Contains('ERROR: second failure') -and $rendered.Contains('Result: FAILED')) 'Host failure messages were not expanded'
+        $before = $script:transportCalls
+        $script:missingSetup = $true
+        $blocked = $false
+        try { Register-MobileDeployment -MobileName missing-setup } catch { $blocked = $_.Exception.Message -eq 'fixture missing setup' }
+        $script:missingSetup = $false
+        Assert ($blocked -and $script:transportCalls -eq $before) 'Missing setup did not block remote deployment'
+        $missingLog = Get-ChildItem "$fixture/logs" -Filter '*-missing-setup-*.jsonl' | Select-Object -First 1
+        $missingEvents = @(Get-Content $missingLog.FullName | ForEach-Object { $_ | ConvertFrom-Json })
+        Assert (-not $missingEvents[-1].Data.Success -and 'EnvironmentCheckStarted' -in $missingEvents.Event) 'Missing setup failure was not audited'
         $script:transportFails = $true
         try { Register-MobileDeployment -MobileName failed } catch { }
         $failed = Get-ChildItem "$fixture/logs" -Filter '*-failed-*.jsonl' | Select-Object -First 1
