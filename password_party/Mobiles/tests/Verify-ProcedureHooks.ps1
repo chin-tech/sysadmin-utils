@@ -53,12 +53,21 @@ try {
         Set-Content -LiteralPath "$scripts/Check-out/10-first.ps1" -Value 'throw "changed source must not run"'
         $result = & (Get-WindowsProcedureHookRunner) -Hooks $hooks -MobileName fixture -Procedure Check-out -RunId fixture-run
         Assert ($result.Actions.Count -eq 3 -and $result.Failures.Count -eq 1) 'PowerShell hooks lost results or failure'
-        Assert ($result.Actions[0].Details.StdOut.Contains('first:fixture')) 'PowerShell snapshot or environment failed'
-        Assert ($result.Actions[1].Details.StdOut.Contains('second:Check-out')) 'PowerShell hook ordering/context failed'
+        Assert ($result.Actions[0].Details.Output.Contains('first:fixture')) 'PowerShell snapshot or environment failed'
+        Assert ($result.Actions[1].Details.Output.Contains('second:Check-out')) 'PowerShell hook ordering/context failed'
         Assert ($result.Actions[2].Status -eq 'Failed') 'Nonterminating PowerShell error was reported as successful'
+        # Explicit exits must not terminate the runner or prevent later hooks from running.
+        $exitHooks = @(7, 0 | ForEach-Object {
+            [pscustomobject]@{ Name = "exit-$_.ps1"; Sha256 = 'fixture'
+                ContentBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("Write-Output 'before exit'; exit $_")) }
+        })
+        $exitResult = & (Get-WindowsProcedureHookRunner) -Hooks $exitHooks -MobileName "fixture's mobile" -Procedure Check-out -RunId fixture-run
+        Assert ($exitResult.Actions.Count -eq 2 -and $exitResult.Failures.Count -eq 1) 'Explicit exit interrupted the runner or lost failure'
+        Assert ($exitResult.Actions[0].Details.ExitCode -eq 7 -and $exitResult.Actions[1].Details.ExitCode -eq 0) 'Explicit exit codes were lost'
+        Assert ($exitResult.Actions[1].Status -eq 'Success') 'Exit zero was reported as failed'
         $returnHooks = @(Get-MobileProcedureHooks -Procedure Check-in -ScriptsRoot $scripts)
         $returnResult = & (Get-WindowsProcedureHookRunner) -Hooks $returnHooks -MobileName fixture -Procedure Check-in -RunId fixture-run
-        Assert ($returnResult.Actions[0].Details.StdOut.Contains('return:Check-in')) 'Check-in hook discovery/execution failed'
+        Assert ($returnResult.Actions[0].Details.Output.Contains('return:Check-in')) 'Check-in hook discovery/execution failed'
         Set-Content -LiteralPath "$scripts/Check-in/bad.ps1" -Value 'if ('
         $rejected = $false
         try { Get-MobileProcedureHooks -Procedure Check-in -ScriptsRoot $scripts | Out-Null } catch { $rejected = $true }
@@ -128,15 +137,8 @@ record_failure 'fixture failure'
                 $json = & bash $path
                 $linux = ($json -join "`n") | ConvertFrom-Json
                 Assert (-not $linux.Success -and $linux.Actions.Count -eq 2) 'Linux hook result JSON was corrupted or failed hook was ignored'
-                Assert ($linux.Actions[0].Details.StdOut.Trim() -eq 'linux:fixture:Check-out') 'Linux context or quoted filename failed'
+                Assert ($linux.Actions[0].Details.Output.Trim() -eq 'linux:fixture:Check-out') 'Linux context or quoted filename failed'
                 Assert ($linux.Actions[1].Details.ExitCode -eq 7) 'Linux exit code was not recorded'
-                # The standalone hook runner also preserves output and failure details.
-                $standalone = Get-LinuxProcedureHookScript -Hooks $linuxHooks -MobileName fixture -Procedure Check-in -RunId fixture-run -Standalone -ToolPath $env:PATH
-                [IO.File]::WriteAllText($path, $standalone)
-                $standaloneResult = ((& bash $path) -join "`n") | ConvertFrom-Json
-                Assert ($standaloneResult.Actions.Count -eq 2 -and $standaloneResult.Failures.Count -eq 1) 'Standalone hooks lost actions or failures'
-                Assert ($standaloneResult.Actions[0].Details.StdOut.Trim() -eq 'linux:fixture:Check-in') 'Standalone hooks lost procedure context/output'
-
                 $currentUser = (& id -un).Trim()
                 $user = [pscustomobject]@{
                     BaseName = 'fixture'; LinuxName = $currentUser

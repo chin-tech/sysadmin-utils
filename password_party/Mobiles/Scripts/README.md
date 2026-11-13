@@ -8,7 +8,7 @@ Put self-contained scripts directly in these folders:
 
 Windows hosts receive only `.ps1` files. Linux hosts receive only `.sh` files. Other files and subdirectories are ignored. Scripts run in filename order; names such as `10-configure.ps1` and `20-verify.ps1` make the order clear. Discovery snapshots the content once per procedure run, so every applicable host receives the same version even if the local files change during deployment. Script hashes identify the executed snapshots in the audit log. Linux CRLF line endings are normalized to LF before hashing/execution.
 
-Hooks run on each target, not on the administrator machine. PowerShell uses a separate noninteractive process in the WinRM account context. Linux uses a separate Bash process via `dzdo`. Linux targets need `bash`, `base64`, `jq`, and the `timeout` utility. Each hook has a five-minute timeout. A PowerShell error or nonzero exit code, or a nonzero Bash exit code, fails that hook. All selected hooks are attempted; failure blocks check-out domain departure or check-in built-in cleanup on that host.
+Hooks run on each target, not on the administrator machine. PowerShell uses a separate noninteractive process in the WinRM account context. Linux uses a separate Bash process via `dzdo`. Linux targets need `bash`, `base64`, and `jq`. Hooks run synchronously without an automatic timeout; put a timeout inside an individual hook if needed. A PowerShell error or nonzero exit code, or a nonzero Bash exit code, fails that hook. All selected hooks are attempted; failure blocks check-out domain departure or check-in built-in cleanup on that host.
 
 Each script receives these environment variables:
 
@@ -18,15 +18,15 @@ MOBILE_PROCEDURE    # Check-in or Check-out
 MOBILE_RUN_ID
 ```
 
-The working directory is temporary. Supporting files and adjacent scripts are not copied. Hooks should be self-contained, handle repeated execution, and avoid interactive prompts. Use `throw`/`Write-Error` or `exit 1` in PowerShell, and a nonzero exit status in Bash, to report failure. Hooks are independent child processes, so shell variables and functions do not carry between scripts.
+Windows uses a temporary working directory; Linux inherits the remote procedure working directory. Use absolute paths in hooks. Supporting files and adjacent scripts are not copied. Hooks should be self-contained, handle repeated execution, and avoid interactive prompts. Use `throw`/`Write-Error` or `exit 1` in PowerShell, and a nonzero exit status in Bash, to report failure. Hooks are independent child processes, so shell variables and functions do not carry between scripts.
 
-The execution path is `Get-MobileProcedureHooks` (discover and snapshot), then `Get-WindowsProcedureHookRunner` or `Get-LinuxProcedureHookScript` (execute and record). The Linux `-Standalone` option adds the result envelope when hooks run outside normal provisioning/cleanup. The Windows launcher exists to turn PowerShell errors into a failed process exit code; it is a temporary part of that execution, not a scheduled job.
+The execution path is `Get-MobileProcedureHooks` (discover and snapshot), then `Get-WindowsProcedureHookRunner` or `Get-LinuxProcedureHookScript` (execute and record). Windows writes one temporary script containing a small wrapper that creates and invokes the snapshotted scriptblock, then removes it after execution. Its child process turns PowerShell errors into a failed exit code and isolates explicit `exit` statements. Linux pipes the snapshot directly into `dzdo env ... bash -s`; it creates no hook files or services. Both runners return results through the existing deployment audit.
 
 ## Audit files
 
 Each procedure creates matching timestamped `.log` and `.jsonl` files under the configured `MobileDeployments` directory (normally `.mobiles/.deployments`). The `.log` is readable text with expanded targets, task selections, host actions, nested details, output, and error messages. The command prints its path at the end, including after an error. The `.jsonl` retains the structured events; its path is also shown with `-Verbose`. Both logs must be writable before deployment can proceed.
 
-Every line is a JSON event with a UTC timestamp, run ID, mobile name, and procedure. Events record run start/completion, selected built-in tasks, target hosts, hook inventory (name/platform/SHA-256), host actions and failures, and procedure exceptions. Hook results include timestamps, exit code, and up to 64 KiB each of stdout and stderr. Script contents, credential payloads, and generated keytabs are not written to the journal. Hook output is logged, so scripts should not print passwords or other secrets. Protect the log directory using your normal administrator access controls.
+Every line is a JSON event with a UTC timestamp, run ID, mobile name, and procedure. Events record run start/completion, selected built-in tasks, target hosts, hook inventory (name/platform/SHA-256), host actions and failures, and procedure exceptions. Hook results include timestamps, exit code, and up to 65,536 characters of combined stdout/stderr in `Details.Output`. Script contents, credential payloads, and generated keytabs are not written to the journal. Hook output is logged, so scripts should not print passwords or other secrets. Protect the log directory using your normal administrator access controls.
 
 Read the `.log` in an editor, or render either file through the viewer. Existing JSONL files from earlier runs work too:
 

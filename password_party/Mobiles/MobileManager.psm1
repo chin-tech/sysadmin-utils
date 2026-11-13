@@ -1545,7 +1545,8 @@ function Get-MobileProcedureHooks {
     if (-not (Test-Path -LiteralPath $path)) { return }
     foreach ($file in (Get-ChildItem -LiteralPath $path -File -ErrorAction Stop | Sort-Object Name)) {
         if ($file.Extension -notin @('.ps1', '.sh')) { continue }
-        $content = [IO.File]::ReadAllText($file.FullName).TrimStart([char]0xFEFF)
+        $content = [string](Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 -ErrorAction Stop)
+        $content = $content.TrimStart([char]0xFEFF)
         if ($file.Extension -eq '.sh') { $content = $content.Replace("`r`n", "`n") }
         if ($file.Extension -eq '.ps1') {
             $tokens = $null; $errors = $null
@@ -1701,70 +1702,55 @@ function Get-WindowsProcedureHookRunner {
         param([array]$Hooks, [string]$MobileName, [string]$Procedure, [string]$RunId)
         $actions = [System.Collections.Generic.List[object]]::new()
         $failures = [System.Collections.Generic.List[string]]::new()
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $false
         foreach ($hook in $Hooks) {
             $started = [datetime]::UtcNow.ToString('o')
             $directory = Join-Path ([IO.Path]::GetTempPath()) ('mobile-hook-' + [guid]::NewGuid().ToString('N'))
-            $process = $null
-            $exitCode = $null
-            $stdout = ''; $stderr = ''
-            $hookSucceeded = $false
+            $exitCode = $null; $output = ''
             try {
-                # 1. Materialize the snapshotted script and a launcher that turns errors into exit codes.
-                New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
+                New-Item -ItemType Directory -Path $directory | Out-Null
+                # One temporary script, one child process. An explicit exit stays inside that process.
                 $scriptPath = Join-Path $directory 'hook.ps1'
-                $launcherPath = Join-Path $directory 'launch.ps1'
-                $content = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($hook.ContentBase64))
-                [IO.File]::WriteAllText($scriptPath, $content, [Text.UTF8Encoding]::new($true))
-                $launcher = {
+                $context = @(
+                    "`$env:MOBILE_NAME = '$( $MobileName.Replace("'", "''") )'"
+                    "`$env:MOBILE_PROCEDURE = '$( $Procedure.Replace("'", "''") )'"
+                    "`$env:MOBILE_RUN_ID = '$( $RunId.Replace("'", "''") )'"
+                ) -join "`n"
+                $runner = {
+                    param($ContentBase64)
                     $ErrorActionPreference = 'Stop'
                     try {
-                        & $args[0]
+                        $content = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ContentBase64))
+                        & ([scriptblock]::Create($content))
                         if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }
-                    } catch { Write-Error -ErrorRecord $_ -ErrorAction Continue; exit 1 }
+                    } catch { Write-Output ($_ | Out-String); exit 1 }
                 }
-                [IO.File]::WriteAllText($launcherPath, $launcher.ToString(), [Text.UTF8Encoding]::new($true))
-                # 2. Run in its own process with the procedure context and captured output.
-                $info = [Diagnostics.ProcessStartInfo]::new()
-                $info.FileName = (Get-Process -Id $PID -ErrorAction Stop).Path
-                $info.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$launcherPath`" `"$scriptPath`""
-                $info.WorkingDirectory = $directory
-                $info.UseShellExecute = $false
-                $info.RedirectStandardOutput = $true
-                $info.RedirectStandardError = $true
-                $info.EnvironmentVariables['MOBILE_NAME'] = $MobileName
-                $info.EnvironmentVariables['MOBILE_PROCEDURE'] = $Procedure
-                $info.EnvironmentVariables['MOBILE_RUN_ID'] = $RunId
-                $process = [Diagnostics.Process]::Start($info)
-                $outTask = $process.StandardOutput.ReadToEndAsync()
-                $errTask = $process.StandardError.ReadToEndAsync()
-                # 3. Bound execution time, then collect both streams before recording the result.
-                if (-not $process.WaitForExit(300000)) {
-                    $process.Kill()
-                    throw 'Hook exceeded its five-minute time limit.'
-                }
-                $exitCode = $process.ExitCode
-                $stdout = $outTask.GetAwaiter().GetResult()
-                $stderr = $errTask.GetAwaiter().GetResult()
+                $script = $context + "`n& {" + $runner.ToString() + "} '" + $hook.ContentBase64 + "'"
+                [IO.File]::WriteAllText($scriptPath, $script, [Text.UTF8Encoding]::new($true))
+                $engine = (Get-Process -Id $PID).Path
+                Push-Location $directory
+                try {
+                    # Native stderr is part of the output; the process exit code decides success.
+                    $ErrorActionPreference = 'Continue'
+                    $output = (& $engine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $scriptPath 2>&1 | Out-String)
+                    $exitCode = $LASTEXITCODE
+                } finally { $ErrorActionPreference = 'Stop'; Pop-Location }
                 if ($exitCode -ne 0) { throw "Hook exited with code $exitCode." }
-                $hookSucceeded = $true
             } catch {
                 $failures.Add("Hook '$($hook.Name)': $($_.Exception.Message)")
-                $stderr += "`n$($_.Exception.Message)"
+                $output += "`n$($_.Exception.Message)"
             } finally {
-                if ($process) { $process.Dispose() }
-                if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue }
+                Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
             }
-            # 4. Record the outcome even when starting or running the hook failed.
             $actions.Add([PSCustomObject]@{
-                    Category = 'Hook'; Name = $hook.Name
-                    Status = if ($hookSucceeded) { 'Success' } else { 'Failed' }
-                    Details = [PSCustomObject]@{
-                        Sha256 = $hook.Sha256; StartedUtc = $started; CompletedUtc = [datetime]::UtcNow.ToString('o')
-                        ExitCode = $exitCode
-                        StdOut = $stdout.Substring(0, [Math]::Min(65536, $stdout.Length))
-                        StdErr = $stderr.Substring(0, [Math]::Min(65536, $stderr.Length))
-                    }
-                })
+                Category = 'Hook'; Name = $hook.Name
+                Status = if ($exitCode -eq 0) { 'Success' } else { 'Failed' }
+                Details = [PSCustomObject]@{
+                    Sha256 = $hook.Sha256; StartedUtc = $started; CompletedUtc = [datetime]::UtcNow.ToString('o')
+                    ExitCode = $exitCode; Output = $output.Substring(0, [Math]::Min(65536, $output.Length))
+                }
+            })
         }
         [PSCustomObject]@{ Actions = $actions.ToArray(); Failures = $failures.ToArray() }
     }
@@ -1774,71 +1760,33 @@ function Get-LinuxProcedureHookScript(
     [array]$Hooks,
     [string]$MobileName,
     [string]$Procedure,
-    [string]$RunId,
-    [switch]$Standalone,
-    [string]$ToolPath = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    [string]$RunId
 ) {
     if (-not $Hooks) { return '' }
     $header = @'
-# Procedure hooks run in isolated child shells; stdout never mixes with result JSON.
+# Capture output separately from the host's JSON result; exit only the child Bash process.
 run_mobile_hook() {
     local hook_name="$1" hook_hash="$2" hook_content="$3"
-    local hook_dir hook_status='Failed' hook_exit=1 hook_started
+    local hook_status='Success' hook_exit hook_started hook_output
     hook_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    hook_dir="$(mktemp -d)"
-    if [[ -z "$hook_dir" ]]; then
-        record_failure "Hook '$hook_name': cannot create temporary directory"
-        record_action 'Hook' "$hook_name" 'Failed'
-        return
+    hook_output="$(printf '%s' "$hook_content" | base64 -d | dzdo env \
+        MOBILE_NAME="$mobile_hook_name" MOBILE_PROCEDURE="$mobile_hook_procedure" MOBILE_RUN_ID="$mobile_hook_run" \
+        bash -s 2>&1)"
+    hook_exit=$?
+    if [[ "$hook_exit" -ne 0 ]]; then
+        hook_status='Failed'
+        record_failure "Hook '$hook_name': exit $hook_exit"
     fi
-    chmod 700 "$hook_dir"
-    if printf '%s' "$hook_content" | base64 -d > "$hook_dir/hook.sh"; then
-        (cd "$hook_dir" && timeout 300 dzdo env \
-            MOBILE_NAME="$mobile_hook_name" MOBILE_PROCEDURE="$mobile_hook_procedure" MOBILE_RUN_ID="$mobile_hook_run" \
-            bash "$hook_dir/hook.sh") > "$hook_dir/stdout" 2> "$hook_dir/stderr"
-        hook_exit=$?
-        if [[ "$hook_exit" -eq 0 ]]; then hook_status='Success'; fi
-    else
-        printf '%s\n' 'Could not decode hook' > "$hook_dir/stderr"
-        : > "$hook_dir/stdout"
-    fi
-    head -c 65536 "$hook_dir/stdout" > "$hook_dir/out-short"
-    head -c 65536 "$hook_dir/stderr" > "$hook_dir/err-short"
-    # Build one audit action from the exit status and bounded output files.
     actions_json+=("$(jq -cn \
-        --arg name "$hook_name" --arg status "$hook_status" \
-        --arg sha "$hook_hash" --argjson code "$hook_exit" \
+        --arg name "$hook_name" --arg status "$hook_status" --arg sha "$hook_hash" --argjson code "$hook_exit" \
         --arg started "$hook_started" --arg ended "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --rawfile stdout "$hook_dir/out-short" --rawfile stderr "$hook_dir/err-short" '{
-            Category: "Hook",
-            Name: $name,
-            Status: $status,
-            Details: {
-                Sha256: $sha,
-                StartedUtc: $started,
-                CompletedUtc: $ended,
-                ExitCode: $code,
-                StdOut: $stdout,
-                StdErr: $stderr
-            }
-        }')")
-    if [[ "$hook_status" != 'Success' ]]; then record_failure "Hook '$hook_name': exit $hook_exit"; fi
-    rm -rf -- "$hook_dir"
+        --arg output "${hook_output:0:65536}" \
+        '{Category:"Hook", Name:$name, Status:$status,
+          Details:{Sha256:$sha, StartedUtc:$started, CompletedUtc:$ended, ExitCode:$code, Output:$output}}')")
 }
+
 '@
     $lines = [System.Collections.Generic.List[string]]::new()
-    if ($Standalone) {
-        $lines.Add('export PATH=' + (ConvertTo-BashArgument $ToolPath))
-        $lines.Add(@'
-set -o pipefail
-actions_json=(); failures=()
-record_failure() { failures+=("$1"); }
-record_action() {
-    actions_json+=("$(jq -cn --arg name "$2" --arg status "$3" \
-        '{Category:"Hook", Name:$name, Status:$status}')")
-}
-'@)
-    }
     $lines.Add('mobile_hook_name=' + (ConvertTo-BashArgument $MobileName))
     $lines.Add('mobile_hook_procedure=' + (ConvertTo-BashArgument $Procedure))
     $lines.Add('mobile_hook_run=' + (ConvertTo-BashArgument $RunId))
@@ -1846,14 +1794,6 @@ record_action() {
     foreach ($hook in $Hooks) {
         $lines.Add(('run_mobile_hook {0} {1} {2}' -f (ConvertTo-BashArgument $hook.Name),
                 (ConvertTo-BashArgument $hook.Sha256), (ConvertTo-BashArgument $hook.ContentBase64)))
-    }
-    if ($Standalone) {
-        $lines.Add(@'
-# Emit one host result after every selected hook has been attempted.
-jq -n --argjson actions "[$(IFS=,; echo "${actions_json[*]}")]" \
-    --argjson failures "$(printf '%s\n' "${failures[@]}" | jq -Rs 'split("\n") | map(select(length > 0))')" \
-    '{Actions:$actions, Failures:$failures}'
-'@)
     }
     return ($lines -join "`n").Replace("`r`n", "`n")
 }
