@@ -8,7 +8,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
 if ($issues.Count) { throw ($issues.Message -join "`n") }
 $names = @('Test-DeploymentTaskPlan', 'Get-DeploymentTaskSelection', 'Get-WindowsCollector-Registry', 'Get-WindowsCollector-Symantec', 'Get-WindowsCollector-Ivanti',
     'Get-WindowsInformationBlock', 'Get-WindowsCollector-DiskSpace', 'Get-LinuxInformationScript', 'Get-LinuxCollector-DiskSpace',
-    'Get-TaskData', 'New-WindowsPostTask-UserRights', 'Get-PostDeployScript')
+    'Edit-UserRight', 'Get-TaskData', 'New-WindowsPostTask-UserRights', 'Get-PostDeployScript')
 $definitions = $ast.FindAll({ param($node)
     ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names) -or
     ($node -is [System.Management.Automation.Language.TypeDefinitionAst] -and $node.Name -eq 'TaskTriggerType') -or

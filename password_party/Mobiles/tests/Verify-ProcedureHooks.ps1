@@ -8,7 +8,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $roo
 if ($errors.Count) { throw ($errors.Message -join '; ') }
 $statements = @($ast.EndBlock.Statements)
 $names = @('Get-LinuxDeploymentUsers', 'Get-LinuxResultHeader', 'Get-LinuxResultFooter', 'ConvertFrom-WindowsDeploymentResult', 'ConvertFrom-LinuxDeploymentResult', 'ConvertTo-MobileLogLines', 'Format-MobileRunEvent', 'Show-MobileRunLog', 'Get-MobileProcedureHooks', 'Write-MobileRunEvent', 'New-MobileRunLog', 'Get-WindowsProcedureHookRunner',
-    'Get-LinuxProcedureHookScript', 'ConvertTo-BashArgument', 'Get-LinuxDeployScript', 'Get-LinuxUnregisterScript',
+    'New-LinuxTask-RestoreSmbBoot', 'Get-LinuxProcedureHookScript', 'ConvertTo-BashArgument', 'Get-LinuxDeployScript', 'Get-LinuxUnregisterScript',
     'New-LinuxTask-LeaveDomain', 'Get-DeploymentTaskSelection', 'Test-DeploymentTaskPlan',
     'Register-MobileDeployment', 'Unregister-Deployment')
 $source = $statements | Where-Object {

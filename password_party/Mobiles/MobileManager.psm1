@@ -36,6 +36,7 @@ $script:Config = [PSCustomObject]@{
     encryptionPin      = $manifestCfg.encryptionPin
     mobileOU           = $manifestCfg.MobileOU
     DeploymentTasks    = $manifestCfg.DeploymentTasks
+    SmbUserName        = $manifestCfg.SmbUserName
     Preflight          = $manifestCfg.Preflight
     NfsHome            = (Join-Path $nfsRoot $env:USERNAME)
     MobileEntries      = (Join-Path $mobileRoot 'entries')
@@ -633,11 +634,11 @@ function Get-UserFullName([string]$UserName, [string]$FullName) {
             }
 
             $first = if ($props.Contains('givenName')) {
-                $props['givenName'][0] 
+                $props['givenName'][0]
             } else { '' }
 
             $last  = if ($props.Contains('sn')) {
-                $props['sn'][0] 
+                $props['sn'][0]
             } else { '' }
 
             $combined = "$first $last".Trim()
@@ -1279,7 +1280,7 @@ function Get-MobileData {
     if ($sections.ContainsKey('users')) {
         $result.MobileUsers = @( $sections['users'] |
                 ConvertFrom-Csv | ForEach-Object {
-                    [PSCustomObject]@{ 
+                    [PSCustomObject]@{
                         Username = $_.username
                         Groups   = if ($_.groups) { $_.groups -split ';' } else { @() }
                         Name = if ($_.fullname) { $_.fullname } else { $_.name }
@@ -1744,13 +1745,13 @@ function Get-WindowsProcedureHookRunner {
                 Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
             }
             $actions.Add([PSCustomObject]@{
-                Category = 'Hook'; Name = $hook.Name
-                Status = if ($exitCode -eq 0) { 'Success' } else { 'Failed' }
-                Details = [PSCustomObject]@{
-                    Sha256 = $hook.Sha256; StartedUtc = $started; CompletedUtc = [datetime]::UtcNow.ToString('o')
-                    ExitCode = $exitCode; Output = $output.Substring(0, [Math]::Min(65536, $output.Length))
-                }
-            })
+                    Category = 'Hook'; Name = $hook.Name
+                    Status = if ($exitCode -eq 0) { 'Success' } else { 'Failed' }
+                    Details = [PSCustomObject]@{
+                        Sha256 = $hook.Sha256; StartedUtc = $started; CompletedUtc = [datetime]::UtcNow.ToString('o')
+                        ExitCode = $exitCode; Output = $output.Substring(0, [Math]::Min(65536, $output.Length))
+                    }
+                })
         }
         [PSCustomObject]@{ Actions = $actions.ToArray(); Failures = $failures.ToArray() }
     }
@@ -1839,100 +1840,287 @@ function Get-WindowsTask-LogArchiver {
     }
 }
 
+
+function Edit-UserRight($cfgText, $RightName, $Sid, $Action) {
+    $secSid = "*$Sid"
+    $pattern = "(?m)^(\s*$([regex]::Escape($RightName))\s*=\s*)([^\r\n]*)"
+    $match = [regex]::Match($cfgText, $pattern)
+    $sids = @($match.Groups[2].Value.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($Action -eq 'Add' -and $secSid -notin $sids) { $sids += $secSid }
+    if ($Action -eq 'Remove') { $sids = @($sids | Where-Object { $_ -ne $secSid }) }
+    $line = "$RightName = " + ($sids -join ',')
+    if ($match.Success) { return [regex]::Replace($cfgText, $pattern, { $line }) }
+    if ($Action -eq 'Add') { return $cfgText.Replace('[Privilege Rights]', "[Privilege Rights]`r`n$line") }
+    return $cfgText
+}
+
+# SMB is enabled only by a nonblank -SmbHost. Credentials stay out of task XML and audit data.
+function Get-MobileSmbCredential([string]$MobileName) {
+    $name = [string]$script:Config.SmbUserName
+    if ($name -notmatch '^[a-zA-Z][a-zA-Z0-9_-]{0,19}$') { throw 'SmbUserName must be a simple local account name (1-20 characters).' }
+    if ($MobileName -notmatch '^[a-zA-Z0-9_-]+$') { throw 'Unsafe mobile name for SMB credentials.' }
+    $path = Join-Path $script:Config.MobileDump "$MobileName.smb.cms"
+    if (Test-Path -LiteralPath $path) {
+        $password = Unprotect-CmsMessage -Path $path -ErrorAction Stop
+    } else {
+        $bytes = New-Object byte[] 32
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+        $password = 'Aa1!' + [Convert]::ToBase64String($bytes)
+        $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object {
+            $_.Subject -like "*$($script:Config.CertName)*" -and $_.HasPrivateKey
+        } | Select-Object -First 1
+        if (-not $cert) { throw 'Deployer certificate is missing.' }
+        Protect-CmsMessage -To $cert -Content $password -OutFile $path -ErrorAction Stop
+    }
+    return [pscredential]::new($name, (ConvertTo-SecureString $password -AsPlainText -Force))
+}
+
+function Get-MobileSmbWindowsNetwork([string[]]$Computers) {
+    # Contact registered computer names over WinRM; the returned IPs are only for SMB mounts.
+    foreach ($computer in $Computers) {
+        $network = Invoke-Command -ComputerName $computer -ErrorAction Stop -ScriptBlock {
+            $ErrorActionPreference = 'Stop'
+            $addresses = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like '10.*' -and -not $_.SkipAsSource })
+            if ($addresses.Count -ne 1) { throw 'SMB requires exactly one primary 10.x IPv4 address.' }
+            $address = $addresses[0]
+            $config = Get-NetIPConfiguration -InterfaceIndex $address.InterfaceIndex
+            [pscustomobject]@{
+                IP = $address.IPAddress; PrefixLength = $address.PrefixLength; InterfaceIndex = $address.InterfaceIndex
+                Gateway = @($config.IPv4DefaultGateway.NextHop)[0]
+                Dns = @((Get-DnsClientServerAddress -InterfaceIndex $address.InterfaceIndex -AddressFamily IPv4).ServerAddresses)
+                Shares = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { $_.DeviceID.TrimEnd(':') })
+            }
+        }
+        if (-not $network -or -not $network.IP -or -not $network.Shares) { throw "No SMB network/drive inventory returned by '$computer'." }
+        $network | Add-Member -NotePropertyName HostName -NotePropertyValue $computer -Force
+        $network
+    }
+}
+
+function New-LinuxFsTabEntry($SMBHost, $IP, $Shares) {
+    if ($SMBHost -notmatch '^[a-zA-Z0-9_.-]+$' -or $IP -notmatch '^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$') { throw 'Invalid SMB host or IPv4 address.' }
+    foreach ($share in $Shares) {
+        if ($share -notmatch '^[A-Z]$') { throw 'SMB drive shares must be single drive letters.' }
+        $mount = "/share/$SMBHost/$share"
+        $entry = "//$IP/$share $mount cifs defaults,_netdev,nofail,sec=ntlmssp,credentials=/etc/security/mobiles-smb.conf 0 0"
+        # Replace only this managed mount; preserve all unrelated fstab entries.
+        $pattern = [regex]::Escape($mount)
+        "sed -i '\|[[:space:]]$pattern[[:space:]]|d' /etc/fstab"
+        'printf ''%s\n'' ' + (ConvertTo-BashArgument $entry) + ' >> /etc/fstab'
+        'mkdir -p ' + (ConvertTo-BashArgument $mount)
+    }
+}
+
+function New-LinuxTask-Smb($Source, [pscredential]$Credential) {
+    $credentials = "username=$($Credential.UserName)`npassword=$($Credential.GetNetworkCredential().Password)`n"
+    $entries = (New-LinuxFsTabEntry -SMBHost $Source.HostName -IP $Source.IP -Shares $Source.Shares) -join "`n"
+    $boot = New-LinuxTask-SmbBoot
+    $script = @'
+# Save the live network as a persistent profile; do not interrupt the current SSH connection.
+smb_details="$(dzdo bash <<'MOBILE_SMB_SETUP'
+set -e
+command -v mount.cifs >/dev/null
+mapfile -t addresses < <(ip -o -4 address show scope global | awk '$4 ~ /^10[.]/ {print $2 " " $4}')
+[[ ${#addresses[@]} -eq 1 ]] || { echo 'SMB requires exactly one primary 10.x IPv4 address.' >&2; exit 1; }
+read -r device address <<< "${addresses[0]}"
+connection="$(nmcli -g GENERAL.CON-UUID device show "$device")"
+[[ -n "$connection" && "$connection" != '--' ]]
+gateway="$(nmcli -g IP4.GATEWAY device show "$device")"
+if [[ "$gateway" == '--' ]]; then gateway=''; fi
+dns="$(nmcli -g IP4.DNS device show "$device" | paste -sd, -)"
+echo "Network: $device $address; connection=$connection; gateway=$gateway; DNS=$dns"
+nmcli connection modify uuid "$connection" ipv4.method manual ipv4.addresses "$address" ipv4.gateway "$gateway" ipv4.dns "$dns"
+umask 077
+install -m 600 /dev/null /etc/security/mobiles-smb.conf
+printf '%s' __CREDENTIALS__ > /etc/security/mobiles-smb.conf
+__ENTRIES__
+__BOOT__
+MOBILE_SMB_SETUP
+)"
+if [[ $? -eq 0 ]]; then
+    record_action 'SMB' 'Offline configuration (reboot required)' 'Prepared' "$(printf '%s' "$smb_details" | jq -Rs .)"
+else
+    record_action 'SMB' 'Offline configuration' 'Failed'
+    record_failure 'SMB preparation failed; review the host network, cifs-utils and boot configuration.'
+fi
+'@
+    return $script.Replace('__CREDENTIALS__', (ConvertTo-BashArgument $credentials)).Replace('__ENTRIES__', $entries).Replace('__BOOT__', $boot).Replace("`r`n", "`n")
+}
+
+function New-LinuxTask-SmbBoot {
+    return @'
+# Keep the normal boot entry intact. No global crypto-policy or initramfs changes.
+if [[ $(cat /proc/sys/crypto/fips_enabled) == 1 ]]; then
+    title='Mobile SMB (fips=0)'
+    if ! grubby --info="TITLE=$title" | grep -q '^index='; then
+        original="$(grubby --default-title)"
+        info="$(grubby --info=DEFAULT)"
+        kernel="$(printf '%s\n' "$info" | sed -n 's/^kernel="\(.*\)"$/\1/p')"
+        initrd="$(printf '%s\n' "$info" | sed -n 's/^initrd="\(.*\)"$/\1/p')"
+        [[ -n "$original" && -n "$kernel" && -n "$initrd" ]]
+        if [[ ! -f /etc/security/mobiles-smb-boot-original ]]; then printf '%s\n' "$original" > /etc/security/mobiles-smb-boot-original; fi
+        echo "Original boot: $original"
+        id="$(printf '%s\n' "$info" | sed -n 's/^id="\(.*\)"$/\1/p')"
+        if [[ -n "$id" && -f "/boot/loader/entries/$id.conf" ]]; then
+            # RHEL 8 BLS: a unique filename avoids overwriting the original kernel's entry.
+            args="$(printf '%s\n' "$info" | sed -n 's/^args="\(.*\)"$/\1/p')"
+            [[ -n "$args" && "$args" != *'$kernelopts'* ]]
+            entry="/boot/loader/entries/$id-mobiles-smb.conf"
+            cp "/boot/loader/entries/$id.conf" "$entry"
+            sed -i -e "s/^title .*/title $title/" -e '/^options /d' "$entry"
+            args="$(printf '%s\n' "$args" | sed -E 's/(^| )fips=[^ ]+//g')"
+            printf 'options %s fips=0\n' "$args" >> "$entry"
+        else
+            # RHEL 7 GRUB: copy the default into a separately titled entry.
+            grubby --add-kernel="$kernel" --initrd="$initrd" --copy-default --title="$title" --args='fips=0'
+        fi
+    fi
+    index="$(grubby --info="TITLE=$title" | sed -n 's/^index=//p')"
+    [[ "$index" =~ ^[0-9]+$ ]]
+    grubby --set-default-index="$index"
+    echo 'Boot: Mobile SMB (fips=0); reboot required, kernel override only.'
+fi
+'@
+}
+
+function New-LinuxTask-RestoreSmbBoot {
+    return @'
+# Restore by title rather than a saved numeric index, which kernel updates can move.
+if [[ -f /etc/security/mobiles-smb-boot-original ]]; then
+    if dzdo bash <<'MOBILE_SMB_RESTORE'
+set -e
+original="$(cat /etc/security/mobiles-smb-boot-original)"
+mobile_index="$(grubby --info='TITLE=Mobile SMB (fips=0)' | sed -n 's/^index=//p')"
+index="$(grubby --info="TITLE=$original" | sed -n 's/^index=//p')"
+if [[ $(grubby --default-title) == 'Mobile SMB (fips=0)' ]]; then
+    [[ "$index" =~ ^[0-9]+$ ]]
+    grubby --set-default-index="$index"
+fi
+if [[ "$mobile_index" =~ ^[0-9]+$ ]]; then grubby --remove-kernel="$mobile_index"; fi
+rm /etc/security/mobiles-smb-boot-original
+MOBILE_SMB_RESTORE
+    then record_action 'SMB' 'Normal boot default (reboot required)' 'Restored'
+    else record_failure 'Could not restore the normal boot default'; fi
+fi
+'@
+}
+
+function New-WindowsPostTask-Smb {
+    return {
+        # Shares are created on every Windows member; Linux mounts only the selected host.
+        try {
+            $ErrorActionPreference = 'Stop'
+            $account = "$env:COMPUTERNAME\$smbUserName"
+            foreach ($drive in $smbNetwork.Shares) {
+                $path = "${drive}:\"
+                $share = Get-SmbShare -Name $drive -ErrorAction SilentlyContinue
+                if ($share -and $share.Path -ne $path) { throw "Share '$drive' already points to another path." }
+                if (-not $share) { New-SmbShare -Name $drive -Path $path -FullAccess $account | Out-Null }
+                Grant-SmbShareAccess -Name $drive -AccountName $account -AccessRight Full -Force | Out-Null
+                icacls $path /grant "${account}:(OI)(CI)M" | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "NTFS access failed for '$path'." }
+            }
+            if (-not (Get-NetFirewallRule -Name 'Mobiles-SMB-In' -ErrorAction SilentlyContinue)) {
+                New-NetFirewallRule -Name 'Mobiles-SMB-In' -DisplayName 'Mobile SMB' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 445 -RemoteAddress '10.0.0.0/8' -Profile Any | Out-Null
+            }
+            record_action 'SMB' 'Drive shares' 'Success'
+        } catch { record_failure "SMB shares: $($_.Exception.Message)"; record_action 'SMB' 'Drive shares' 'Failed' }
+
+        try {
+            # Use the pre-deployment snapshot, even if DHCP is unavailable at this boot.
+            $mask = ((0..3 | ForEach-Object {
+                $bits = [Math]::Min(8, [Math]::Max(0, $smbNetwork.PrefixLength - 8 * $_))
+                [string](256 - [Math]::Pow(2, 8 - $bits))
+            }) -join '.')
+            $gateway = if ($smbNetwork.Gateway) { $smbNetwork.Gateway } else { 'none' }
+            netsh interface ipv4 set address "name=$($smbNetwork.InterfaceIndex)" source=static "address=$($smbNetwork.IP)" "mask=$mask" "gateway=$gateway" store=persistent | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Static IPv4 configuration failed.' }
+            if ($smbNetwork.Dns.Count) { Set-DnsClientServerAddress -InterfaceIndex $smbNetwork.InterfaceIndex -ServerAddresses $smbNetwork.Dns -ErrorAction Stop }
+            record_action 'Network' 'Static IPv4' 'Success' $smbNetwork.IP
+        } catch { record_failure "Static IPv4: $($_.Exception.Message)"; record_action 'Network' 'Static IPv4' 'Failed' }
+    }.ToString()
+}
+
 function New-WindowsPostTask-UserRights {
     return {
         # Task: User Rights
 
 
 
-        $tmpSec = Join-Path -Path $env:TEMP -ChildPath 'sec_export.inf'
-        $tmpDB  = Join-Path -Path $env:TEMP -ChildPath 'sec_temp.sdb'
+        try {
+            $tmpSec = Join-Path -Path $env:TEMP -ChildPath 'sec_export.inf'
+            $tmpDB  = Join-Path -Path $env:TEMP -ChildPath 'sec_temp.sdb'
 
-        secedit /export /cfg $tmpSec /areas USER_RIGHTS /quiet
+            secedit /export /cfg $tmpSec /areas USER_RIGHTS /quiet
+            if ($LASTEXITCODE -ne 0) { throw "Security policy export failed: $LASTEXITCODE" }
 
-        $objUser = [System.Security.Principal.NTAccount]'Authenticated Users'
-        $objSid  = $objUser.Translate( [System.Security.Principal.SecurityIdentifier]).Value
+            $objUser = [System.Security.Principal.NTAccount]'Authenticated Users'
+            $objSid  = $objUser.Translate( [System.Security.Principal.SecurityIdentifier]).Value
 
-        $rights = @(
-            'SeInteractiveLogonRight',
-            'SeRemoteInteractiveLogonRight',
-            'SeNetworkLogonRight'
-        )
-
-        $cfg = Get-Content -Path $tmpSec -Raw -Encoding Unicode
-
-        # Ensure the [Privilege Rights] header exists
-        if ($cfg -notmatch '(?m)^\[Privilege Rights\]') { $cfg += "`r`n[Privilege Rights]`r`n" }
-
-        function Add-PrivilegeRight {
-            param(
-                [string]$ConfigText,
-                [string]$RightName,
-                [string]$RawSid
-            )
-
-            $secSid = "*$RawSid"
-            $pattern = "(?m)^(\s*$([regex]::Escape($RightName))\s*=\s*)([^\r\n]*)"
-
-            $matchResult = [regex]::Match($ConfigText, $pattern)
-
-            if ($matchResult.Success) {
-
-                $existingSids = @( $matchResult.Groups[2].Value.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-
-                if ($secSid -notin $existingSids) {
-
-                    $newValues = @($existingSids + $secSid) -join ','
-
-                    $ConfigText = [regex]::Replace(
-                        $ConfigText,
-                        $pattern,
-                        {
-                            param($match)
-                            $match.Groups[1].Value + $newValues
-                        }
-                    )
-                }
-            } else {
-                $ConfigText = $ConfigText -replace `
-                    '(?m)^\[Privilege Rights\]', `
-                    "[Privilege Rights]`r`n$RightName = $secSid"
+            $smbUserObj = if ([string]::IsNullOrWhiteSpace($smbUserName)) { $null } else {
+                [System.Security.Principal.NTAccount]"$env:COMPUTERNAME\$smbUserName"
             }
 
-            return $ConfigText
-        }
+            $SmbUserSid = $null
+            if ( $smbUserObj ) {
+                $smbUserSid = $smbUserObj.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            }
 
-        # 1. Apply grant rights
-        foreach ($r in $rights) {
-            $cfg = Add-PrivilegeRight `
-                -ConfigText $cfg `
-                -RightName $r `
-                -RawSid $objSid
-        }
 
-        # Write configuration
-        $cfg | Set-Content -Path $tmpSec -Encoding Unicode
+            $rights = @(
+                'SeInteractiveLogonRight',
+                'SeRemoteInteractiveLogonRight',
+                'SeNetworkLogonRight'
+            )
+            $denyRights = @(
+                'SeDenyInteractiveLogonRight',
+                'SeDenyRemoteInteractiveLogonRight',
+                'SeDenyBatchLogonRight'
+            )
 
-        # Apply configuration
-        secedit /configure `
-            /db $tmpDB `
-            /cfg $tmpSec `
-            /areas USER_RIGHTS `
-            /quiet
+            $cfg = Get-Content -Path $tmpSec -Raw -Encoding Unicode
 
-        if ($LASTEXITCODE -eq 0) {
-            record_action 'UserRights' 'LocalSecurityPolicy' 'Success'
-        } else {
+            # Ensure the [Privilege Rights] header exists
+            if ($cfg -notmatch '(?m)^\[Privilege Rights\]') { $cfg += "`r`n[Privilege Rights]`r`n" }
+
+            # 1. Apply grant rights
+            foreach ($r in $rights) {
+                $cfg = Edit-UserRight -cfgText $cfg -RightName $r -Sid $objSid -Action 'Add'
+            }
+            if ($smbUserSid) {
+                $cfg = Edit-UserRight -cfgText $cfg -RightName 'SeNetworkLogonRight' -Sid $smbUserSid -Action 'Add'
+                foreach ($r in $denyRights) {
+                    $cfg = Edit-UserRight -cfgText $cfg -RightName $r -Sid $smbUserSid -Action 'Add'
+                }
+            }
+
+            # Write configuration
+            $cfg | Set-Content -Path $tmpSec -Encoding Unicode
+
+            # Apply configuration
+            secedit /configure `
+                /db $tmpDB `
+                /cfg $tmpSec `
+                /areas USER_RIGHTS `
+                /quiet
+
+            if ($LASTEXITCODE -eq 0) {
+                record_action 'UserRights' 'LocalSecurityPolicy' 'Success'
+            } else {
+                record_action 'UserRights' 'LocalSecurityPolicy' 'Failed'
+                record_failure "User rights configuration failed: exit code $LASTEXITCODE"
+            }
+        } catch {
             record_action 'UserRights' 'LocalSecurityPolicy' 'Failed'
-            record_failure "User rights configuration failed: exit code $LASTEXITCODE"
+            record_failure "User rights configuration failed: $($_.Exception.Message)"
+        } finally {
+            Remove-Item -Path $tmpSec, $tmpDB -Force -ErrorAction SilentlyContinue
         }
-
-        # Cleanup
-        Remove-Item -Path $tmpSec, $tmpDB -Force -ErrorAction SilentlyContinue
     }.ToString()
 }
 
-function Get-PostDeployScript([switch]$UserRights) {
+function Get-PostDeployScript([switch]$UserRights, $SmbNetwork, [string]$SmbUserName) {
     $selected = @(Get-DeploymentTaskSelection -Platform Windows -Phase PostDeployment)
     if (-not $PSBoundParameters.ContainsKey('UserRights')) { $UserRights = 'UserRights' -in $selected }
     $tasks = [System.Collections.Generic.List[string]]::new()
@@ -1968,7 +2156,15 @@ function Get-PostDeployScript([switch]$UserRights) {
                 }
             }).ToString())
 
-    if ($UserRights) { $tasks.Add((New-WindowsPostTask-UserRights)) }
+    $tasks.Add("`$smbUserName = '" + $SmbUserName.Replace("'", "''") + "'")
+    if ($SmbNetwork) {
+        $tasks.Add("`$smbNetwork = '" + ($SmbNetwork | ConvertTo-Json -Compress -Depth 4).Replace("'", "''") + "' | ConvertFrom-Json")
+        $tasks.Add((New-WindowsPostTask-Smb))
+    }
+    if ($UserRights -or $SmbNetwork) {
+        $tasks.Add('function Edit-UserRight {' + ${function:Edit-UserRight}.ToString() + '}')
+        $tasks.Add((New-WindowsPostTask-UserRights))
+    }
 
     $tasks.Add(({
                 "[ Post Deployment Ran - $(Get-Date) ]" |
@@ -1985,7 +2181,7 @@ function Get-PostDeployScript([switch]$UserRights) {
     return ($tasks -join "`n`n")
 }
 
-function Get-TaskData([string]$tasksPath, [bool]$hasLinux) {
+function Get-TaskData([string]$tasksPath, [bool]$hasLinux, $SmbNetwork, [string]$SmbUserName) {
     $selected = @(Get-DeploymentTaskSelection -Platform Windows -Phase Scheduled)
     $postTasks = @(Get-DeploymentTaskSelection -Platform Windows -Phase PostDeployment)
     $taskData = @()
@@ -2003,8 +2199,8 @@ function Get-TaskData([string]$tasksPath, [bool]$hasLinux) {
             }
             'PostDeploy' {
                 # Do not register an otherwise empty post-deployment task.
-                if ('UserRights' -notin $postTasks) { continue }
-                $scriptText = Get-PostDeployScript
+                if ('UserRights' -notin $postTasks -and -not $SmbNetwork) { continue }
+                $scriptText = Get-PostDeployScript -SmbNetwork $SmbNetwork -SmbUserName $SmbUserName
                 $trigger = @{ Type = [TaskTriggerType]::Boot; Delay = 'PT1M' }
                 $xml = New-TaskXML -Description 'Runs after deployment' -Author '[Mobile Administration]' `
                     -Execute 'powershell.exe' -ToEncode $scriptText -TriggerConfigs @($trigger)
@@ -2134,6 +2330,17 @@ $script:WindowsDeployBlock = {
                 Add-Action -Category 'Privilege' -Name $actionName -Status $(if ($success) { 'OK' } else { 'Failed' })
             }
         }
+    }
+
+    if ($payload.SmbCredential) {
+        $success = Invoke-Step -Context 'SMB local account' -Action {
+            $name = $payload.SmbCredential.UserName
+            $parameters = @{ Name = $name; Password = $payload.SmbCredential.Password; PasswordNeverExpires = $true; ErrorAction = 'Stop' }
+            if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { Set-LocalUser @parameters }
+            else { New-LocalUser @parameters -Description 'Mobile SMB access' | Out-Null }
+            Enable-LocalUser -Name $name -ErrorAction Stop
+        }
+        Add-Action -Category 'SMB' -Name $payload.SmbCredential.UserName -Status $(if ($success) { 'Ready' } else { 'Failed' })
     }
 
     #
@@ -2647,7 +2854,9 @@ function Get-LinuxDeployScript {
 
         [array]$Hooks = @(),
         [string]$MobileName,
-        [string]$RunId
+        [string]$RunId,
+        $SmbSource,
+        [pscredential]$SmbCredential
     )
 
     # Resolve users according to metadata priority
@@ -2673,6 +2882,8 @@ function Get-LinuxDeployScript {
     if ($Hooks) {
         $tasks.Add((Get-LinuxProcedureHookScript -Hooks $Hooks -MobileName $MobileName -Procedure 'Check-out' -RunId $RunId))
     }
+
+    if ($SmbSource) { $tasks.Add((New-LinuxTask-Smb -Source $SmbSource -Credential $SmbCredential)) }
 
     if ($Disjoin) {
         if (-not $linuxUsers) { throw 'Domain departure requires at least one Linux account.' }
@@ -2825,6 +3036,8 @@ function Get-LinuxUnregisterScript {
         $tasks.Add(':')
     }
 
+
+    $tasks.Add((New-LinuxTask-RestoreSmbBoot))
 
     if ($linuxUsers) {
         $tasks.Add(
@@ -3411,7 +3624,7 @@ function Get-WindowsScanState {
         if ($task.State -in @('Running','Queued') -or $native -in $activeValues) { $status='Running' }
         elseif ($status -in @('Starting','Running')) {
             $started = if ($current.StartedUtc -is [datetime]) { $current.StartedUtc.ToUniversalTime() }
-                       elseif ($current.StartedUtc) { [DateTimeOffset]::Parse($current.StartedUtc).UtcDateTime } else { [datetime]::MinValue }
+            elseif ($current.StartedUtc) { [DateTimeOffset]::Parse($current.StartedUtc).UtcDateTime } else { [datetime]::MinValue }
             $status = if ($status -eq 'Starting' -and ([datetime]::UtcNow - $started).TotalSeconds -lt 60) { 'Starting' } else { 'Interrupted' }
         }
         if ($Options.StartScan -and $status -notin @('Starting','Running') -and ($Options.Rescan -or $status -eq 'NotStarted')) {
@@ -3426,10 +3639,10 @@ function Get-WindowsScanState {
         }
         $logs = if ($env:ProgramData) {
             @(Get-ChildItem (Join-Path $env:ProgramData 'Symantec\Symantec Endpoint Protection\*\Data\Logs\AV\*') -File -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 3 | ForEach-Object {
-                    $tail=(Get-Content $_.FullName -Tail 40 -ErrorAction SilentlyContinue) -join "`n"
-                    [PSCustomObject]@{ Path=$_.FullName; ModifiedUtc=$_.LastWriteTimeUtc.ToString('o'); Tail=$tail.Substring(0,[Math]::Min(65536,$tail.Length)) }
-                })
+                    Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 3 | ForEach-Object {
+                        $tail=(Get-Content $_.FullName -Tail 40 -ErrorAction SilentlyContinue) -join "`n"
+                        [PSCustomObject]@{ Path=$_.FullName; ModifiedUtc=$_.LastWriteTimeUtc.ToString('o'); Tail=$tail.Substring(0,[Math]::Min(65536,$tail.Length)) }
+                    })
         } else { @() }
         [PSCustomObject]@{ Status=$status; StateDirectory=$root; Current=$current; LastCompleted=$previous; NativeScanStatus=$native; LatestAVLogs=@($logs) }
     } finally { if ($locked) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
@@ -3442,14 +3655,14 @@ function Get-WindowsScanBlock {
     }
     $parts += '$scanWorker = {' + (Get-WindowsScanWorker).ToString() + '}'
     $parts += ({
-        $symantec = Get-SymantecInformation
-        $date = [string]$symantec.DefinitionDate
-        if ($date -match '^(\d{4})[-/](\d{2})[-/](\d{2})(?:$|[ T])') { $date = '{0}-{1}-{2}' -f $Matches[1],$Matches[2],$Matches[3] }
-        elseif ($date -notmatch '^\d{8}$') { $date = '' }
-        try { $scan = Get-WindowsScanState -Options $Options -Worker $scanWorker }
-        catch { $scan = [PSCustomObject]@{ Status='Failed'; Current=[PSCustomObject]@{ Error=$_.Exception.Message } } }
-        [PSCustomObject]@{ HostName=$env:COMPUTERNAME; Platform='Windows'; DefinitionDate=$date; Scan=$scan; Inventory=$symantec }
-    }).ToString()
+            $symantec = Get-SymantecInformation
+            $date = [string]$symantec.DefinitionDate
+            if ($date -match '^(\d{4})[-/](\d{2})[-/](\d{2})(?:$|[ T])') { $date = '{0}-{1}-{2}' -f $Matches[1],$Matches[2],$Matches[3] }
+            elseif ($date -notmatch '^\d{8}$') { $date = '' }
+            try { $scan = Get-WindowsScanState -Options $Options -Worker $scanWorker }
+            catch { $scan = [PSCustomObject]@{ Status='Failed'; Current=[PSCustomObject]@{ Error=$_.Exception.Message } } }
+            [PSCustomObject]@{ HostName=$env:COMPUTERNAME; Platform='Windows'; DefinitionDate=$date; Scan=$scan; Inventory=$symantec }
+        }).ToString()
     [scriptblock]::Create($parts -join "`n")
 }
 
@@ -3640,7 +3853,8 @@ function Get-MobileScanEvidence([string]$Platform, $Observation, $Options) {
         $definitions=$scan.Current.DefinitionVersion -ceq $result.DefinitionVersion
     }
     $scan | Add-Member -NotePropertyMembers @{ Status=$status; ScanBlocked=$blocked
-        Note=$(if ($blocked) { 'Definitions are stale, unknown, or future-dated; use -Force to override.' }) } -Force
+        Note=$(if ($blocked) { 'Definitions are stale, unknown, or future-dated; use -Force to override.' })
+    } -Force
     if ($Platform -eq 'Linux') { $scan | Add-Member -NotePropertyMembers @{ ScopeMatches=$scope; DefinitionsMatch=$definitions } -Force }
     else { $scan | Add-Member -NotePropertyMembers @{ DefinitionAssessment=$definition; Review='SEP completion is not a clean verdict; review native AV logs.' } -Force }
     $name=if ($Platform -eq 'Linux') { 'ClamAV' } else { 'Symantec' }
@@ -3651,7 +3865,8 @@ function Get-MobileScanEvidence([string]$Platform, $Observation, $Options) {
     [PSCustomObject]@{ HostName=$Observation.Target; Platform=$Platform; DefinitionDate=$result.DefinitionDate; ScanStatus=$status
         LastScanStatus=$scan.LastCompleted.Status; LastScanCompletedUtc=$scan.LastCompleted.CompletedUtc
         ScanEvidenceCurrent=($scope -and $definitions); Actions=$actions
-        Failures=@(if ($status -in @('Failed','TimedOut','Interrupted','ThreatsDetected')) { "$name scan: $status. $($scan.Current.Error) $($scan.Current.StdErr)" }) }
+        Failures=@(if ($status -in @('Failed','TimedOut','Interrupted','ThreatsDetected')) { "$name scan: $status. $($scan.Current.Error) $($scan.Current.StdErr)" })
+    }
 }
 
 function Invoke-MobileScan {
@@ -3765,11 +3980,11 @@ function Write-MobileTable([array]$Rows, [string[]]$Properties, [string[]]$Heade
     if (-not $Rows.Count) { return }
     $width = Get-MobileTerminalWidth
     $widths = @(for ($i = 0; $i -lt $Properties.Count; $i++) {
-        $lengths = @($Headers[$i].Length; foreach ($row in $Rows) {
-            foreach ($line in ([string]$row.($Properties[$i]) -split '\r?\n')) { $line.Length }
+            $lengths = @($Headers[$i].Length; foreach ($row in $Rows) {
+                    foreach ($line in ([string]$row.($Properties[$i]) -split '\r?\n')) { $line.Length }
+                })
+            [int]($lengths | Measure-Object -Maximum).Maximum
         })
-        [int]($lengths | Measure-Object -Maximum).Maximum
-    })
     # Leave room for separators, then shrink the widest columns first.
     $available = $width - 3 * ($Properties.Count - 1)
     if ($available -lt 3 * $Properties.Count) {
@@ -3804,11 +4019,11 @@ function Write-MobileTable([array]$Rows, [string[]]$Properties, [string[]]$Heade
         $height = 1
         for ($i = 0; $i -lt $widths.Count; $i++) {
             $wrapped = @(foreach ($line in $lines[$i]) {
-                if (-not $line.Length) { '' }
-                for ($offset = 0; $offset -lt $line.Length; $offset += $widths[$i]) {
-                    $line.Substring($offset, [Math]::Min($widths[$i], $line.Length - $offset))
-                }
-            })
+                    if (-not $line.Length) { '' }
+                    for ($offset = 0; $offset -lt $line.Length; $offset += $widths[$i]) {
+                        $line.Substring($offset, [Math]::Min($widths[$i], $line.Length - $offset))
+                    }
+                })
             $lines[$i] = $wrapped
             $height = [Math]::Max($height, $wrapped.Count)
         }
@@ -3865,18 +4080,18 @@ function Format-HostCollector {
             Write-MobileCenteredText "$family hosts" Cyan
 
             $rows = @(foreach ($hostResult in $hosts) {
-                $values = [ordered]@{}
-                foreach ($column in $columns) {
-                    $values[$column.Header] = if ($column.Getter) { & $column.Getter $hostResult }
-                    elseif ($hostResult.Success -and $null -ne $hostResult.Summary.($column.Property) -and
+                    $values = [ordered]@{}
+                    foreach ($column in $columns) {
+                        $values[$column.Header] = if ($column.Getter) { & $column.Getter $hostResult }
+                        elseif ($hostResult.Success -and $null -ne $hostResult.Summary.($column.Property) -and
                             [string]$hostResult.Summary.($column.Property) -ne '') {
-                        $hostResult.Summary.($column.Property)
-                    } else { '-' }
-                }
-                if (-not $hostResult.Success) { $values['HOST'] += ' [FAILED]' }
-                $values['DisplayColor'] = if ($hostResult.Success) { 'Gray' } else { 'Red' }
-                [pscustomobject]$values
-            })
+                            $hostResult.Summary.($column.Property)
+                        } else { '-' }
+                    }
+                    if (-not $hostResult.Success) { $values['HOST'] += ' [FAILED]' }
+                    $values['DisplayColor'] = if ($hostResult.Success) { 'Gray' } else { 'Red' }
+                    [pscustomobject]$values
+                })
             Write-MobileTable $rows $columns.Header
             $failed = @($hosts | Where-Object { -not $_.Success })
             if ($failed.Count) {
@@ -4103,14 +4318,14 @@ function Get-MobileOverview {
     # --- SECTION: Configured Users ---
     Write-Section -Text 'USERS' -Color DarkYellow
     $userRows = @(foreach ($u in ($data.MobileUsers | Sort-Object Username)) {
-        $hasPassword = -not [string]::IsNullOrWhiteSpace($mobileDumpPath) -and
+            $hasPassword = -not [string]::IsNullOrWhiteSpace($mobileDumpPath) -and
             (Test-Path (Join-Path $mobileDumpPath $u.Username))
-        [pscustomobject]@{
-            Username = $u.Username; Groups = $u.Groups -join ', '; FullName = $u.Name
-            Password = if ($hasPassword) { '[+] SET' } else { '[-] PENDING' }
-            DisplayColor = if ($hasPassword) { 'Green' } else { 'Yellow' }
-        }
-    })
+            [pscustomobject]@{
+                Username = $u.Username; Groups = $u.Groups -join ', '; FullName = $u.Name
+                Password = if ($hasPassword) { '[+] SET' } else { '[-] PENDING' }
+                DisplayColor = if ($hasPassword) { 'Green' } else { 'Yellow' }
+            }
+        })
     Write-MobileTable $userRows @('Username', 'Groups', 'FullName', 'Password') @('USERNAME', 'GROUPS', 'FULL NAME', 'PASSWORD SET')
 
     # --- SECTION: Windows Nodes ---
@@ -4213,7 +4428,8 @@ function Register-MobileDeployment {
         [switch]$Disjoin,
         [string]$LinuxDisjoinKeytab,
         [string]$DomainPrincipal,
-        [int]$DomainKeyVersion = 0
+        [int]$DomainKeyVersion = 0,
+        [string]$SmbHost
     )
 
     $run = New-MobileRunLog -MobileName $MobileName -Procedure 'Check-out'
@@ -4230,13 +4446,24 @@ function Register-MobileDeployment {
         Write-MobileRunEvent -Run $run -Event 'EnvironmentCheckStarted' -Data @{ ReadOnly = $true }
         Assert-MobileEnvironment -Linux:($mobileData.Linux.Count -gt 0)
         Write-MobileRunEvent -Run $run -Event 'EnvironmentCheckCompleted' -Data @{ Success = $true; ReadOnly = $true }
+        $smbCredential = $null; $smbNetworks = @(); $smbSource = $null
+        if (-not [string]::IsNullOrWhiteSpace($SmbHost)) {
+            $SmbHost = $SmbHost.Trim()
+            if ($SmbHost -notin @($mobileData.Windows)) { throw "SmbHost '$SmbHost' must be a Windows computer in this mobile." }
+            if ('PostDeploy' -notin @(Get-DeploymentTaskSelection -Platform Windows -Phase Scheduled)) { throw 'SMB requires the PostDeploy scheduled task.' }
+            if ($script:Config.SmbUserName -in @($mobileData.AllUsers.Name)) { throw 'SmbUserName conflicts with a deployment user.' }
+            $smbNetworks = @(Get-MobileSmbWindowsNetwork -Computers $mobileData.Windows)
+            $smbSource = $smbNetworks | Where-Object HostName -eq $SmbHost
+            $smbCredential = Get-MobileSmbCredential -MobileName $MobileName
+            Write-MobileRunEvent -Run $run -Event 'SmbInventory' -Data @{ Source = $SmbHost; UserName = $smbCredential.UserName; Windows = $smbNetworks }
+        }
         if ($Disjoin -and $mobileData.Linux.Count -gt 0) {
             $LinuxDisjoinKeytab = Resolve-LinuxDisjoinKeytab -Keytab $LinuxDisjoinKeytab `
                 -Principal $DomainPrincipal -Kvno $DomainKeyVersion
         }
         $mobileData.AllUsers  = Get-UserCreds -MobileName $MobileName -AllUsers $mobileData.AllUsers -mobileDumpPath $mobileDump
         $taskData = @()
-        if (@($mobileData.Windows).Count -gt 0) {
+        if (@($mobileData.Windows).Count -gt 0 -and -not $smbCredential) {
             $taskData = @(Get-TaskData -hasLinux:$($mobileData.Linux.Count -gt 0))
         }
 
@@ -4246,6 +4473,7 @@ function Register-MobileDeployment {
             taskData = @($taskData)
             MobileName = $MobileName
             Disjoin = $disJoin
+            SmbCredential = $null
             Bitlocker = $defaultPin
             ProvisioningTasks = $provisioningTasks
             Hooks = $windowsHooks
@@ -4258,12 +4486,20 @@ function Register-MobileDeployment {
         $winErrors = [System.Collections.Generic.List[object]]::new()
         $rawWindows = @()
         if (@($mobileData.Windows).Count -gt 0) {
-            $rawWindows = Invoke-Command `
-                -ComputerName $mobileData.Windows `
-                -ScriptBlock $Script:WindowsDeployBlock `
-                -ArgumentList $windowsPayload `
-                -ErrorVariable winErrors `
-                -ErrorAction SilentlyContinue
+            if ($smbCredential) {
+                $rawWindows = @(foreach ($network in $smbNetworks) {
+                    $windowsPayload.SmbCredential = $smbCredential
+                    $windowsPayload.TaskData = @(Get-TaskData -hasLinux:($mobileData.Linux.Count -gt 0) -SmbNetwork $network -SmbUserName $smbCredential.UserName)
+                    Invoke-Command -ComputerName $network.HostName -ScriptBlock $script:WindowsDeployBlock -ArgumentList $windowsPayload -ErrorVariable +winErrors -ErrorAction SilentlyContinue
+                })
+            } else {
+                $rawWindows = Invoke-Command `
+                    -ComputerName $mobileData.Windows `
+                    -ScriptBlock $Script:WindowsDeployBlock `
+                    -ArgumentList $windowsPayload `
+                    -ErrorVariable winErrors `
+                    -ErrorAction SilentlyContinue
+            }
         }
 
 
@@ -4273,8 +4509,10 @@ function Register-MobileDeployment {
         $linResults = @()
         foreach ($result in $winResults) { Write-MobileRunEvent -Run $run -Event 'HostResult' -Data $result }
 
+        if ($smbCredential -and @($winResults | Where-Object { -not $_.Success }).Count) { throw 'Windows SMB preparation failed; Linux deployment was not started.' }
         if ($mobileData.Linux.Count -gt 0) {
             $linSplat = @{ allUsers = $mobileData.AllUsers; Hooks = $linuxHooks; MobileName = $MobileName; RunId = $run.Id }
+            if ($smbSource) { $linSplat.SmbSource = $smbSource; $linSplat.SmbCredential = $smbCredential }
             if ($disjoin) {
                 $linSplat['disjoin'] = $true
                 $linSplat['b64kt'] = $LinuxDisjoinKeytab

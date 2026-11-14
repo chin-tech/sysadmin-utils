@@ -15,7 +15,7 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
         $source += "`nfunction $name {" + @'
     [CmdletBinding()]
     param([string]$MobileName, [switch]$Full, [switch]$Archive, [switch]$Disjoin,
-        [string]$LinuxDisjoinKeytab, [string]$DomainPrincipal, [int]$DomainKeyVersion,
+        [string]$SmbHost, [string]$LinuxDisjoinKeytab, [string]$DomainPrincipal, [int]$DomainKeyVersion,
         [switch]$Rescan,
         [switch]$Add, [switch]$Remove, [switch]$Force, [switch]$Console)
     [pscustomobject]@{ Command=$MyInvocation.MyCommand.Name; Options=@{} + $PSBoundParameters; Config=$script:configuration }
@@ -42,7 +42,7 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
     # Exercise discovery before the first invocation: no module/config/site work is needed.
     Assert-Completion '-' @('-Info','-RegisterDeployment','-UnRegisterDeployment','-Scan','-New','-GPO','-Name','-Full')
     Assert-Completion '-Scan fixture -' @('-Rescan','-Force')
-    Assert-Completion '-RegisterDeployment fixture -' @('-Disjoin','-LinuxDisjoinKeytab','-DomainPrincipal','-DomainKeyVersion')
+    Assert-Completion '-RegisterDeployment fixture -' @('-SmbHost','-Disjoin','-LinuxDisjoinKeytab','-DomainPrincipal','-DomainKeyVersion')
     Assert-Completion '-UnRegisterDeployment fixture -' @('-Archive')
     Assert-Completion '-Info fixture -' @('-Full')
     Assert-Completion '-GPO fixture -' @('-Add','-Remove','-Force')
@@ -67,6 +67,11 @@ function Set-MobileConfig { param($Overrides) $script:configuration = $Overrides
     Assert (-not $result.Options.ContainsKey('Force') -and -not $result.Options.ContainsKey('Rescan')) 'Omitted scan controls were forwarded'
     $result = & $cli -RegisterDeployment fixture -Disjoin -LinuxDisjoinKeytab fixture-keytab -DomainPrincipal admin -DomainKeyVersion 3
     Assert ($result.Command -eq 'Register-MobileDeployment' -and $result.Options.Disjoin -and $result.Options.LinuxDisjoinKeytab -eq 'fixture-keytab' -and $result.Options.DomainPrincipal -eq 'admin' -and $result.Options.DomainKeyVersion -eq 3) 'Check-out options were not forwarded'
+    $result = & $cli -RegisterDeployment fixture -SmbHost WIN01
+    Assert ($result.Options.SmbHost -eq 'WIN01') 'SMB host was not forwarded'
+    $result = & $cli -RegisterDeployment fixture -SmbHost ''
+    Assert ($result.Options.SmbHost -eq '') 'Blank SMB host was not preserved'
+    Assert-Rejected @{ Scan=$true; Name='fixture'; SmbHost='WIN01' }
     $result = & $cli -UnRegisterDeployment fixture -Archive
     Assert ($result.Command -eq 'Unregister-Deployment' -and $result.Options.Archive) 'Check-in dispatch changed'
     $result = & $cli -GPO -Add fixture

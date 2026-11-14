@@ -37,6 +37,7 @@ dynamicparam {
     $options = switch ($mode) {
         'Info' { [ordered]@{ Full = [switch] } }
         'RegisterDeployment' { [ordered]@{
+            SmbHost = [string]
             Disjoin = [switch]
             LinuxDisjoinKeytab = [string]
             DomainPrincipal = [string]
@@ -91,7 +92,7 @@ end {
             Invoke-MobileScan -MobileName $Name @commandOptions
         }
         'RegisterDeployment' {
-            foreach ($option in @('Disjoin', 'LinuxDisjoinKeytab', 'DomainPrincipal', 'DomainKeyVersion')) {
+            foreach ($option in @('SmbHost', 'Disjoin', 'LinuxDisjoinKeytab', 'DomainPrincipal', 'DomainKeyVersion')) {
                 if ($PSBoundParameters.ContainsKey($option)) { $commandOptions[$option] = $PSBoundParameters[$option] }
             }
             Register-MobileDeployment -MobileName $Name @commandOptions
