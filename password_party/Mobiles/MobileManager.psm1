@@ -2373,7 +2373,7 @@ $script:WindowsDeployBlock = {
                 ErrorAction = 'Stop'
             }
 
-            if ($tpm.IsPresent -and $tpm.IsEnabled) {
+            if ($tpm.TpmPresent -and $tpm.TpmEnabled) {
                 $bitLockerParams.TpmAndPinProtector = $true
                 $bitLockerParams.Pin = ConvertTo-SecureString  -String $payload.Bitlocker  -AsPlainText  -Force
             } else {
@@ -2383,7 +2383,14 @@ $script:WindowsDeployBlock = {
 
             $success = Invoke-Step  -Context "BitLocker '$($drive.MountPoint)'"  -Action { Enable-BitLocker @bitLockerParams }
 
-            Add-Action  -Category 'DiskEncryption'  -Name $drive.MountPoint  -Status $(if ($success) { 'Changed' } else { 'Failed' })
+            Add-Action  -Category 'DiskEncryption'  -Name $drive.MountPoint  -Status $(if ($success) { 'Changed' } else { 'Failed' }) -Details @{
+                BeforeVolumeStatus = [string]$drive.VolumeStatus
+                BeforeProtectionStatus = [string]$drive.ProtectionStatus
+                BeforeEncryptionPercentage = $drive.EncryptionPercentage
+                TpmPresent = $tpm.TpmPresent
+                TpmEnabled = $tpm.TpmEnabled
+                ProtectorRequested = if ($bitLockerParams.TpmAndPinProtector) { 'TpmPin' } else { 'Password' }
+            }
         }
     }
 

@@ -99,7 +99,7 @@ legacy,,Legacy User
         }
         function Add-LocalGroupMember { [CmdletBinding()] param($Group, $Member) }
         function Get-BitLockerVolume { $script:encryptionQueries++ }
-        function Get-Tpm { [pscustomobject]@{ IsPresent = $false; IsEnabled = $false } }
+        function Get-Tpm { [pscustomobject]@{ TpmPresent = $false; TpmEnabled = $false } }
         function Remove-Computer { [CmdletBinding()] param($WorkGroupName, [switch]$Force, $Restart) $script:departures++ }
         $payload = [pscustomobject]@{
             ProvisioningTasks = @('Users', 'PasswordExpiry', 'Groups', 'BitLocker')
@@ -127,6 +127,29 @@ legacy,,Legacy User
         $script:departures = 0
         $result = & $script:WindowsDeployBlock $payload
         Assert ($script:departures -eq 0 -and -not $result.Success) 'Disabling provisioning bypassed mandatory verification'
+
+        # Get-Tpm uses TpmPresent/TpmEnabled; the wrong property names silently choose Password.
+        function Get-BitLockerVolume {
+            [pscustomobject]@{ VolumeType='OperatingSystem'; MountPoint='C:'; VolumeStatus='FullyDecrypted'; ProtectionStatus='Off'; EncryptionPercentage=0 }
+        }
+        function Get-Tpm { [pscustomobject]@{ TpmPresent=$script:hasTpm; TpmEnabled=$script:hasTpm } }
+        function Enable-BitLocker {
+            [CmdletBinding()] param($MountPoint,[switch]$TpmAndPinProtector,$Pin,[switch]$PasswordProtector,$Password)
+            $script:protector = if ($TpmAndPinProtector) { 'TpmPin' } elseif ($PasswordProtector) { 'Password' }
+            if ($script:bitlockerFails) { throw 'The specified directory object has not been modified' }
+        }
+        $payload.ProvisioningTasks=@('BitLocker')
+        $payload.Disjoin=$false
+        $payload | Add-Member -NotePropertyName Bitlocker -NotePropertyValue 'fixture-pin'
+        foreach ($hasTpm in @($true,$false)) {
+            $script:hasTpm=$hasTpm
+            $result = & $script:WindowsDeployBlock $payload
+            Assert ($result.Success -and $script:protector -eq $(if ($hasTpm) { 'TpmPin' } else { 'Password' })) 'Wrong BitLocker protector selected for TPM state'
+        }
+        $script:bitlockerFails=$true
+        $result = & $script:WindowsDeployBlock $payload
+        Assert (-not $result.Success -and $result.Failures[0] -like '*directory object*') 'BitLocker error was hidden'
+        Assert ($result.Actions[0].Details.BeforeVolumeStatus -eq 'FullyDecrypted' -and $result.Actions[0].Details.ProtectorRequested -eq 'Password') 'BitLocker failure audit omitted its state/protector'
 
         function New-LinuxTask-CreateDirectory { '# create directory' }
         function New-LinuxTask-AddUsers { param($Users, $HomeBase) '# account creation marker' }
