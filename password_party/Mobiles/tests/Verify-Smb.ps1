@@ -184,10 +184,14 @@ record_failure() { echo "$@" >&2; exit 1; }
             if ($ArgumentList.SmbCredential) {
                 Assert ($ArgumentList.TaskData[0].Host -eq $ComputerName -and $ArgumentList.SmbCredential.UserName -eq 'mobile-smb-access') 'Host-specific task/credential was not forwarded'
             }
-            foreach ($name in $ComputerName) { [pscustomobject]@{ PSComputerName=$name; Success=$true; Actions=@(); Failures=@() } }
+            foreach ($name in $ComputerName) {
+                [pscustomobject]@{ PSComputerName=$name; HostName=$name
+                    Success=(-not $script:windowsFailure); Actions=@(); Failures=@($script:windowsFailure) }
+            }
         }
         function ConvertFrom-WindowsDeploymentResult { param($Results,$Computers,$TransportErrors) $Results }
         function Get-LinuxDeployScript { param($allUsers,$Hooks,$MobileName,$RunId,$SmbSource,$SmbCredential)
+            $script:linuxCalls++
             $script:linuxSmbSource=$SmbSource
             if ($SmbSource) { Assert ($SmbSource.HostName -eq 'WIN01' -and $SmbCredential.UserName -eq 'mobile-smb-access') 'Selected source/credential was not forwarded to Linux' }
             'fixture'
@@ -201,6 +205,13 @@ record_failure() { echo "$@" >&2; exit 1; }
         $script:visited=@()
         Register-MobileDeployment fixture -SmbHost ' '
         Assert ($script:visited.Count -eq 2 -and $null -eq $script:linuxSmbSource) 'Blank SMB host did not skip optional preparation'
+        $before=$script:linuxCalls
+        $script:windowsFailure='BitLocker: fixture failure'
+        $message=''
+        try { Register-MobileDeployment fixture -SmbHost WIN01 } catch { $message=$_.Exception.Message }
+        Assert ($message.Contains('WIN01: BitLocker: fixture failure') -and $message.Contains('WIN02: BitLocker: fixture failure')) 'Windows gate hid host names or underlying failures'
+        Assert ($message.StartsWith('Windows deployment failed;') -and $script:linuxCalls -eq $before) 'Gate mislabeled a general failure as SMB-specific or started Linux'
+        $script:windowsFailure=$null
         $script:visited=@(); $rejected=$false
         try { Register-MobileDeployment fixture -SmbHost misspelled } catch { $rejected=$true }
         Assert ($rejected -and $script:visited.Count -eq 0) 'Invalid SMB host reached deployment'
