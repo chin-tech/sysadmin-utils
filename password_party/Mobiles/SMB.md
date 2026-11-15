@@ -21,7 +21,7 @@ Omit `-SmbHost`, or pass an empty/whitespace value, to skip SMB preparation. The
 
 Reboot/disconnect remains an operator action. Preparation is reported as **Prepared**, not as successful live mounting. If Windows shares were unavailable when Linux booted, retry the relevant mounts locally after Windows is ready; `nofail` allows Linux boot to continue.
 
-Windows boot results remain in `C:\Post-Deployment.xml`, as with the existing post task. The controller journal records task registration and Linux preparation; it cannot assert that a later offline boot task completed. Windows deployment failures stop Linux SMB deployment from proceeding.
+Windows boot results remain in `C:\Post-Deployment.xml`, as with the existing post task. The controller journal records task registration and Linux preparation; it cannot assert that a later offline boot task completed. Windows host failures are logged and displayed while Linux deployment continues independently. Any failed host keeps the overall result failed. Each host still blocks its own domain departure if its local preparation fails. Linux preparation does not establish that the Windows shares will be available after reboot.
 
 ## Returning to the domain
 

@@ -164,7 +164,10 @@ record_failure() { echo "$@" >&2; exit 1; }
         }
         # Exercise controller wiring without remoting, keys, account changes or actual task registration.
         function New-MobileRunLog { param($MobileName,$Procedure) [pscustomobject]@{ Id='fixture'; Path='fixture'; ReadablePath='fixture' } }
-        function Write-MobileRunEvent { param($Run,$Event,$Data) }
+        $script:events=@()
+        function Write-MobileRunEvent { param($Run,$Event,$Data)
+            $script:events += [pscustomobject]@{ Event=$Event; Data=$Data }
+        }
         function Get-MobileProcedureHooks { param($Procedure) @() }
         function Get-WindowsProcedureHookRunner { { } }
         function Get-MobileData { param($MobileName) [pscustomobject]@{ Windows=@('WIN01','WIN02'); Linux=@('linux'); AllUsers=@() } }
@@ -198,7 +201,7 @@ record_failure() { echo "$@" >&2; exit 1; }
         }
         function Invoke-Linux { param($Computers,$Script,$KeyPath) [pscustomobject]@{ Success=$true } }
         function ConvertFrom-LinuxDeploymentResult { param($Results) $Results }
-        function Format-DeploymentResults { param($results,$allUsers) }
+        function Format-DeploymentResults { param($results,$allUsers) $script:displayedResults=@($results) }
         $script:visited=@()
         Register-MobileDeployment fixture -SmbHost WIN01
         Assert (($script:visited -join ',') -eq 'WIN01,WIN02' -and $script:linuxSmbSource.HostName -eq 'WIN01') 'SMB deployment missed Windows members or the selected source'
@@ -207,10 +210,13 @@ record_failure() { echo "$@" >&2; exit 1; }
         Assert ($script:visited.Count -eq 2 -and $null -eq $script:linuxSmbSource) 'Blank SMB host did not skip optional preparation'
         $before=$script:linuxCalls
         $script:windowsFailure='BitLocker: fixture failure'
-        $message=''
-        try { Register-MobileDeployment fixture -SmbHost WIN01 } catch { $message=$_.Exception.Message }
-        Assert ($message.Contains('WIN01: BitLocker: fixture failure') -and $message.Contains('WIN02: BitLocker: fixture failure')) 'Windows gate hid host names or underlying failures'
-        Assert ($message.StartsWith('Windows deployment failed;') -and $script:linuxCalls -eq $before) 'Gate mislabeled a general failure as SMB-specific or started Linux'
+        $script:events=@()
+        Register-MobileDeployment fixture -SmbHost WIN01
+        Assert ($script:linuxCalls -eq ($before + 1)) 'Windows failure prevented Linux deployment'
+        Assert ($script:displayedResults.Count -eq 3 -and -not $script:displayedResults[0].Success -and $script:displayedResults[2].Success) 'Mixed Windows/Linux results were not displayed'
+        $hostEvents=@($script:events | Where-Object Event -eq HostResult)
+        Assert ($hostEvents.Count -eq 3 -and $hostEvents[0].Data.Failures[0] -eq 'BitLocker: fixture failure') 'Continuing Linux lost the original Windows failure'
+        Assert ($script:events[-1].Event -eq 'RunCompleted' -and -not $script:events[-1].Data.Success) 'Mixed results incorrectly marked the run successful'
         $script:windowsFailure=$null
         $script:visited=@(); $rejected=$false
         try { Register-MobileDeployment fixture -SmbHost misspelled } catch { $rejected=$true }

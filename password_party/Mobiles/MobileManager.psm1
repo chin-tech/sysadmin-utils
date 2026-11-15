@@ -4516,15 +4516,7 @@ function Register-MobileDeployment {
         $linResults = @()
         foreach ($result in $winResults) { Write-MobileRunEvent -Run $run -Event 'HostResult' -Data $result }
 
-        $failedWindows = @($winResults | Where-Object { -not $_.Success })
-        if ($smbCredential -and $failedWindows.Count) {
-            $failureDetails = foreach ($result in $failedWindows) {
-                $messages = @($result.Failures | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-                if (-not $messages.Count) { $messages = @('Host reported failure without diagnostic details; inspect its HostResult in the audit log.') }
-                foreach ($message in $messages) { "$($result.HostName): $message" }
-            }
-            throw ("Windows deployment failed; Linux deployment was not started.`n" + ($failureDetails -join "`n"))
-        }
+        # Host failures remain in the results; other hosts/platforms still get their deployment attempt.
         if ($mobileData.Linux.Count -gt 0) {
             $linSplat = @{ allUsers = $mobileData.AllUsers; Hooks = $linuxHooks; MobileName = $MobileName; RunId = $run.Id }
             if ($smbSource) { $linSplat.SmbSource = $smbSource; $linSplat.SmbCredential = $smbCredential }
