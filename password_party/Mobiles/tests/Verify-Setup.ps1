@@ -16,7 +16,7 @@ try {
     @'
 function Initialize-Environment {
     [CmdletBinding()]
-    param([switch]$Console,[switch]$HaltOnError,[switch]$ForceGpoRefresh)
+    param([switch]$Console,[switch]$HaltOnError,[switch]$ForceGpoRefresh,[switch]$DryRun)
     [pscustomobject]@{ Config=$script:Config; Options=@{}+$PSBoundParameters }
 }
 '@ | Set-Content (Join-Path $fixture 'Setup/MobileEnvironment.ps1')
@@ -27,6 +27,10 @@ function Initialize-Environment {
     Assert ($result.Options.ForceGpoRefresh) 'Forced GPO refresh was not forwarded'
     $result = & (Join-Path $fixture 'Initialize-Mobiles.ps1') -ForceGpoRefresh:$false
     Assert (-not $result.Options.ForceGpoRefresh) 'Explicit false GPO refresh was enabled'
+    $result = & (Join-Path $fixture 'Initialize-Mobiles.ps1') -DryRun -ForceGpoRefresh -ConfigOverride @{Priority='preview'}
+    Assert ($result.Options.DryRun -and $result.Options.ForceGpoRefresh -and $result.Config.Priority -eq 'preview') 'Dry-run/force/configuration options were not forwarded'
+    $result = & (Join-Path $fixture 'Initialize-Mobiles.ps1') -DryRun:$false
+    Assert (-not $result.Options.DryRun) 'Explicit false dry run was enabled'
     Assert (-not (Get-Command Initialize-Environment -ErrorAction SilentlyContinue)) 'Setup function escaped into the public session'
     $manifest = Import-PowerShellDataFile (Join-Path $root 'MobileManager.psd1')
     Assert ('Initialize-Environment' -notin $manifest.FunctionsToExport) 'Setup is still exported by the manager'
@@ -128,6 +132,36 @@ function Initialize-Environment {
             Assert $script:forced 'Initializer did not forward forced GPO refresh'
             Assert (Initialize-Environment @options -ForceGpoRefresh:$false -HaltOnError) 'Normal initializer failed'
             Assert (-not $script:forced) 'Normal initializer enabled forced refresh'
+            # A dry run must not reach any write/provisioning/password boundary.
+            $script:Config = [pscustomobject]@{ GpoID='00000000-0000-0000-0000-000000000123'; AdminRoot='admin'; fallbackPass='secret-that-must-not-be-shown' }
+            function Test-AndFixDirectories { throw 'Dry run created directories' }
+            function Test-AndFixSshEnvironment { throw 'Dry run changed SSH' }
+            function Test-AndFixDeployerCert { throw 'Dry run changed certificates' }
+            function New-ShortcutGPO { throw 'Dry run published a GPO' }
+            function New-Item { throw 'Dry run wrote to disk' }
+            function Set-Content { throw 'Dry run wrote a file' }
+            function Read-Host { throw 'Dry run prompted for a password' }
+            function Test-Path { param($LiteralPath) $LiteralPath -eq 'home' }
+            function Get-MobileGpoContext { param($GpoID,$OUName)
+                if ($script:offline) { throw 'fixture domain unavailable' }
+                [pscustomobject]@{ DistinguishedName='fixture-DN'; Path='fixture-DC-SYSVOL'; ClientPath='fixture-domain-SYSVOL' }
+            }
+            $oldProfile=$env:USERPROFILE; $env:USERPROFILE=$root
+            try {
+                $plan=Initialize-Environment @options -OUPath 'fixture-ou' -CertName 'fixture-cert' -DryRun
+                Assert ($plan.DryRun -and $plan.Configuration.SshKeyPath -eq 'key' -and $plan.Configuration.OU -eq 'fixture-ou') 'Dry run did not show effective initialization parameters'
+                Assert ($plan.Configuration.GpoWritePath -eq 'fixture-DC-SYSVOL' -and $plan.Configuration.GpoClientPath -eq 'fixture-domain-SYSVOL') 'Dry run omitted discovered GPO targets'
+                Assert (($plan.Actions | Where-Object Component -eq 'Directory:NfsHome').Action -eq 'Keep existing directory') 'Dry run misreported an existing directory'
+                Assert (($plan.Actions | Where-Object Component -eq 'Directory:MobileDump').Action -eq 'Create directory') 'Dry run misreported a missing directory'
+                Assert (-not ($plan | ConvertTo-Json -Depth 6).Contains('secret-that-must-not-be-shown')) 'Dry run exposed unrelated deployment secrets'
+                $forced=Initialize-Environment @options -DryRun -ForceGpoRefresh
+                Assert ($forced.Configuration.ForceGpoRefresh -and ($forced.Actions | Where-Object Component -eq GPO).Action.Contains('Back up')) 'Forced dry run omitted backup/refresh behavior'
+                $script:offline=$true
+                $offline=Initialize-Environment @options -DryRun
+                Assert ($offline.DryRun -and ($offline.Notes -join ' ').Contains('fixture domain unavailable')) 'Offline dry run failed or pretended to resolve GPO targets'
+                $rendered=(Initialize-Environment @options -DryRun -Console 6>&1 | Out-String)
+                Assert ($rendered.Contains('Initialization dry run') -and $rendered.Contains('SshKeyPath') -and $rendered.Contains('fixture domain unavailable')) 'Console dry run omitted values or unresolved targets'
+            } finally { $env:USERPROFILE=$oldProfile }
         } $root
     } finally {Remove-Module $module -ErrorAction SilentlyContinue}
     'PASS: separate setup entry point, configuration precedence, private helpers, read-only prerequisites, no-op SSH ACL checks, ACL failure handling and missing-setup guidance.'

@@ -204,11 +204,12 @@ function Initialize-Environment {
         [Parameter()][string]$OUPath        = $Script:Config.MobileOU,
         [Parameter()][string]$CertName      = $(if ($Script:Config.CertName) { $Script:Config.CertName } else { 'MobileDeployer' }),
         [Parameter()][switch]$ForceGpoRefresh,
+        [Parameter()][switch]$DryRun,
         [Parameter()][switch]$HaltOnError,
         [Parameter()][switch]$Console
     )
 
-    if ($console) { Write-Host "`n[+] Executing System Requirements & Provisioning..." -ForegroundColor Cyan }
+    if ($console -and -not $DryRun) { Write-Host "`n[+] Executing System Requirements & Provisioning..." -ForegroundColor Cyan }
     $results = [System.Collections.Generic.List[object]]::new()
 
     # 1. Directory Structure Mapping
@@ -218,6 +219,49 @@ function Initialize-Environment {
         'MobileDump'    = $MobileDump
         'MobileEntries' = $MobileEntries
     }
+    if ($DryRun) {
+        # Read-only preview: do not call any provisioning helper or request passwords.
+        $configuration = [ordered]@{
+            Operator = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
+            NfsHome = $NfsHome; AdminRoot = $AdminRoot; MobileDump = $MobileDump; MobileEntries = $MobileEntries
+            LocalSshDirectory = Join-Path $env:USERPROFILE '.ssh'
+            SshKeyPath = $SshKeyPath; SshPublicKeyPath = "$SshKeyPath.pub"
+            AuthorizedKeys = Join-Path (Join-Path $NfsHome '.ssh') 'authorized_keys'
+            CertName = $CertName; CertStore = 'Cert:\CurrentUser\My'
+            PfxFile = Join-Path $AdminRoot "$CertName.pfx"
+            CerFile = Join-Path $AdminRoot "$CertName.cer"
+            LogonTemplate = Join-Path (Split-Path $PSScriptRoot -Parent) 'MobileLogon.ps1'
+            GpoID = $script:Config.GpoID; OU = $OUPath; ForceGpoRefresh = [bool]$ForceGpoRefresh
+            GpoBackupRoot = Join-Path $script:Config.AdminRoot ('GpoBackups/' + ([guid]$script:Config.GpoID).ToString('B').ToUpperInvariant())
+        }
+        $actions = @(
+            foreach ($name in ($requiredPaths.Keys | Sort-Object)) {
+                [pscustomobject]@{ Component="Directory:$name"; Action=if (Test-Path -LiteralPath $requiredPaths[$name]) { 'Keep existing directory' } else { 'Create directory' }; Target=$requiredPaths[$name] }
+            }
+            [pscustomobject]@{ Component='SSH'; Action='Create missing .ssh directories/keypair; enroll the public key if absent; repair differing ACLs for the operator (directories FullControl, files Read; inheritance removed). Existing keys are reused.'; Target=$SshKeyPath }
+            [pscustomobject]@{ Component='Certificate'; Action='Reuse a matching current-user certificate; otherwise import the existing PFX (password prompt during apply), or create/export a document-encryption certificate and PFX/CER files.'; Target=$configuration.PfxFile }
+            [pscustomobject]@{ Component='GPO'; Action=if ($ForceGpoRefresh) { 'Back up managed state, republish managed scripts/shortcuts and advance the user revision, including unchanged content; repair mismatched/malformed managed state where supported.' } else { 'Create/repair changed managed scripts/shortcuts and metadata; advance the user revision only on publication; unchanged healthy content is preserved. Invalid/mismatched state stops publication.' }; Target=$script:Config.GpoID }
+            [pscustomobject]@{ Component='GPO link'; Action='Add the configured OU link if missing; preserve existing link settings and unrelated policy content.'; Target=$OUPath }
+        )
+        $notes = @('Conditional actions depend on the state at execution time; this preview does not compute a GPO content diff or certify permissions/readiness.',
+            'GPO writes: CreateLocalAccounts.ps1 (logon template with public certificate), Run.ps1, User/Preferences/Shortcuts/Shortcuts.xml, gpt.ini and AD metadata; a publication marker exists during writes.')
+        try {
+            $context = Get-MobileGpoContext $script:Config.GpoID $OUPath
+            $configuration.GpoDirectory = $context.DistinguishedName
+            $configuration.GpoOuPath = $context.OU.Path
+            $configuration.GpoWritePath = $context.Path
+            $configuration.GpoClientPath = $context.ClientPath
+        } catch { $notes += "Read-only GPO discovery unavailable: $($_.Exception.Message). Domain/DC/SYSVOL targets will be resolved during apply." }
+        $plan = [pscustomobject]@{ DryRun=$true; Configuration=[pscustomobject]$configuration; Actions=$actions; Notes=$notes }
+        if ($Console) {
+            Write-Host "`n[+] Initialization dry run - no setup changes will be made." -ForegroundColor Cyan
+            Write-Host ($plan.Configuration | Format-List | Out-String)
+            Write-Host ($plan.Actions | Format-List | Out-String)
+            foreach ($note in $notes) { Write-Host $note }
+        }
+        return $plan
+    }
+
     $results.AddRange((Test-AndFixDirectories -PathMap $requiredPaths))
 
     # 2. SSH Environment

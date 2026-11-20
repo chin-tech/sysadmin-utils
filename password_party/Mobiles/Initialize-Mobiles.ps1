@@ -6,9 +6,10 @@ Run explicitly for initial provisioning or deliberate repairs, using the operato
 account and configuration that will manage deployments. Routine mobile commands
 never invoke this setup script. Ordinary repeats preserve matching state; use
 -ForceGpoRefresh to back up and deliberately republish the managed GPO content.
+-DryRun displays resolved setup values and conditional actions without provisioning.
 #>
 [CmdletBinding()]
-param([hashtable]$ConfigOverride, [switch]$ForceGpoRefresh)
+param([hashtable]$ConfigOverride, [switch]$ForceGpoRefresh, [switch]$DryRun)
 
 $manager = Import-Module (Join-Path $PSScriptRoot 'MobileManager.psd1') -Force -PassThru
 $configPath = Join-Path $PSScriptRoot 'cfg.psd1'
@@ -21,7 +22,7 @@ if ($ConfigOverride) {
 Set-MobileConfig -Overrides $overrides
 
 $options = @{}
-foreach ($option in @('Verbose', 'Debug', 'ForceGpoRefresh')) {
+foreach ($option in @('Verbose', 'Debug', 'ForceGpoRefresh', 'DryRun')) {
     if ($PSBoundParameters.ContainsKey($option)) { $options[$option] = $PSBoundParameters[$option] }
 }
 # Setup helpers share the configured module's private state, but are loaded only

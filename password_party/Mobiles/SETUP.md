@@ -8,6 +8,29 @@ Provision the management environment explicitly from the account that will opera
 
 This creates or repairs the configured directories, SSH key/enrollment and permissions, deployer certificate, and GPO logon scripts. It uses the module defaults and root `cfg.psd1`, with explicit `-ConfigOverride` values taking precedence. The existing setup ledger is displayed and fatal failures stop the script. An ordinary repeat with the same configuration/templates and healthy existing state leaves managed files, shortcut IDs/timestamps, versions, and matching SSH ACLs unchanged. Missing assets or changed managed content are repaired as needed.
 
+## Preview initialization
+
+```powershell
+.\Initialize-Mobiles.ps1 -DryRun
+.\Initialize-Mobiles.ps1 -DryRun -ForceGpoRefresh
+.\Initialize-Mobiles.ps1 -DryRun -ConfigOverride @{ nfsHomeRoot = 'D:\MobileAdmin' }
+```
+
+The dry run uses the same configuration precedence and derived paths as a real run: module defaults, then root `cfg.psd1` if present, then explicit `-ConfigOverride`. It prints the operating account, directories, SSH key/enrollment paths, certificate store/PFX/CER locations, logon template, GPO ID/OU, backup root and refresh setting. Existing/missing directories are distinguished; SSH, certificate and GPO actions describe their conditional behavior. Only setup-related values are displayed; deployment passwords, LUKS secrets and PINs are excluded.
+
+It makes a read-only AD lookup to show the actual writable-DC SYSVOL path, domain client path and directory target. If domain/OU discovery is unavailable, the preview still returns its local plan and clearly reports that those targets remain unresolved. It does not create directories or keys, change ACLs, import/export certificates, ask for passwords, make backups, publish scripts, advance GPO versions or alter OU links. `-ForceGpoRefresh` changes the preview to describe backup and forced publication; it performs no refresh while `-DryRun` is active.
+
+The preview does not calculate an exact GPO content diff or prove access/permissions. Conditional actions are evaluated again during a normal run, since state can change after the preview. Capture the structured plan for closer review if useful:
+
+```powershell
+$plan = .\Initialize-Mobiles.ps1 -DryRun
+$plan.Configuration
+$plan.Actions
+$plan.Notes
+```
+
+Omit `-DryRun` to perform initialization with the reviewed configuration.
+
 Certificates and SSH locations are associated with the operating account/profile, so configure each operator's required environment. Running setup once under an unrelated account does not provision every operator's certificate store. Existing domain/SYSVOL permissions are still required for the GPO work.
 
 `Mobiles.ps1` has no `-Initialize` mode. Importing `MobileManager.psd1` does not expose initialization or load its implementation. Setup-only functions live in `Setup/MobileEnvironment.ps1` and are loaded privately by the administrator entry point.
